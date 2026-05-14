@@ -237,6 +237,11 @@ _CF_CHALLENGE_MARKERS = (
 # A probe whose verdict is none of these is treated as "the host answered us".
 _UNREACHABLE_VERDICTS = ("unreachable", "blocked", "cloudflare_challenge")
 
+# The engine's own search-engine call budget (Http.get timeout= at the
+# QueryRepair site-search call sites). A host can be fully reachable yet still
+# fail every engine fetch if the round-trip exceeds this on Railway.
+_ENGINE_SEARCH_BUDGET_MS = 850
+
 
 def _classify_probe(url: str) -> dict[str, Any]:
     """Probe one upstream host and classify reachability. Read-only."""
@@ -265,6 +270,12 @@ def _classify_probe(url: str) -> dict[str, Any]:
         verdict = "ok"
     else:
         verdict = f"http_{res.status_code}"  # e.g. 404 still means reachable
+    # A host can answer fine here (10s budget) yet still fail every engine
+    # fetch, because the engine's site-search calls only wait ~0.75-0.85s.
+    too_slow_for_engine = (
+        verdict not in _UNREACHABLE_VERDICTS
+        and elapsed_ms > _ENGINE_SEARCH_BUDGET_MS
+    )
     return {
         "url": url,
         "verdict": verdict,
@@ -272,6 +283,7 @@ def _classify_probe(url: str) -> dict[str, Any]:
         "body_length": len(body),
         "cloudflare_challenge": cf_challenge,
         "elapsed_ms": elapsed_ms,
+        "too_slow_for_engine_budget": too_slow_for_engine,
     }
 
 
@@ -285,16 +297,41 @@ def upstream_diagnostics() -> dict[str, Any]:
     """
     probes = {name: _classify_probe(url) for name, url in _PROBE_TARGETS.items()}
 
+    # Which scraper the engine actually built on this host. If cloudscraper
+    # failed to install on Railway, get_scraper() silently returns a plain
+    # requests.Session with no Cloudflare bypass -- that alone produces fg=""
+    # while Basenotes still works, and it is NOT an IP block.
+    scraper = engine.get_scraper()
+    scraper_type = type(scraper).__module__ + "." + type(scraper).__name__
+    cloudscraper_active = engine.cloudscraper is not None
+
     def _reachable(name: str) -> bool:
         return probes[name]["verdict"] not in _UNREACHABLE_VERDICTS
 
     fg_ok = _reachable("fragrantica_home") or _reachable("fragrantica_perfume")
     search_ok = _reachable("google") or _reachable("bing")
+    any_too_slow = any(p.get("too_slow_for_engine_budget") for p in probes.values())
 
-    if fg_ok and search_ok:
+    if not cloudscraper_active:
         recommendation = (
-            "All upstreams reachable from Railway -- the zero-FG-link result is "
-            "not a raw connectivity block. Re-check the engine run / deadlines."
+            "cloudscraper is NOT installed on this host -- get_scraper() fell "
+            "back to a plain requests.Session with no Cloudflare bypass. This "
+            "alone explains fg=\"\" and is a BUILD problem, not an IP block. "
+            "Fix the Railway build (verify cloudscraper in requirements.txt "
+            "actually installed) before considering a proxy."
+        )
+    elif fg_ok and search_ok and any_too_slow:
+        recommendation = (
+            "All upstreams answered, but at least one round-trip exceeded the "
+            "engine's ~0.85s site-search budget. The engine may be timing out "
+            "fetches that are reachable -- this is a latency/timeout issue, not "
+            "an IP block. Re-check before adding a proxy."
+        )
+    elif fg_ok and search_ok:
+        recommendation = (
+            "All upstreams reachable from Railway and within the engine's "
+            "timeout budget -- the zero-FG-link result is not a raw "
+            "connectivity block. Re-check the engine run / deadlines."
         )
     elif not fg_ok and not search_ok:
         recommendation = (
@@ -315,8 +352,11 @@ def upstream_diagnostics() -> dict[str, Any]:
     return {
         "probes": probes,
         "summary": {
+            "scraper_type": scraper_type,
+            "cloudscraper_active": cloudscraper_active,
             "fragrantica_reachable": fg_ok,
             "search_engines_reachable": search_ok,
+            "any_host_too_slow_for_engine_budget": any_too_slow,
         },
         "recommendation": recommendation,
     }
