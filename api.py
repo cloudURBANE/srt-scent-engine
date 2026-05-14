@@ -52,6 +52,16 @@ import fragrance_parser_full_rewrite_fixed as engine
 # defaults defined in build_parser(), so search/fallback behavior is untouched.
 _ARGS = engine.build_parser().parse_args([])
 
+# Option 3 pre-cache pipeline wiring. Railway's runtime is 403'd by Cloudflare
+# on fragrantica.com, so the engine's live FG search resolves nothing and the
+# default cache path (~/.cache/...) is an empty file in a fresh container. When
+# FG_CACHE_PATH is set, point the engine at a cache file warmed offline by
+# scripts/warm_fg_cache.py and shipped with the deploy. This is the exact knob
+# the engine's own `--fg-cache` flag already exposes -- no engine/resolver
+# change, just choosing which file the existing IdentityCache reads. Unset =
+# unchanged behavior, so this line is inert until the env var is provided.
+_ARGS.fg_cache = os.environ.get("FG_CACHE_PATH", _ARGS.fg_cache)
+
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
 # ---------------------------------------------------------------------------
