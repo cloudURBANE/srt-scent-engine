@@ -3,3 +3,5 @@ uvicorn[standard]==0.34.0
 requests==2.32.3
 cloudscraper==1.2.71
 beautifulsoup4==4.12.3
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4

@@ -34,14 +34,16 @@ will fall back to it if `id` is absent.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import db
 import fragrance_parser_full_rewrite_fixed as engine
 
 # ---------------------------------------------------------------------------
@@ -72,7 +74,19 @@ _ARGS.fg_cache = os.environ.get("FG_CACHE_PATH", _ARGS.fg_cache)
 _FG_DETAIL_CACHE_PATH = os.environ.get("FG_DETAIL_CACHE_PATH", "")
 _FG_DETAIL_CACHE: dict[str, Any] | None = None  # lazy-loaded once, see below
 
+# Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
+# `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
+# offline worker only -- it is never sent to the frontend and is never logged.
+# Unset => the worker endpoints are unconfigured and return 503.
+_ENRICHMENT_WORKER_TOKEN = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
+
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    """Bootstrap durable storage. Inert when DATABASE_URL is unset (local dev)."""
+    db.init_db()
 
 # ---------------------------------------------------------------------------
 # CORS -- restricted to the frontend origin(s).
@@ -157,6 +171,7 @@ def _source_coverage(
     selected: engine.UnifiedFragrance,
     details: engine.UnifiedDetails,
     fragrantica_cached: bool = False,
+    fragrantica_cache_source: str | None = None,
 ) -> dict[str, Any]:
     """Report which sources actually backed this detail bundle. Read-only.
 
@@ -189,6 +204,9 @@ def _source_coverage(
         "basenotes": bn_has_data,
         "fragrantica": fg_has_data,
         "fragrantica_cached": fragrantica_cached,
+        # "db" (durable Postgres cache), "json" (bundled file), or null (live or
+        # absent). Additive honesty signal; existing keys keep their meaning.
+        "fragrantica_cache_source": fragrantica_cache_source,
         "basenotes_linked": bn_linked,
         "fragrantica_linked": fg_linked,
         "derived_metrics": derived,
@@ -200,6 +218,7 @@ def _details_to_dict(
     selected: engine.UnifiedFragrance,
     details: engine.UnifiedDetails,
     fragrantica_cached: bool = False,
+    fragrantica_cache_source: str | None = None,
 ) -> dict[str, Any]:
     """Serialize a full detail bundle.
 
@@ -220,7 +239,9 @@ def _details_to_dict(
         "year": _coerce_year(selected.year),
         "gender": details.gender,
         "derived_metrics": details.derived_metrics,
-        "source_coverage": _source_coverage(selected, details, fragrantica_cached),
+        "source_coverage": _source_coverage(
+            selected, details, fragrantica_cached, fragrantica_cache_source
+        ),
         # Raw fields, included for convenience (do not remove derived_metrics).
         "raw": {
             "description": details.description,
@@ -1070,24 +1091,19 @@ def _load_fg_detail_cache() -> dict[str, Any]:
     return _FG_DETAIL_CACHE
 
 
-def _apply_fg_detail_cache(
-    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+def _hydrate_details_from_entry(
+    details: engine.UnifiedDetails, entry: dict[str, Any]
 ) -> bool:
-    """Overlay cached Fragrantica detail data onto a BN-only detail bundle.
+    """Overlay a cached Fragrantica detail `entry` onto a BN-only bundle.
 
-    Returns True only when cached Fragrantica data was actually applied. Live
-    Fragrantica data always wins: if details.frag_cards is already populated
-    this is a no-op and returns False.
+    Shared by the DB cache and the bundled JSON cache: both produce an `entry`
+    dict with the same shape (`frag_cards` / `notes` / `pros_cons` / `reviews`).
+    Returns True only when cached Fragrantica data was actually applied.
+
+    Strictly additive -- live data always wins (callers only invoke this when
+    `details.frag_cards` is empty), fields are filled only when empty, and the
+    existing derived_metrics adapter is re-run exactly as the engine runs it.
     """
-    # Live Fragrantica data present -> never touch it.
-    if details.frag_cards:
-        return False
-    if not selected.frag_url:
-        return False
-    entry = _load_fg_detail_cache().get(_canonical_fg_url(selected.frag_url))
-    if not entry:
-        return False
-
     cached_cards = entry.get("frag_cards")
     if not isinstance(cached_cards, dict) or not cached_cards:
         return False
@@ -1130,6 +1146,43 @@ def _apply_fg_detail_cache(
     return True
 
 
+def _apply_fg_detail_cache_db(
+    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+) -> bool:
+    """Hydrate from the durable Postgres fg_detail_cache. Inert when DB disabled.
+
+    This is the second tier of the detail lookup order (live FG -> DB cache ->
+    bundled JSON cache -> partial). Only `quality_status = 'complete'` entries
+    are trusted for hydration; weaker entries are left for a worker re-fetch.
+    """
+    if details.frag_cards or not selected.frag_url:
+        return False
+    entry = db.lookup_detail_cache(_canonical_fg_url(selected.frag_url))
+    if not entry or entry.get("quality_status") != "complete":
+        return False
+    return _hydrate_details_from_entry(details, entry)
+
+
+def _apply_fg_detail_cache(
+    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+) -> bool:
+    """Overlay cached Fragrantica detail data from the bundled JSON cache.
+
+    Returns True only when cached Fragrantica data was actually applied. Live
+    Fragrantica data always wins: if details.frag_cards is already populated
+    this is a no-op and returns False.
+    """
+    # Live Fragrantica data present -> never touch it.
+    if details.frag_cards:
+        return False
+    if not selected.frag_url:
+        return False
+    entry = _load_fg_detail_cache().get(_canonical_fg_url(selected.frag_url))
+    if not entry:
+        return False
+    return _hydrate_details_from_entry(details, entry)
+
+
 def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     """Reconstruct the engine candidate from the detail request.
 
@@ -1165,6 +1218,34 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     )
 
 
+def _enqueue_enrichment_job(
+    selected: engine.UnifiedFragrance, req: DetailRequest
+) -> None:
+    """Enqueue (or upsert) an enrichment job for a partial detail result.
+
+    Keyed by the canonical Fragrantica URL, so a repeated request for the same
+    fragrance bumps the job's requested_count instead of duplicating it. Any
+    failure here is swallowed -- enrichment is a background nicety and must
+    never break the user-facing /details response.
+    """
+    try:
+        job_key = _canonical_fg_url(selected.frag_url)
+        if not job_key:
+            return
+        db.enqueue_job(
+            job_key=job_key,
+            query=(req.source_url or None),
+            name=selected.name or None,
+            house=selected.brand or None,
+            year=_coerce_year(selected.year),
+            bn_url=selected.bn_url or None,
+            fg_url=selected.frag_url or None,
+        )
+    except Exception:
+        # Best-effort: never let queue write failures surface to the client.
+        pass
+
+
 @app.post("/api/fragrances/details")
 def details(req: DetailRequest) -> dict[str, Any]:
     """Fetch the full detail bundle for a fragrance returned by /search.
@@ -1190,12 +1271,217 @@ def details(req: DetailRequest) -> dict[str, Any]:
             status_code=502, detail=f"Detail fetch failed: {exc}"
         ) from exc
 
-    # If the live fetch produced no Fragrantica contribution (Railway is 403'd
-    # on fragrantica.com), hydrate it from fg_detail_cache_v1.json. Inert when
-    # live FG data exists or FG_DETAIL_CACHE_PATH is unset.
-    fragrantica_cached = _apply_fg_detail_cache(selected, detail_bundle)
+    # Cache lookup order: live Fragrantica -> durable DB cache -> bundled JSON
+    # cache -> partial BN-only response. Live data always wins (both overlay
+    # helpers no-op when detail_bundle.frag_cards is already populated). The DB
+    # cache is the fresh runtime cache so it wins over the shipped JSON file.
+    fragrantica_cache_source: str | None = None
+    if _apply_fg_detail_cache_db(selected, detail_bundle):
+        fragrantica_cache_source = "db"
+    elif _apply_fg_detail_cache(selected, detail_bundle):
+        fragrantica_cache_source = "json"
+    fragrantica_cached = fragrantica_cache_source is not None
 
-    return _details_to_dict(selected, detail_bundle, fragrantica_cached)
+    # Still partial: a Fragrantica URL is linked but no live/cached FG data
+    # exists. Enqueue an enrichment job so the offline worker can fetch it.
+    # Inert when DATABASE_URL is unset.
+    if (
+        not detail_bundle.frag_cards
+        and selected.frag_url
+        and not fragrantica_cached
+    ):
+        _enqueue_enrichment_job(selected, req)
+
+    return _details_to_dict(
+        selected, detail_bundle, fragrantica_cached, fragrantica_cache_source
+    )
+
+
+# ---------------------------------------------------------------------------
+# Enrichment pipeline -- public status + protected worker API.
+#
+# The worker endpoints are the contract the offline worker (a later pass) will
+# consume: it lists pending jobs, claims one, fetches Fragrantica detail in an
+# environment that is not 403'd, and uploads the parsed payload back via the
+# complete endpoint -- which durably stores it in fg_detail_cache so future
+# /details requests hydrate from the DB instead of returning a partial result.
+#
+# All /api/enrichment/jobs/* endpoints require a bearer token; the public
+# status endpoint does not (it leaks only aggregate counts, no job content).
+# Every endpoint here is inert with a 503 when DATABASE_URL is unset.
+# ---------------------------------------------------------------------------
+
+
+class CompleteJobRequest(BaseModel):
+    fg_url: str | None = None
+    schema_version: int = 1
+    captured_at: str | None = None
+    source: str | None = None
+    frag_cards: dict[str, Any] = {}
+    notes: dict[str, Any] = {}
+    pros_cons: list[Any] = []
+    reviews: list[Any] = []
+    raw_identity: dict[str, Any] = {}
+    quality_status: str | None = None
+
+
+class FailJobRequest(BaseModel):
+    error: str
+    retryable: bool = False
+
+
+class IgnoreJobRequest(BaseModel):
+    note: str | None = None
+    reason: str | None = None
+
+
+def _require_db() -> None:
+    """Reject enrichment requests when durable storage is not configured."""
+    if not db.ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Enrichment storage is not configured (DATABASE_URL unset).",
+        )
+
+
+def _require_worker_token(authorization: str | None = Header(default=None)) -> None:
+    """FastAPI dependency: enforce the worker bearer token. Never logs the token.
+
+    503 when the token env var is unset (endpoint unconfigured), 401 when the
+    Authorization header is missing or does not carry the exact bearer token.
+    """
+    if not _ENRICHMENT_WORKER_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Worker endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset).",
+        )
+    expected = f"Bearer {_ENRICHMENT_WORKER_TOKEN}"
+    presented = authorization or ""
+    # Constant-time comparison; the token value never appears in logs or errors.
+    if not hmac.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing worker token.")
+
+
+@app.get("/api/enrichment/status")
+def enrichment_status() -> dict[str, Any]:
+    """Public enrichment health signal: job counts by status. No job content."""
+    if not db.ENABLED:
+        return {"enabled": False, "counts": {}}
+    return {"enabled": True, "counts": db.get_status_counts()}
+
+
+@app.get("/api/enrichment/jobs", dependencies=[Depends(_require_worker_token)])
+def list_enrichment_jobs(
+    status: str = Query(default="pending"),
+    limit: int = Query(default=db.DEFAULT_JOB_LIMIT, ge=1, le=db.MAX_JOB_LIMIT),
+) -> dict[str, Any]:
+    """Protected: list jobs for the worker, priority-first. Defaults to pending."""
+    _require_db()
+    if status not in db.VALID_JOB_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Unknown status '{status}'.")
+    return {"jobs": db.list_jobs(status=status, limit=limit)}
+
+
+@app.post(
+    "/api/enrichment/jobs/{job_id}/claim",
+    dependencies=[Depends(_require_worker_token)],
+)
+def claim_enrichment_job(job_id: str) -> dict[str, Any]:
+    """Protected: claim a pending (or stale-processing) job with a lease window."""
+    _require_db()
+    result = db.claim_job(job_id)
+    if result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return result
+
+
+@app.post(
+    "/api/enrichment/jobs/{job_id}/complete",
+    dependencies=[Depends(_require_worker_token)],
+)
+def complete_enrichment_job(
+    job_id: str, payload: CompleteJobRequest
+) -> dict[str, Any]:
+    """Protected: store parsed Fragrantica detail output and mark job completed.
+
+    Rejects an empty `frag_cards` -- a weak/empty parse must be reported via the
+    fail endpoint, never recorded as a successful cache entry.
+    """
+    _require_db()
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    fg_url = (payload.fg_url or job.get("fg_url") or "").strip()
+    if not fg_url:
+        raise HTTPException(
+            status_code=400,
+            detail="No fg_url on the payload or the job; cannot key the cache.",
+        )
+    canonical = _canonical_fg_url(fg_url)
+    if not canonical:
+        raise HTTPException(status_code=400, detail="fg_url did not canonicalize.")
+
+    if not isinstance(payload.frag_cards, dict) or not payload.frag_cards:
+        raise HTTPException(
+            status_code=400,
+            detail="frag_cards is empty; report a weak parse via /fail instead.",
+        )
+
+    quality = payload.quality_status or "complete"
+    if quality not in db.VALID_QUALITY_STATUSES:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown quality_status '{quality}'."
+        )
+
+    cache_row = {
+        "canonical_fg_url": canonical,
+        "name": job.get("name"),
+        "house": job.get("house"),
+        "year": job.get("year"),
+        "schema_version": payload.schema_version,
+        "source": payload.source or "worker",
+        "captured_at": payload.captured_at,
+        "frag_cards": payload.frag_cards,
+        "notes": payload.notes,
+        "pros_cons": payload.pros_cons,
+        "reviews": payload.reviews,
+        "raw_identity": payload.raw_identity,
+        "quality_status": quality,
+    }
+    updated = db.complete_job(job_id, cache_row)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"completed": True, "canonical_fg_url": canonical, "job": updated}
+
+
+@app.post(
+    "/api/enrichment/jobs/{job_id}/fail",
+    dependencies=[Depends(_require_worker_token)],
+)
+def fail_enrichment_job(job_id: str, payload: FailJobRequest) -> dict[str, Any]:
+    """Protected: record a failure. Retryable returns the job to 'pending'."""
+    _require_db()
+    updated = db.fail_job(job_id, payload.error, payload.retryable)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"failed": True, "job": updated}
+
+
+@app.post(
+    "/api/enrichment/jobs/{job_id}/ignore",
+    dependencies=[Depends(_require_worker_token)],
+)
+def ignore_enrichment_job(
+    job_id: str, payload: IgnoreJobRequest
+) -> dict[str, Any]:
+    """Protected: permanently retire a job (non-fragrance, bad identity, dead URL)."""
+    _require_db()
+    note = payload.note or payload.reason
+    updated = db.ignore_job(job_id, note)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"ignored": True, "job": updated}
 
 
 if __name__ == "__main__":

@@ -2,13 +2,15 @@
 
 ## Files added (engine untouched)
 
-| file               | purpose                                            |
-|--------------------|----------------------------------------------------|
-| `api.py`           | FastAPI wrapper — imports the engine, exposes HTTP  |
-| `requirements.txt` | Python deps (engine deps + fastapi/uvicorn)         |
-| `Procfile`         | start command                                      |
-| `railway.toml`     | Railway build/deploy config + `/health` healthcheck |
-| `API_CONTRACT.md`  | endpoint contract for the frontend                 |
+| file                 | purpose                                            |
+|----------------------|----------------------------------------------------|
+| `api.py`             | FastAPI wrapper — imports the engine, exposes HTTP  |
+| `db.py`              | Postgres layer for the enrichment queue + detail cache |
+| `requirements.txt`   | Python deps (engine deps + fastapi/uvicorn + psycopg) |
+| `Procfile`           | start command                                      |
+| `railway.toml`       | Railway build/deploy config + `/health` healthcheck |
+| `API_CONTRACT.md`    | endpoint contract for the frontend                 |
+| `test_enrichment.py` | self-test for the enrichment pipeline              |
 
 ## Steps
 
@@ -26,6 +28,25 @@
 
 The Python API and the Vite frontend are **separate Railway services** in the
 same project.
+
+## Enrichment pipeline (durable storage)
+
+The enrichment job queue and the durable Fragrantica detail cache live in
+Postgres. To enable them:
+
+1. In the Railway project: **New → Database → Add PostgreSQL**.
+2. On the **API** service, reference the database's `DATABASE_URL` (Railway
+   exposes it as a shared variable — add it to the API service's variables).
+3. Set `ENRICHMENT_WORKER_TOKEN` on the **API** service to a long random secret.
+   This authorizes the offline worker against `/api/enrichment/jobs/*`. **Never**
+   put this token on the frontend service.
+4. Redeploy. On startup `db.init_db()` creates the `enrichment_jobs` and
+   `fg_detail_cache` tables idempotently (`CREATE TABLE IF NOT EXISTS`) — no
+   manual migration step.
+
+If `DATABASE_URL` is unset the API still runs: enrichment enqueue is skipped,
+`/api/enrichment/status` reports `enabled: false`, and the worker endpoints
+return `503`. The existing bundled JSON detail cache keeps working unchanged.
 
 ## Notes
 
