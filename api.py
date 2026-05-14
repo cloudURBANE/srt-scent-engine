@@ -198,6 +198,163 @@ def health() -> dict[str, bool]:
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Upstream reachability diagnostics (TEMPORARY -- remove after proxy scoping).
+#
+# The deployed runtime resolves zero Fragrantica links, but the engine reaches
+# Fragrantica two ways: direct fragrantica.com fetches AND site:fragrantica.com
+# lookups via Google/Bing (see QueryRepair._search_url / FragranticaEngine).
+# Before scoping an outbound proxy we need to know *which* host group Railway
+# is blocked on. This endpoint probes each host directly using the engine's own
+# scraper and headers -- it is read-only and changes no engine/parser/resolver
+# behavior. Delete this block once the proxy scope decision is made.
+# ---------------------------------------------------------------------------
+
+_PROBE_TARGETS: dict[str, str] = {
+    "google": (
+        "https://www.google.com/search?q=silver+mountain+water+"
+        "site:fragrantica.com/perfume"
+    ),
+    "bing": (
+        "https://www.bing.com/search?q=silver+mountain+water+"
+        "site:fragrantica.com/perfume"
+    ),
+    "fragrantica_home": "https://www.fragrantica.com/",
+    "fragrantica_perfume": (
+        "https://www.fragrantica.com/perfume/Creed/"
+        "Silver-Mountain-Water-1517.html"
+    ),
+}
+
+_CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "cf-challenge",
+    "attention required",
+    "cf-browser-verification",
+    "/cdn-cgi/challenge-platform",
+)
+
+# A probe whose verdict is none of these is treated as "the host answered us".
+_UNREACHABLE_VERDICTS = ("unreachable", "blocked", "cloudflare_challenge")
+
+
+def _classify_probe(url: str) -> dict[str, Any]:
+    """Probe one upstream host and classify reachability. Read-only."""
+    import time as _time
+
+    scraper = engine.get_scraper()
+    headers = dict(engine.Http.DEFAULT_HEADERS)
+    started = _time.monotonic()
+    try:
+        res = scraper.get(url, timeout=10, headers=headers)
+    except Exception as exc:
+        return {
+            "url": url,
+            "verdict": "unreachable",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": int((_time.monotonic() - started) * 1000),
+        }
+    elapsed_ms = int((_time.monotonic() - started) * 1000)
+    body = res.text or ""
+    cf_challenge = any(m in body[:4000].lower() for m in _CF_CHALLENGE_MARKERS)
+    if res.status_code in (403, 429) or (res.status_code == 503 and cf_challenge):
+        verdict = "blocked"
+    elif cf_challenge:
+        verdict = "cloudflare_challenge"
+    elif res.status_code == 200:
+        verdict = "ok"
+    else:
+        verdict = f"http_{res.status_code}"  # e.g. 404 still means reachable
+    return {
+        "url": url,
+        "verdict": verdict,
+        "http_status": res.status_code,
+        "body_length": len(body),
+        "cloudflare_challenge": cf_challenge,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+@app.get("/api/diagnostics/upstream")
+def upstream_diagnostics() -> dict[str, Any]:
+    """Probe every upstream host the engine depends on. Temporary; read-only.
+
+    Determines whether Railway is blocked on Fragrantica directly, on the
+    Google/Bing site-search step, or both -- which decides the proxy scope.
+    Runs up to four sequential 10s probes, so it can take ~40s worst case.
+    """
+    probes = {name: _classify_probe(url) for name, url in _PROBE_TARGETS.items()}
+
+    def _reachable(name: str) -> bool:
+        return probes[name]["verdict"] not in _UNREACHABLE_VERDICTS
+
+    fg_ok = _reachable("fragrantica_home") or _reachable("fragrantica_perfume")
+    search_ok = _reachable("google") or _reachable("bing")
+
+    if fg_ok and search_ok:
+        recommendation = (
+            "All upstreams reachable from Railway -- the zero-FG-link result is "
+            "not a raw connectivity block. Re-check the engine run / deadlines."
+        )
+    elif not fg_ok and not search_ok:
+        recommendation = (
+            "Both Fragrantica and the search engines are blocked -- the proxy "
+            "must cover fragrantica.com AND google.com/bing.com."
+        )
+    elif not fg_ok:
+        recommendation = (
+            "Fragrantica is blocked, search engines are reachable -- the proxy "
+            "can be scoped to fragrantica.com only."
+        )
+    else:
+        recommendation = (
+            "Search engines are blocked, Fragrantica is reachable -- the proxy "
+            "must cover google.com/bing.com (the site-search step)."
+        )
+
+    return {
+        "probes": probes,
+        "summary": {
+            "fragrantica_reachable": fg_ok,
+            "search_engines_reachable": search_ok,
+        },
+        "recommendation": recommendation,
+    }
+
+
+def _search_diagnostics(results: list[engine.UnifiedFragrance]) -> dict[str, Any]:
+    """Report Fragrantica coverage so a degraded run is never silently 'complete'.
+
+    The serialization path here is correct -- `_encode_id` reads `item.frag_url`,
+    the same attribute the engine populates. When the emitted token still has
+    `fg = ""` it is because the engine's candidate itself carries no `frag_url`,
+    i.e. the Fragrantica search returned zero links for the query.
+
+    Locally every real query resolves Fragrantica links; a deployed run that
+    links *none* across *all* candidates almost always means the runtime cannot
+    reach Fragrantica (datacenter IP blocked by Cloudflare). That is not a
+    successful search, so we flag it explicitly instead of returning a BN-only
+    payload that looks complete.
+    """
+    total = len(results)
+    fg_linked = sum(1 for item in results if item.frag_url)
+    fragrantica_unreachable = total > 0 and fg_linked == 0
+    diag: dict[str, Any] = {
+        "result_count": total,
+        "fragrantica_linked_count": fg_linked,
+        "fragrantica_unreachable": fragrantica_unreachable,
+    }
+    if fragrantica_unreachable:
+        diag["warning"] = (
+            "No candidate resolved a Fragrantica URL. The engine's Fragrantica "
+            "search returned zero links -- the deployed runtime is most likely "
+            "unable to reach Fragrantica (datacenter IP blocked). Detail "
+            "responses for these ids will be BN-only; this is a degraded "
+            "result, not a complete one."
+        )
+    return diag
+
+
 @app.get("/api/fragrances/search")
 def search(
     q: str = Query(..., min_length=1, description="Fragrance search query"),
@@ -216,6 +373,7 @@ def search(
     return {
         "query": query,
         "results": [_search_result_to_dict(item) for item in results],
+        "diagnostics": _search_diagnostics(results),
     }
 
 
