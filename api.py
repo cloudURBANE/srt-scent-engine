@@ -270,6 +270,194 @@ def health() -> dict[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Runtime parity diagnostics (TEMPORARY -- remove after the Railway 403 cause
+# is proven).
+#
+# Before committing to a cache-only or proxy architecture we must rule out the
+# mundane causes of the Fragrantica 403: a dependency/runtime mismatch, the
+# wrong start command/entrypoint, a bad working directory or cache path, or
+# missing TLS/proxy env vars. This endpoint reports the deployed runtime's
+# identity so it can be diffed field-by-field against a working local run.
+# It is strictly read-only, reports env vars as presence booleans (never
+# values), and touches no engine/parser/resolver/adapter code. Delete this
+# block once parity is confirmed.
+# ---------------------------------------------------------------------------
+
+# Env vars whose *presence* (not value) is relevant to the 403 hypothesis.
+_RUNTIME_ENV_KEYS = (
+    "FG_CACHE_PATH",
+    "FG_DETAIL_CACHE_PATH",
+    "FRONTEND_ORIGINS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+)
+
+# Packages whose version drift could explain a Cloudflare 403 on Railway but
+# not locally (cloudscraper/requests/urllib3/certifi above all).
+_RUNTIME_PACKAGES = (
+    "cloudscraper",
+    "requests",
+    "urllib3",
+    "certifi",
+    "beautifulsoup4",
+    "bs4",
+    "lxml",
+    "fastapi",
+    "uvicorn",
+)
+
+
+def _git_sha() -> dict[str, Any]:
+    """Best-effort git commit SHA of the running code.
+
+    Railway injects RAILWAY_GIT_COMMIT_SHA even when the build image carries no
+    .git directory, so prefer that; fall back to `git rev-parse HEAD`.
+    """
+    for var in ("RAILWAY_GIT_COMMIT_SHA", "SOURCE_VERSION", "GIT_COMMIT"):
+        val = os.environ.get(var)
+        if val:
+            return {"sha": val.strip(), "source": var}
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return {"sha": out.stdout.strip(), "source": "git rev-parse"}
+        return {"sha": None, "source": None, "detail": out.stderr.strip()[:200]}
+    except Exception as exc:
+        return {"sha": None, "source": None, "detail": f"{type(exc).__name__}: {exc}"}
+
+
+def _process_start_command() -> list[str]:
+    """The argv this process was actually started with.
+
+    On Railway (Linux) /proc/self/cmdline is the real exec line -- it reveals an
+    accidental override of the intended `uvicorn api:app ...` start command.
+    Everywhere else, fall back to sys.argv.
+    """
+    try:
+        with open("/proc/self/cmdline", "rb") as handle:
+            raw = handle.read()
+        parts = [p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p]
+        if parts:
+            return parts
+    except Exception:
+        pass
+    import sys as _sys
+
+    return list(_sys.argv)
+
+
+def _pkg_version(name: str) -> str | None:
+    """Installed version of a package, or None if it is not installed here."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return None
+    except Exception:
+        return None
+
+
+def _cache_file_state(path: str) -> dict[str, Any]:
+    """Resolve a configured cache path and report whether it exists on disk."""
+    if not path:
+        return {"configured": False, "path": None, "exists": False}
+    abspath = os.path.abspath(path)
+    exists = os.path.isfile(abspath)
+    return {
+        "configured": True,
+        "path": abspath,
+        "exists": exists,
+        "size_bytes": os.path.getsize(abspath) if exists else None,
+    }
+
+
+@app.get("/api/diagnostics/runtime")
+def runtime_diagnostics() -> dict[str, Any]:
+    """Report the deployed runtime's identity for parity comparison vs. local.
+
+    Temporary, read-only. Env vars are reported as presence booleans only --
+    never their values. Covers git SHA, cwd, Python/platform, the actual start
+    command, PORT, cache-file existence, pinned package versions, and a config
+    sanity block confirming Railway is running the intended app/entrypoint.
+    """
+    import platform as _platform
+    import sys as _sys
+
+    cwd = os.getcwd()
+
+    env_present = {
+        key: (os.environ.get(key) not in (None, "")) for key in _RUNTIME_ENV_KEYS
+    }
+
+    # Cache-file existence: report both the env-configured path and the path the
+    # engine actually reads (_ARGS.fg_cache), since they can diverge.
+    fg_cache_path = os.environ.get("FG_CACHE_PATH", "")
+    fg_detail_cache_path = os.environ.get("FG_DETAIL_CACHE_PATH", "")
+    cache_files = {
+        "FG_CACHE_PATH": _cache_file_state(fg_cache_path),
+        "FG_DETAIL_CACHE_PATH": _cache_file_state(fg_detail_cache_path),
+        "engine_effective_fg_cache": _cache_file_state(
+            getattr(_ARGS, "fg_cache", "") or ""
+        ),
+    }
+
+    packages = {name: _pkg_version(name) for name in _RUNTIME_PACKAGES}
+
+    # Config sanity -- is Railway running the intended app, entrypoint, and
+    # committed code? The deployed SHA here must be diffed against the latest
+    # pushed commit; a Railway build/start-command override or stale Procfile
+    # would surface as a start_command that is not `uvicorn api:app ...`.
+    config_checks = {
+        "entrypoint_module": __name__,
+        "api_module_file": os.path.abspath(__file__),
+        "procfile_present": os.path.isfile(os.path.join(cwd, "Procfile")),
+        "railway_toml_present": os.path.isfile(os.path.join(cwd, "railway.toml")),
+        "requirements_txt_present": os.path.isfile(
+            os.path.join(cwd, "requirements.txt")
+        ),
+        "railway_service_id": os.environ.get("RAILWAY_SERVICE_ID"),
+        "railway_deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID"),
+        "railway_git_branch": os.environ.get("RAILWAY_GIT_BRANCH"),
+        "railway_git_commit_message": os.environ.get("RAILWAY_GIT_COMMIT_MESSAGE"),
+    }
+
+    scraper = engine.get_scraper()
+    return {
+        "git": _git_sha(),
+        "cwd": cwd,
+        "python_version": _sys.version,
+        "python_executable": _sys.executable,
+        "platform": _platform.platform(),
+        "platform_detail": {
+            "system": _platform.system(),
+            "release": _platform.release(),
+            "machine": _platform.machine(),
+        },
+        "start_command": _process_start_command(),
+        "port": os.environ.get("PORT"),
+        "env_present": env_present,
+        "cache_files": cache_files,
+        "package_versions": packages,
+        "config_checks": config_checks,
+        "scraper": {
+            "type": type(scraper).__module__ + "." + type(scraper).__name__,
+            "cloudscraper_active": engine.cloudscraper is not None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Upstream reachability diagnostics (TEMPORARY -- remove after proxy scoping).
 #
 # The deployed runtime resolves zero Fragrantica links, but the engine reaches
@@ -314,11 +502,37 @@ _UNREACHABLE_VERDICTS = ("unreachable", "blocked", "cloudflare_challenge")
 _ENGINE_SEARCH_BUDGET_MS = 850
 
 
+# Header names whose values must never be echoed back -- presence only.
+_SENSITIVE_HEADER_KEYS = ("cookie", "authorization", "proxy-authorization")
+
+
+def _sanitize_headers(headers: Any) -> dict[str, str]:
+    """Echo request headers for parity comparison, redacting sensitive values."""
+    out: dict[str, str] = {}
+    try:
+        items = dict(headers).items()
+    except Exception:
+        return out
+    for key, value in items:
+        if str(key).lower() in _SENSITIVE_HEADER_KEYS:
+            out[str(key)] = "<set>" if value else "<empty>"
+        else:
+            out[str(key)] = str(value)
+    return out
+
+
 def _classify_probe(url: str) -> dict[str, Any]:
-    """Probe one upstream host and classify reachability. Read-only."""
+    """Probe one upstream host and classify reachability. Read-only.
+
+    Returns enough request/response surface to compare Railway vs. local: the
+    scraper type, the exact (sanitized) headers actually sent, the final URL
+    after redirects, the status, Cloudflare markers, the names of any cookies
+    the host set, and the first 300 chars of the body when the host blocked us.
+    """
     import time as _time
 
     scraper = engine.get_scraper()
+    scraper_type = type(scraper).__module__ + "." + type(scraper).__name__
     headers = dict(engine.Http.DEFAULT_HEADERS)
     started = _time.monotonic()
     try:
@@ -326,6 +540,8 @@ def _classify_probe(url: str) -> dict[str, Any]:
     except Exception as exc:
         return {
             "url": url,
+            "scraper_type": scraper_type,
+            "request_headers": _sanitize_headers(headers),
             "verdict": "unreachable",
             "detail": f"{type(exc).__name__}: {exc}",
             "elapsed_ms": int((_time.monotonic() - started) * 1000),
@@ -347,12 +563,24 @@ def _classify_probe(url: str) -> dict[str, Any]:
         verdict not in _UNREACHABLE_VERDICTS
         and elapsed_ms > _ENGINE_SEARCH_BUDGET_MS
     )
+    blocked = verdict in ("blocked", "cloudflare_challenge")
+    # The headers actually put on the wire (cloudscraper injects its own UA /
+    # ordering) -- this is what must be diffed against a working local run.
+    sent_headers = _sanitize_headers(getattr(res.request, "headers", headers))
+    resp_header_keys = {k.lower() for k in res.headers}
     return {
         "url": url,
+        "scraper_type": scraper_type,
+        "request_headers": sent_headers,
+        "final_url": getattr(res, "url", url),
         "verdict": verdict,
         "http_status": res.status_code,
         "body_length": len(body),
         "cloudflare_challenge": cf_challenge,
+        "cf_ray_present": "cf-ray" in resp_header_keys,
+        "response_server_header": res.headers.get("Server"),
+        "cookies_set": sorted(res.cookies.keys()),
+        "body_preview_when_blocked": body[:300] if blocked else None,
         "elapsed_ms": elapsed_ms,
         "too_slow_for_engine_budget": too_slow_for_engine,
     }
@@ -430,6 +658,159 @@ def upstream_diagnostics() -> dict[str, Any]:
             "any_host_too_slow_for_engine_budget": any_too_slow,
         },
         "recommendation": recommendation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Controlled fetch variants (TEMPORARY -- remove after the Railway 403 cause is
+# proven).
+#
+# /upstream tells us *whether* a host blocks us; this tells us *what about the
+# request* the block depends on. The same Fragrantica perfume URL is fetched
+# five ways. If all five fail identically, the block is request-independent --
+# i.e. a raw IP/reputation block. If one variant succeeds (a modern UA, a warmed
+# session, session reuse, a plain requests vs. cloudscraper difference), the 403
+# is request-shaped and a proxy is not the only path. Read-only: builds throw-
+# away sessions, mutates no engine state. Delete this block once decided.
+# ---------------------------------------------------------------------------
+
+_VARIANT_FG_URL = _PROBE_TARGETS["fragrantica_perfume"]
+_VARIANT_FG_HOME = _PROBE_TARGETS["fragrantica_home"]
+
+# A current-ish desktop Chrome UA, distinct from engine Http.DEFAULT_HEADERS'
+# Chrome/120 string -- isolates "stale User-Agent" as a cause.
+_MODERN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _run_variant(label: str, fetch: Any) -> dict[str, Any]:
+    """Run one fetch variant and classify its outcome. Read-only."""
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        res = fetch()
+    except Exception as exc:
+        return {
+            "variant": label,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": int((_time.monotonic() - started) * 1000),
+        }
+    elapsed_ms = int((_time.monotonic() - started) * 1000)
+    body = res.text or ""
+    cf = any(m in body[:4000].lower() for m in _CF_CHALLENGE_MARKERS)
+    blocked = res.status_code in (403, 429) or (res.status_code == 503 and cf)
+    return {
+        "variant": label,
+        "http_status": res.status_code,
+        "body_length": len(body),
+        "cloudflare_challenge": cf,
+        "blocked": blocked,
+        "final_url": getattr(res, "url", _VARIANT_FG_URL),
+        "cookies_set": sorted(res.cookies.keys()),
+        "server_header": res.headers.get("Server"),
+        "cf_ray_present": "cf-ray" in {k.lower() for k in res.headers},
+        "body_preview": body[:300] if (blocked or cf) else None,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+@app.get("/api/diagnostics/fetch-variants")
+def fetch_variant_diagnostics() -> dict[str, Any]:
+    """Fetch one Fragrantica perfume page five ways to localize the 403 cause.
+
+    Temporary, read-only. Variants: (1) cloudscraper + engine default headers,
+    (2) cloudscraper + explicit modern Chrome UA, (3) plain requests + modern
+    UA (no Cloudflare bypass), (4) cloudscraper warmed via the homepage first,
+    (5) cloudscraper shared session reused (second hit on the same session).
+    """
+    import requests as _requests
+
+    base_headers = dict(engine.Http.DEFAULT_HEADERS)
+    results: list[dict[str, Any]] = []
+
+    # 1. cloudscraper session, engine's own default headers (the live path).
+    def _v1():
+        return engine.get_scraper().get(
+            _VARIANT_FG_URL, timeout=15, headers=base_headers
+        )
+
+    results.append(_run_variant("cloudscraper_default", _v1))
+
+    # 2. cloudscraper session, explicit modern Chrome UA.
+    def _v2():
+        headers = dict(base_headers)
+        headers["User-Agent"] = _MODERN_UA
+        return engine.get_scraper().get(
+            _VARIANT_FG_URL, timeout=15, headers=headers
+        )
+
+    results.append(_run_variant("cloudscraper_modern_ua", _v2))
+
+    # 3. plain requests, same modern UA -- no Cloudflare bypass at all.
+    def _v3():
+        headers = dict(base_headers)
+        headers["User-Agent"] = _MODERN_UA
+        return _requests.Session().get(
+            _VARIANT_FG_URL, timeout=15, headers=headers
+        )
+
+    results.append(_run_variant("plain_requests_modern_ua", _v3))
+
+    # 4. cloudscraper, warmed: hit the homepage first, then the perfume page.
+    def _v4():
+        scraper = engine.get_scraper()
+        scraper.get(_VARIANT_FG_HOME, timeout=15, headers=base_headers)
+        return scraper.get(_VARIANT_FG_URL, timeout=15, headers=base_headers)
+
+    results.append(_run_variant("cloudscraper_warm_via_homepage", _v4))
+
+    # 5. shared cloudscraper session, reused: second hit on the same session
+    #    (contrast with variant 1's fresh-session-per-request).
+    def _v5():
+        scraper = engine.get_scraper()
+        scraper.get(_VARIANT_FG_URL, timeout=15, headers=base_headers)
+        return scraper.get(_VARIANT_FG_URL, timeout=15, headers=base_headers)
+
+    results.append(_run_variant("cloudscraper_shared_session_reuse", _v5))
+
+    ok = [r for r in results if r.get("http_status") == 200 and not r.get("cloudflare_challenge")]
+    errored = [r for r in results if "error" in r]
+    if errored and not ok:
+        interpretation = (
+            "Every variant errored or was blocked. Combined with /upstream, this "
+            "points at a request-independent block (datacenter IP / reputation) "
+            "or a transport failure -- not a header/session/UA issue."
+        )
+    elif not ok:
+        interpretation = (
+            "All five variants were blocked (403/429/Cloudflare challenge) but "
+            "none errored at the transport layer. The block does not depend on "
+            "UA, session warming, or session reuse -- consistent with an IP/"
+            "reputation block. A proxy is the likely path; re-confirm with "
+            "/runtime that this is not a cloudscraper version regression."
+        )
+    elif len(ok) == len(results):
+        interpretation = (
+            "All five variants succeeded. The 403 seen by the engine is NOT a "
+            "raw fetch block -- look at engine state/deadlines or intermittent "
+            "upstream behavior, not a proxy."
+        )
+    else:
+        succeeded = ", ".join(sorted(r["variant"] for r in ok))
+        interpretation = (
+            f"The 403 is request-shaped: variant(s) [{succeeded}] succeeded "
+            f"while others were blocked. The fix is in the request "
+            f"(UA/session/warming), NOT necessarily a proxy."
+        )
+
+    return {
+        "target_url": _VARIANT_FG_URL,
+        "cloudscraper_active": engine.cloudscraper is not None,
+        "variants": results,
+        "interpretation": interpretation,
     }
 
 
