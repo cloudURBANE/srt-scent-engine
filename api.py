@@ -417,6 +417,147 @@ def search(
     }
 
 
+# ---------------------------------------------------------------------------
+# Engine-search diagnostics (TEMPORARY -- remove after the fg="" cause is found).
+#
+# /api/diagnostics/upstream proved every upstream host is reachable from Railway
+# and within the engine's timeout budget, yet the public /search still emits
+# candidates with frag_url="". This endpoint runs the EXACT same code path as
+# the public /search endpoint -- same `_ARGS`, same `get_scraper()`, same
+# `engine.search_once(...)` -- but instead of serializing to the frontend
+# contract it dumps the raw final candidate fields plus whatever the engine
+# printed to stdout. It mutates nothing and re-runs no resolver logic. Delete
+# this block once the exact point where frag_url disappears is identified.
+# ---------------------------------------------------------------------------
+
+# Strips ANSI colour codes the engine wraps its [SYS] log lines in.
+_ANSI_RE = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+# The engine's stdout line emitted by _search_core right after the first pass:
+#   [SYS] Found {X} BN links and {Y} FG native links.
+_BN_FG_COUNT_RE = __import__("re").compile(
+    r"Found\s+(\d+)\s+BN links and\s+(\d+)\s+FG native links"
+)
+
+# _ARGS fields that govern search timing / deadlines / budgets. Surfaced so a
+# Railway-vs-local args drift (esp. shorter deadlines) is immediately visible.
+_SEARCH_TIMING_ARG_KEYS = (
+    "initial_timeout",
+    "detail_timeout",
+    "metrics_budget",
+    "metrics_workers",
+    "metrics_max",
+    "catalog_budget",
+    "catalog_workers",
+    "catalog_slug_limit",
+    "related_budget",
+    "related_page_timeout",
+    "related_max_pages",
+    "external_search",
+    "external_budget",
+    "external_workers",
+    "spell_repair_budget",
+    "max_frag_results",
+    "max_results",
+)
+
+
+def _engine_candidate_to_diag(item: engine.UnifiedFragrance) -> dict[str, Any]:
+    """Dump the raw final candidate fields -- no contract reshaping, no scoring."""
+    return {
+        "name": item.name,
+        "house": item.brand,
+        "year": item.year,
+        "bn_url": item.bn_url,
+        "frag_url": item.frag_url,
+        # The public _search_result_to_dict computes source_url the same way.
+        "source_url": item.frag_url or item.bn_url,
+        "match_score": getattr(item, "query_score", None),
+        "resolver_score": getattr(item, "resolver_score", None),
+        "resolver_source": getattr(item, "resolver_source", None),
+        "bn_positive_pct": getattr(item, "bn_positive_pct", None),
+        "bn_vote_count": getattr(item, "bn_vote_count", None),
+    }
+
+
+@app.get("/api/diagnostics/engine-search")
+def engine_search_diagnostics(
+    q: str = Query("silver mountain water", min_length=1),
+) -> dict[str, Any]:
+    """Run the public /search code path verbatim and dump raw candidates.
+
+    Temporary, read-only. Same `_ARGS`, same `get_scraper()`, same
+    `engine.search_once(...)` as `/api/fragrances/search` -- the only
+    difference is this returns the engine's raw candidate fields and captured
+    stdout instead of the frontend contract shape.
+    """
+    import contextlib
+    import io
+
+    query = q.strip()
+
+    # Same scraper construction as the public endpoint.
+    scraper = engine.get_scraper()
+    scraper_type = type(scraper).__module__ + "." + type(scraper).__name__
+
+    # Capture the engine's stdout so the [SYS] log lines (incl. the BN/FG link
+    # counts) are visible without touching resolver internals.
+    captured = io.StringIO()
+    error: str | None = None
+    results: list[engine.UnifiedFragrance] = []
+    try:
+        with contextlib.redirect_stdout(captured):
+            results = engine.search_once(scraper, query, _ARGS)
+    except Exception as exc:  # mirror the public endpoint's failure surface
+        error = f"{type(exc).__name__}: {exc}"
+
+    sys_log = _ANSI_RE.sub("", captured.getvalue())
+    sys_lines = [ln for ln in sys_log.splitlines() if "[SYS]" in ln]
+
+    # Pull the BN / FG native link counts straight out of the captured log
+    # line -- this reads no resolver internals, only what the engine printed.
+    bn_native_count: int | None = None
+    fg_native_count: int | None = None
+    count_match = _BN_FG_COUNT_RE.search(sys_log)
+    if count_match:
+        bn_native_count = int(count_match.group(1))
+        fg_native_count = int(count_match.group(2))
+
+    result_dicts = [_engine_candidate_to_diag(item) for item in results]
+    any_frag_url = any(item.frag_url for item in results)
+
+    all_args = vars(_ARGS)
+    timing_args = {
+        k: all_args.get(k) for k in _SEARCH_TIMING_ARG_KEYS if k in all_args
+    }
+
+    return {
+        "query": query,
+        "query_repr": repr(query),  # exposes any hidden normalization/whitespace
+        "scraper_type": scraper_type,
+        "cloudscraper_active": engine.cloudscraper is not None,
+        "args_all": {k: _jsonable(v) for k, v in all_args.items()},
+        "args_search_timing": timing_args,
+        "result_count": len(results),
+        "any_frag_url": any_frag_url,
+        # Counts lifted from the captured [SYS] line, not from resolver internals.
+        "bn_native_link_count": bn_native_count,
+        "fg_native_link_count": fg_native_count,
+        # merged candidate count == search_once's returned list length.
+        "merged_candidate_count": len(results),
+        "results": result_dicts,
+        "sys_log_lines": sys_lines,
+        "error": error,
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    """Best-effort coerce an argparse value into something JSON can carry."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     """Reconstruct the engine candidate from the detail request.
 
