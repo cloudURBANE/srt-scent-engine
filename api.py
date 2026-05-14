@@ -133,6 +133,43 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
     }
 
 
+def _source_coverage(
+    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+) -> dict[str, Any]:
+    """Report which sources actually backed this detail bundle. Read-only.
+
+    Railway's runtime is currently 403'd by Cloudflare on fragrantica.com, so a
+    detail fetch routinely succeeds with Basenotes data only. Without this block
+    the frontend cannot tell a dual-source result from a BN-only one -- they
+    have the same shape. This derives coverage purely from what the engine
+    returned; it fabricates nothing and recomputes no score.
+
+    `*_linked` = a source URL was present on the candidate at all.
+    `basenotes` / `fragrantica` = that source actually contributed detail data,
+    judged by its unambiguous per-source field (`bn_consensus` for BN,
+    `frag_cards` for FG). `derived_metrics` is "full" only when both sources
+    contributed; "partial" when one did; "none" when the adapter returned null.
+    """
+    bn_linked = bool(selected.bn_url)
+    fg_linked = bool(selected.frag_url)
+    bn_has_data = bn_linked and bool(details.bn_consensus)
+    fg_has_data = fg_linked and bool(details.frag_cards)
+    if details.derived_metrics is None:
+        derived = "none"
+    elif bn_has_data and fg_has_data:
+        derived = "full"
+    else:
+        derived = "partial"
+    return {
+        "basenotes": bn_has_data,
+        "fragrantica": fg_has_data,
+        "basenotes_linked": bn_linked,
+        "fragrantica_linked": fg_linked,
+        "derived_metrics": derived,
+        "complete": bn_has_data and fg_has_data,
+    }
+
+
 def _details_to_dict(
     selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
 ) -> dict[str, Any]:
@@ -141,6 +178,10 @@ def _details_to_dict(
     `derived_metrics` is passed through exactly as derived_metrics_adapter
     produced it -- a dict on success, or `null` if the adapter raised. It is
     never fabricated.
+
+    `source_coverage` is a read-only honesty signal: when Fragrantica is
+    unreachable the response is BN-only, and the frontend must not present that
+    as complete. See `_source_coverage`.
     """
     notes = details.notes
     return {
@@ -150,6 +191,7 @@ def _details_to_dict(
         "year": _coerce_year(selected.year),
         "gender": details.gender,
         "derived_metrics": details.derived_metrics,
+        "source_coverage": _source_coverage(selected, details),
         # Raw fields, included for convenience (do not remove derived_metrics).
         "raw": {
             "description": details.description,
