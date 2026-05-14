@@ -62,6 +62,16 @@ _ARGS = engine.build_parser().parse_args([])
 # unchanged behavior, so this line is inert until the env var is provided.
 _ARGS.fg_cache = os.environ.get("FG_CACHE_PATH", _ARGS.fg_cache)
 
+# fg_detail_cache_v1.json overlay wiring. FG_CACHE_PATH (above) only restores
+# Fragrantica *URL identity* -- it does not bring back the parsed Fragrantica
+# detail metrics, so on Railway /details still returns BN-only data with every
+# Fragrantica-derived metric group null. FG_DETAIL_CACHE_PATH points at a second
+# cache file -- parsed Fragrantica detail output (frag_cards/notes/...) warmed
+# offline by scripts/warm_fg_detail_cache.py -- which the API-level overlay in
+# _apply_fg_detail_cache() merges onto a BN-only bundle. Unset = path inert.
+_FG_DETAIL_CACHE_PATH = os.environ.get("FG_DETAIL_CACHE_PATH", "")
+_FG_DETAIL_CACHE: dict[str, Any] | None = None  # lazy-loaded once, see below
+
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
 # ---------------------------------------------------------------------------
@@ -144,7 +154,9 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
 
 
 def _source_coverage(
-    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+    selected: engine.UnifiedFragrance,
+    details: engine.UnifiedDetails,
+    fragrantica_cached: bool = False,
 ) -> dict[str, Any]:
     """Report which sources actually backed this detail bundle. Read-only.
 
@@ -157,8 +169,11 @@ def _source_coverage(
     `*_linked` = a source URL was present on the candidate at all.
     `basenotes` / `fragrantica` = that source actually contributed detail data,
     judged by its unambiguous per-source field (`bn_consensus` for BN,
-    `frag_cards` for FG). `derived_metrics` is "full" only when both sources
-    contributed; "partial" when one did; "none" when the adapter returned null.
+    `frag_cards` for FG). `fragrantica_cached` = the Fragrantica contribution
+    came from fg_detail_cache_v1.json rather than a live fetch -- cached data is
+    real parsed parser output, but it is labelled honestly as not-live.
+    `derived_metrics` is "full" only when both sources contributed; "partial"
+    when one did; "none" when the adapter returned null.
     """
     bn_linked = bool(selected.bn_url)
     fg_linked = bool(selected.frag_url)
@@ -173,6 +188,7 @@ def _source_coverage(
     return {
         "basenotes": bn_has_data,
         "fragrantica": fg_has_data,
+        "fragrantica_cached": fragrantica_cached,
         "basenotes_linked": bn_linked,
         "fragrantica_linked": fg_linked,
         "derived_metrics": derived,
@@ -181,7 +197,9 @@ def _source_coverage(
 
 
 def _details_to_dict(
-    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+    selected: engine.UnifiedFragrance,
+    details: engine.UnifiedDetails,
+    fragrantica_cached: bool = False,
 ) -> dict[str, Any]:
     """Serialize a full detail bundle.
 
@@ -191,7 +209,8 @@ def _details_to_dict(
 
     `source_coverage` is a read-only honesty signal: when Fragrantica is
     unreachable the response is BN-only, and the frontend must not present that
-    as complete. See `_source_coverage`.
+    as complete. `fragrantica_cached` flags when the Fragrantica contribution
+    was hydrated from fg_detail_cache_v1.json. See `_source_coverage`.
     """
     notes = details.notes
     return {
@@ -201,7 +220,7 @@ def _details_to_dict(
         "year": _coerce_year(selected.year),
         "gender": details.gender,
         "derived_metrics": details.derived_metrics,
-        "source_coverage": _source_coverage(selected, details),
+        "source_coverage": _source_coverage(selected, details, fragrantica_cached),
         # Raw fields, included for convenience (do not remove derived_metrics).
         "raw": {
             "description": details.description,
@@ -610,6 +629,126 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+# ---------------------------------------------------------------------------
+# fg_detail_cache_v1.json -- API-level Fragrantica detail overlay.
+#
+# FG_CACHE_PATH restores Fragrantica URL identity but not the parsed Fragrantica
+# detail metrics, so on Railway a live detail fetch still returns BN-only data:
+# details.frag_cards is empty and every Fragrantica-derived metric group is
+# null. This overlay hydrates details.frag_cards (plus notes/pros_cons/reviews)
+# from a cache file warmed offline by scripts/warm_fg_detail_cache.py, then
+# re-runs the existing derived_metrics_adapter over the merged object.
+#
+# It is strictly additive and changes no engine/parser/resolver/adapter code:
+#   * It never runs when live Fragrantica data is present (frag_cards non-empty).
+#   * It only fills empty fields -- live data always wins.
+#   * It imports and calls build_derived_metrics exactly as the engine does.
+# Unset FG_DETAIL_CACHE_PATH => this whole path is inert.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_fg_url(url: str) -> str:
+    """Normalize a Fragrantica URL for stable cache keying.
+
+    Lowercases scheme+host and strips trailing slashes/whitespace. The path
+    (which carries the perfume id) is preserved verbatim.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        if "/" in rest:
+            host, path = rest.split("/", 1)
+            text = f"{scheme.lower()}://{host.lower()}/{path}"
+        else:
+            text = f"{scheme.lower()}://{rest.lower()}"
+    return text.rstrip("/")
+
+
+def _load_fg_detail_cache() -> dict[str, Any]:
+    """Lazy-load the detail cache once. Missing/corrupt file => empty (inert)."""
+    global _FG_DETAIL_CACHE
+    if _FG_DETAIL_CACHE is not None:
+        return _FG_DETAIL_CACHE
+    entries: dict[str, Any] = {}
+    if _FG_DETAIL_CACHE_PATH:
+        try:
+            with open(_FG_DETAIL_CACHE_PATH, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            raw = payload.get("entries", {}) if isinstance(payload, dict) else {}
+            if isinstance(raw, dict):
+                entries = {
+                    _canonical_fg_url(k): v
+                    for k, v in raw.items()
+                    if isinstance(v, dict)
+                }
+        except Exception:
+            entries = {}
+    _FG_DETAIL_CACHE = entries
+    return _FG_DETAIL_CACHE
+
+
+def _apply_fg_detail_cache(
+    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+) -> bool:
+    """Overlay cached Fragrantica detail data onto a BN-only detail bundle.
+
+    Returns True only when cached Fragrantica data was actually applied. Live
+    Fragrantica data always wins: if details.frag_cards is already populated
+    this is a no-op and returns False.
+    """
+    # Live Fragrantica data present -> never touch it.
+    if details.frag_cards:
+        return False
+    if not selected.frag_url:
+        return False
+    entry = _load_fg_detail_cache().get(_canonical_fg_url(selected.frag_url))
+    if not entry:
+        return False
+
+    cached_cards = entry.get("frag_cards")
+    if not isinstance(cached_cards, dict) or not cached_cards:
+        return False
+    details.frag_cards = cached_cards
+
+    # Notes: fill only when the live bundle carried none (BN supplied nothing).
+    notes = details.notes
+    if not (notes.top or notes.heart or notes.base or notes.flat):
+        cached_notes = entry.get("notes") or {}
+        if isinstance(cached_notes, dict):
+            notes.has_pyramid = bool(cached_notes.get("has_pyramid", False))
+            notes.top = list(cached_notes.get("top", []) or [])
+            notes.heart = list(cached_notes.get("heart", []) or [])
+            notes.base = list(cached_notes.get("base", []) or [])
+            notes.flat = list(cached_notes.get("flat", []) or [])
+
+    # pros_cons / reviews: additive only -- never replace live content.
+    cached_pros_cons = entry.get("pros_cons") or []
+    if isinstance(cached_pros_cons, list):
+        details.pros_cons.extend(str(p) for p in cached_pros_cons)
+    cached_reviews = entry.get("reviews") or []
+    if isinstance(cached_reviews, list):
+        for r in cached_reviews:
+            if isinstance(r, dict) and r.get("text"):
+                details.reviews.append(
+                    engine.Review(
+                        text=str(r["text"]), source=str(r.get("source", ""))
+                    )
+                )
+
+    # Re-run the existing adapter over the merged object. Best-effort: a failure
+    # here must not break the raw detail response (mirrors the engine contract
+    # in fetch_selected_details).
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        details.derived_metrics = build_derived_metrics(details)
+    except Exception:
+        details.derived_metrics = None
+    return True
+
+
 def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     """Reconstruct the engine candidate from the detail request.
 
@@ -670,7 +809,12 @@ def details(req: DetailRequest) -> dict[str, Any]:
             status_code=502, detail=f"Detail fetch failed: {exc}"
         ) from exc
 
-    return _details_to_dict(selected, detail_bundle)
+    # If the live fetch produced no Fragrantica contribution (Railway is 403'd
+    # on fragrantica.com), hydrate it from fg_detail_cache_v1.json. Inert when
+    # live FG data exists or FG_DETAIL_CACHE_PATH is unset.
+    fragrantica_cached = _apply_fg_detail_cache(selected, detail_bundle)
+
+    return _details_to_dict(selected, detail_bundle, fragrantica_cached)
 
 
 if __name__ == "__main__":
