@@ -1032,6 +1032,240 @@ def _jsonable(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Spell-repair diagnostics (TEMPORARY -- remove after the suggest() empty-return
+# cause is proven).
+#
+# /engine-search showed the pipeline is healthy on a correctly-spelled query but
+# a typo'd query ("dior sava") returns []: QueryRepair.suggest() returns "" --
+# it never corrects the typo to "dior sauvage" -- even though /upstream reports
+# Google/Bing reachable and fast. suggest() repairs typos by SCRAPING Google/
+# Bing SERP HTML; the hypothesis is that the markup Railway's datacenter IP gets
+# back lacks the result links / "did you mean" text the parsers expect.
+#
+# This endpoint fetches the exact search URLs suggest() builds, reports what
+# markup actually came back (length, key marker presence, anchor count, consent-
+# page markers, preview), and runs the engine's OWN extractors + evidence
+# harvester over that markup so we can see precisely where the evidence is lost.
+# It then runs the real suggest() end-to-end at the live budget AND at a
+# generous budget, to rule the 1.6s deadline in or out. Strictly read-only --
+# it calls engine functions but mutates no engine state. Delete this block once
+# the parser fix lands.
+# ---------------------------------------------------------------------------
+
+# Plain fragrantica.com/perfume URLs in raw markup -- the canonical evidence
+# _add_markup_evidence harvests. Zero of these in a 200-OK body is the smoking
+# gun for "Google served Railway a stripped/JS-only/consent SERP".
+_FG_PERFUME_URL_RE = __import__("re").compile(
+    r"https?://[^\s\"'<>]*fragrantica\.com/perfume/[^\s\"'<>]+"
+)
+
+# Consent / soft-block interstitials Google/Bing serve datacenter IPs instead of
+# a real SERP. Their presence explains an empty parse on an HTTP 200.
+_CONSENT_MARKERS = (
+    "consent.google",
+    "consent.youtube",
+    "before you continue",
+    "/sorry/",
+    "unusual traffic",
+    "our systems have detected",
+)
+
+
+def _inspect_search_markup(markup: str, kind: str, original: str) -> dict[str, Any]:
+    """Run the engine's own SERP extractors over `markup` and report the result.
+
+    Mirrors exactly what QueryRepair.suggest() does internally: it calls the
+    same extractor (extract_google_suggestion / extract_bing_suggestion) and the
+    same evidence harvester (_add_markup_evidence). If `harvested_records` is
+    empty here, suggest() harvested nothing from this page either.
+    """
+    lowered = markup.lower()
+    fg_urls = _FG_PERFUME_URL_RE.findall(markup)
+
+    extractor_kind = "bing" if kind == "bing" else "google"
+    try:
+        if extractor_kind == "bing":
+            extracted = engine.QueryRepair.extract_bing_suggestion(markup, original)
+        else:
+            extracted = engine.QueryRepair.extract_google_suggestion(markup, original)
+    except Exception as exc:
+        extracted = f"<error: {type(exc).__name__}: {exc}>"
+
+    # The raw evidence dict suggest() builds up across all its SERP fetches.
+    records: dict[str, Any] = {}
+    try:
+        engine.QueryRepair._add_markup_evidence(
+            records, markup, original, kind=extractor_kind
+        )
+        records_dump = {
+            key: {k: _jsonable(v) for k, v in rec.items()}
+            for key, rec in records.items()
+        }
+    except Exception as exc:
+        records_dump = {"<error>": f"{type(exc).__name__}: {exc}"}
+
+    return {
+        "markup_length": len(markup),
+        "fragrantica_perfume_url_count": len(fg_urls),
+        "fragrantica_perfume_url_sample": fg_urls[:5],
+        "contains_did_you_mean": "did you mean" in lowered,
+        "contains_showing_results_for": "showing results for" in lowered,
+        "contains_including_results_for": "including results for" in lowered,
+        "contains_consent_or_softblock": any(m in lowered for m in _CONSENT_MARKERS),
+        "anchor_tag_count": lowered.count("<a "),
+        "engine_extractor_returned": extracted,
+        "harvested_record_count": len(records),
+        "harvested_records": records_dump,
+    }
+
+
+@app.get("/api/diagnostics/spell-repair")
+def spell_repair_diagnostics(
+    q: str = Query("dior sava", min_length=1),
+) -> dict[str, Any]:
+    """Localize why QueryRepair.suggest() returns "" for a typo'd query.
+
+    Temporary, read-only. Fetches the exact search URLs suggest() uses, runs the
+    engine's own extractors/harvester over the returned markup, then runs the
+    real suggest() at the live budget and at a generous budget.
+    """
+    import time as _time
+
+    query = q.strip()
+    scraper = engine.get_scraper()
+    headers = dict(engine.Http.DEFAULT_HEADERS)
+
+    # A representative subset of the queries suggest() builds for a short input:
+    # the canonical site-search (where the FG perfume links live), a plain
+    # "<q> perfume" google pass, the bing equivalent, and the autocomplete JSON.
+    probe_queries: list[tuple[str, str]] = [
+        ("google", f"{query} site:fragrantica.com/perfume"),
+        ("google", f"{query} perfume"),
+        ("bing", f"{query} site:fragrantica.com/perfume"),
+        ("autocomplete", f"{query} fragrance"),
+    ]
+
+    probes: list[dict[str, Any]] = []
+    for kind, search_query in probe_queries:
+        url = engine.QueryRepair._search_url(kind, search_query)
+        entry: dict[str, Any] = {
+            "kind": kind,
+            "search_query": search_query,
+            "url": url,
+        }
+        started = _time.monotonic()
+        try:
+            # Generous 10s timeout here on purpose: we want to SEE the markup
+            # regardless of the engine's tight ~0.8s budget. The budget itself
+            # is tested separately via the suggest() runs below.
+            res = scraper.get(url, timeout=10, headers=headers)
+            entry["http_status"] = res.status_code
+            entry["elapsed_ms"] = int((_time.monotonic() - started) * 1000)
+            markup = res.text or ""
+            if kind == "autocomplete":
+                try:
+                    extracted = engine.QueryRepair.extract_google_autocomplete(
+                        markup, query
+                    )
+                except Exception as exc:
+                    extracted = f"<error: {type(exc).__name__}: {exc}>"
+                entry["markup_length"] = len(markup)
+                entry["body_preview"] = markup[:300]
+                entry["engine_extractor_returned"] = extracted
+            else:
+                entry.update(_inspect_search_markup(markup, kind, query))
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["elapsed_ms"] = int((_time.monotonic() - started) * 1000)
+        probes.append(entry)
+
+    # Run the real suggest() end-to-end. The first run uses the engine's live
+    # budget (_ARGS.spell_repair_budget, default 1.6s) -- this is exactly what
+    # the public /search path does. The second uses a generous budget: if the
+    # live run returns "" but the generous run returns a correction, the bug is
+    # the deadline; if both return "", the bug is the markup/parser.
+    def _run_suggest(seconds: float) -> dict[str, Any]:
+        started = _time.monotonic()
+        try:
+            out = engine.QueryRepair.suggest(scraper, query, seconds=seconds)
+            return {
+                "budget_seconds": seconds,
+                "returned": out,
+                "elapsed_ms": int((_time.monotonic() - started) * 1000),
+            }
+        except Exception as exc:
+            return {
+                "budget_seconds": seconds,
+                "error": f"{type(exc).__name__}: {exc}",
+                "elapsed_ms": int((_time.monotonic() - started) * 1000),
+            }
+
+    suggest_runs = [
+        _run_suggest(float(_ARGS.spell_repair_budget)),
+        _run_suggest(8.0),
+    ]
+
+    # Cheap verdict so the JSON is readable without cross-referencing fields.
+    any_fg_links = any(
+        p.get("fragrantica_perfume_url_count", 0) > 0 for p in probes
+    )
+    any_consent = any(p.get("contains_consent_or_softblock") for p in probes)
+    any_harvested = any(p.get("harvested_record_count", 0) > 0 for p in probes)
+    live_suggest = suggest_runs[0].get("returned")
+    generous_suggest = suggest_runs[1].get("returned")
+    if not any_fg_links and any_consent:
+        verdict = (
+            "Google/Bing served a consent / soft-block page, not a real SERP -- "
+            "the markup has no fragrantica.com/perfume links to harvest. This is "
+            "an IP-shaped block, not a parser bug."
+        )
+    elif not any_fg_links:
+        verdict = (
+            "The SERP markup contains ZERO fragrantica.com/perfume links despite "
+            "HTTP 200 -- Google/Bing served Railway a stripped or JS-rendered "
+            "page. The parser is fine; there is nothing in the HTML to parse."
+        )
+    elif any_fg_links and not any_harvested:
+        verdict = (
+            "The markup DOES contain fragrantica.com/perfume links but "
+            "_add_markup_evidence harvested none of them -- this is a genuine "
+            "parser/selector bug. Patch _add_markup_evidence."
+        )
+    elif any_harvested and not live_suggest and generous_suggest:
+        verdict = (
+            "Evidence harvested and a correction is reachable, but the live "
+            "1.6s budget returns '' -- the bug is the deadline, not the parser. "
+            "Raise spell_repair_budget or speed up the fetch path."
+        )
+    elif any_harvested and not live_suggest and not generous_suggest:
+        verdict = (
+            "Evidence WAS harvested but suggest() still returns '' even at a "
+            "generous budget -- the bug is downstream of harvesting: scoring "
+            "(_best_record / _record_score) or confidence thresholds."
+        )
+    else:
+        verdict = (
+            "suggest() returned a correction here. If the public /search still "
+            "fails, the divergence is elsewhere (args, scraper, or timing)."
+        )
+
+    return {
+        "query": query,
+        "spell_repair_budget": _ARGS.spell_repair_budget,
+        "probes": probes,
+        "suggest_runs": suggest_runs,
+        "summary": {
+            "any_fragrantica_links_in_markup": any_fg_links,
+            "any_consent_or_softblock_page": any_consent,
+            "any_evidence_harvested": any_harvested,
+            "live_budget_suggest_returned": live_suggest,
+            "generous_budget_suggest_returned": generous_suggest,
+        },
+        "verdict": verdict,
+    }
+
+
+# ---------------------------------------------------------------------------
 # fg_detail_cache_v1.json -- API-level Fragrantica detail overlay.
 #
 # FG_CACHE_PATH restores Fragrantica URL identity but not the parsed Fragrantica
