@@ -623,7 +623,7 @@ def print_manager_header(client: ApiClient, config: WorkerConfig) -> None:
     status = _status_counts(client)
     counts = status.get("counts") or {}
     print()
-    print("Scent Engine Enrichment Manager")
+    print("SRT SET ENGINE  ·  enrichment control")
     print()
     print(f"API: {config.api_base_url}")
     print(f"Worker auth: {'configured' if config.auth_configured else 'missing'}")
@@ -657,55 +657,69 @@ def _print_jobs(jobs: list[dict[str, Any]]) -> None:
         )
 
 
+def dispatch_management_action(
+    choice: str, client: ApiClient, config: WorkerConfig, stop: StopController
+) -> str | None:
+    """Run a single management action by menu number.
+
+    Shared by the static menu (run_management) and the live dashboard hotkeys.
+    Returns "exit" when the user chose to leave; None otherwise. Callers are
+    responsible for catching WorkerError / KeyboardInterrupt around this.
+    """
+    if choice == "1":
+        ensure_token(config)
+        _print_jobs(client.list_jobs("pending", limit=MAX_LIST_LIMIT))
+    elif choice == "2":
+        ensure_token(config)
+        one = WorkerConfig(**{**config.__dict__, "limit": 1})
+        process_pending(client, one, stop=stop)
+    elif choice == "3":
+        ensure_token(config)
+        limit = _prompt_int("How many jobs? ", DEFAULT_LIMIT)
+        batch = WorkerConfig(**{**config.__dict__, "limit": limit})
+        process_pending(client, batch, stop=stop)
+    elif choice == "4":
+        ensure_token(config)
+        limit = _prompt_int("How many jobs? ", DEFAULT_LIMIT)
+        delay = _prompt_float("Delay seconds? ", config.delay)
+        jitter = _prompt_float("Jitter seconds? ", config.jitter)
+        batch = WorkerConfig(**{**config.__dict__, "limit": limit, "delay": delay, "jitter": jitter})
+        process_pending(client, batch, stop=stop)
+    elif choice == "5":
+        ensure_token(config)
+        retry_cfg = WorkerConfig(**{**config.__dict__, "limit": config.limit})
+        process_pending(client, retry_cfg, only_retries=True, stop=stop)
+    elif choice == "6":
+        ensure_token(config)
+        job_id = input("Job id to ignore: ").strip()
+        note = input("Note/reason: ").strip()
+        if job_id:
+            if config.dry_run:
+                print(f"Dry run: would ignore {job_id}")
+            else:
+                client.ignore_job(job_id, note)
+                print("Job ignored.")
+    elif choice == "7":
+        print("Cache stats endpoint is unavailable in the current API contract.")
+    elif choice == "8":
+        ensure_token(config)
+        path = input("Query list path: ").strip()
+        if path:
+            warm_list(client, config, path, stop=stop)
+    elif choice == "9":
+        return "exit"
+    else:
+        print("Unknown option.")
+    return None
+
+
 def run_management(client: ApiClient, config: WorkerConfig, stop: StopController) -> int:
     while not stop.stop_requested:
         print_manager_header(client, config)
         choice = input("Choose an option: ").strip()
         try:
-            if choice == "1":
-                ensure_token(config)
-                _print_jobs(client.list_jobs("pending", limit=MAX_LIST_LIMIT))
-            elif choice == "2":
-                ensure_token(config)
-                one = WorkerConfig(**{**config.__dict__, "limit": 1})
-                process_pending(client, one, stop=stop)
-            elif choice == "3":
-                ensure_token(config)
-                limit = _prompt_int("How many jobs? ", DEFAULT_LIMIT)
-                batch = WorkerConfig(**{**config.__dict__, "limit": limit})
-                process_pending(client, batch, stop=stop)
-            elif choice == "4":
-                ensure_token(config)
-                limit = _prompt_int("How many jobs? ", DEFAULT_LIMIT)
-                delay = _prompt_float("Delay seconds? ", config.delay)
-                jitter = _prompt_float("Jitter seconds? ", config.jitter)
-                batch = WorkerConfig(**{**config.__dict__, "limit": limit, "delay": delay, "jitter": jitter})
-                process_pending(client, batch, stop=stop)
-            elif choice == "5":
-                ensure_token(config)
-                retry_cfg = WorkerConfig(**{**config.__dict__, "limit": config.limit})
-                process_pending(client, retry_cfg, only_retries=True, stop=stop)
-            elif choice == "6":
-                ensure_token(config)
-                job_id = input("Job id to ignore: ").strip()
-                note = input("Note/reason: ").strip()
-                if job_id:
-                    if config.dry_run:
-                        print(f"Dry run: would ignore {job_id}")
-                    else:
-                        client.ignore_job(job_id, note)
-                        print("Job ignored.")
-            elif choice == "7":
-                print("Cache stats endpoint is unavailable in the current API contract.")
-            elif choice == "8":
-                ensure_token(config)
-                path = input("Query list path: ").strip()
-                if path:
-                    warm_list(client, config, path, stop=stop)
-            elif choice == "9":
+            if dispatch_management_action(choice, client, config, stop) == "exit":
                 return 0
-            else:
-                print("Unknown option.")
         except WorkerError as exc:
             print(f"Operation failed: {exc.code}")
             if config.debug and str(exc) != exc.code:
@@ -714,6 +728,433 @@ def run_management(client: ApiClient, config: WorkerConfig, stop: StopController
             stop.stop_requested = True
             print("\nStop requested.")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Live management dashboard
+# --------------------------------------------------------------------------
+
+DASHBOARD_MIN_INTERVAL = 5
+DASHBOARD_MAX_INTERVAL = 600
+DASHBOARD_STEP = 15
+# Auto-approve claims + completes one pending enrichment on this fixed cadence.
+AUTO_APPROVE_INTERVAL = 5
+_DASH_STATUSES = ("pending", "processing", "completed", "failed", "ignored")
+
+# The number keys the live dashboard accepts, with plain-language labels so the
+# operator never has to guess what a hotkey does. Keys 1-6 here must stay in
+# sync with dispatch_management_action().
+DASHBOARD_ACTIONS: dict[str, str] = {
+    "1": "List pending jobs",
+    "2": "Process next job",
+    "3": "Process next N jobs",
+    "4": "Process slowly (with delay)",
+    "5": "Retry failed jobs",
+    "6": "Ignore a job",
+}
+
+
+def _read_key_nonblocking() -> str:
+    """Return a pending keypress without blocking, or "" if none.
+
+    Interactive hotkeys rely on Windows' msvcrt; on other platforms this always
+    returns "" so the dashboard still auto-refreshes, just without live keys.
+    """
+    try:
+        import msvcrt  # type: ignore
+    except ImportError:
+        return ""
+    if not msvcrt.kbhit():
+        return ""
+    ch = msvcrt.getwch()
+    # Arrow / function keys arrive as a two-part sequence; swallow the second
+    # part so it is not mistaken for a hotkey.
+    if ch in ("\x00", "\xe0"):
+        if msvcrt.kbhit():
+            msvcrt.getwch()
+        return ""
+    return ch
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _colors() -> dict[str, str]:
+    """Reuse the engine's ANSI palette; degrade to plain text if unavailable."""
+    return {name: str(getattr(engine, name, "") or "") for name in ("B", "Y", "C", "D", "R", "Z")}
+
+
+def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
+    """One status call (always) plus two targeted job-list calls for the
+    actionable "needs attention" metrics. The job-list calls require a worker
+    token; without one they fail quietly and those metrics render as unknown."""
+    status = _status_counts(client)
+    snapshot: dict[str, Any] = {
+        "enabled": status.get("enabled"),
+        "counts": dict(status.get("counts") or {}),
+        "error": status.get("error"),
+        "retryable_failures": None,
+        "stale_processing": None,
+    }
+    if snapshot["error"]:
+        return snapshot
+    try:
+        failed = client.list_jobs("failed", limit=MAX_LIST_LIMIT)
+        snapshot["retryable_failures"] = sum(
+            1 for j in failed if int(j.get("failure_count") or 0) > 0
+        )
+    except WorkerError:
+        pass
+    try:
+        processing = client.list_jobs("processing", limit=MAX_LIST_LIMIT)
+        now = datetime.now(timezone.utc)
+        snapshot["stale_processing"] = sum(
+            1
+            for j in processing
+            if (_parse_iso(j.get("claim_expires_at")) or now) < now
+        )
+    except WorkerError:
+        pass
+    return snapshot
+
+
+def _fmt_delta(delta: int, c: dict[str, str]) -> str:
+    if delta > 0:
+        return f"{c['C']}(+{delta}){c['Z']}"
+    if delta < 0:
+        return f"{c['R']}({delta}){c['Z']}"
+    return f"{c['D']}( 0){c['Z']}"
+
+
+def _render_dashboard(
+    snapshot: dict[str, Any],
+    baseline: dict[str, int],
+    config: WorkerConfig,
+    interval: int,
+    auto_approve: bool = False,
+) -> None:
+    c = _colors()
+    os.system("cls" if os.name == "nt" else "clear")
+    width = 64
+    bar = f"  {c['D']}{'─' * width}{c['Z']}"
+    now = datetime.now().strftime("%H:%M:%S")
+    print()
+    print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
+    print(f"   {c['B']}SRT SET ENGINE{c['Z']}   {c['D']}·   enrichment control{c['Z']}")
+    print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
+    auth = f"{c['C']}● connected{c['Z']}" if config.auth_configured else f"{c['R']}● no token{c['Z']}"
+    print(f"   {c['D']}{now}   refreshes every {interval}s   {c['Z']}{auth}")
+    print(f"   {c['D']}API   {config.api_base_url}{c['Z']}")
+    print(bar)
+    # Make the auto-approve state impossible to miss — it acts on the queue
+    # without any further input once it is on.
+    if auto_approve:
+        print(
+            f"   {c['B']}{c['Y']}● AUTO-APPROVE ON{c['Z']}   "
+            f"{c['D']}claims + completes one pending job every {AUTO_APPROVE_INTERVAL}s{c['Z']}"
+        )
+    else:
+        print(f"   {c['D']}○ auto-approve off   press [a] to start hands-free approval{c['Z']}")
+    print(bar)
+    if snapshot.get("error"):
+        print(f"   {c['R']}Status endpoint unavailable: {snapshot['error']}{c['Z']}")
+        print(f"   {c['D']}Retrying on the next refresh…{c['Z']}")
+        print(bar)
+    else:
+        counts = snapshot.get("counts") or {}
+        print(f"   {c['B']}QUEUE{c['Z']}   {c['D']}(change since this session opened){c['Z']}")
+        for name in _DASH_STATUSES:
+            val = int(counts.get(name) or 0)
+            delta = val - int(baseline.get(name) or 0)
+            print(f"     {name:<12}{c['B']}{val:>6}{c['Z']}   {_fmt_delta(delta, c)}")
+        print(bar)
+        print(f"   {c['B']}NEEDS ATTENTION{c['Z']}")
+        rf = snapshot.get("retryable_failures")
+        sp = snapshot.get("stale_processing")
+        rf_s = f"{c['Y']}{rf}{c['Z']}" if rf is not None else f"{c['D']}— (needs token){c['Z']}"
+        sp_s = f"{c['Y']}{sp}{c['Z']}" if sp is not None else f"{c['D']}— (needs token){c['Z']}"
+        print(f"     retryable failures   {rf_s}")
+        print(f"     stale processing     {sp_s}")
+        print(bar)
+    # Spell out every hotkey so the operator never has to guess.
+    print(f"   {c['B']}ACTIONS{c['Z']}   {c['D']}press a number{c['Z']}")
+    left = [("1", DASHBOARD_ACTIONS["1"]), ("2", DASHBOARD_ACTIONS["2"]), ("3", DASHBOARD_ACTIONS["3"])]
+    right = [("4", DASHBOARD_ACTIONS["4"]), ("5", DASHBOARD_ACTIONS["5"]), ("6", DASHBOARD_ACTIONS["6"])]
+    for (lk, ll), (rk, rl) in zip(left, right):
+        plain = f"[{lk}] {ll}"
+        pad = max(3, 32 - len(plain))
+        print(
+            f"     {c['Y']}[{lk}]{c['Z']} {ll}{' ' * pad}"
+            f"{c['Y']}[{rk}]{c['Z']} {rl}"
+        )
+    print(bar)
+    auto_key = (
+        f"{c['Y']}[a] auto-approve: ON{c['Z']}"
+        if auto_approve
+        else f"{c['D']}[a] auto-approve: off{c['Z']}"
+    )
+    print(f"   {auto_key}")
+    print(
+        f"   {c['D']}[r] refresh now    [+/-] change interval    [q] quit{c['Z']}"
+    )
+
+
+def _run_auto_approve(
+    client: ApiClient,
+    config: WorkerConfig,
+    stop: StopController,
+    auto_state: dict[str, Any],
+) -> None:
+    """Claim and complete the single oldest pending enrichment.
+
+    This is the per-tick body of auto-approve mode: it grabs one pending job,
+    runs it through the same process_job() path the manual actions use, and
+    returns. The engine scraper/args are built once and cached on auto_state so
+    repeated ticks stay cheap.
+    """
+    c = _colors()
+    try:
+        jobs = client.list_jobs("pending", limit=1)
+    except WorkerError as exc:
+        print(f"  {c['R']}auto-approve: cannot read the queue ({exc.code}){c['Z']}")
+        time.sleep(1.0)
+        return
+    if not jobs:
+        print(f"  {c['D']}auto-approve: queue is empty — nothing to approve right now.{c['Z']}")
+        time.sleep(1.0)
+        return
+    if auto_state.get("scraper") is None:
+        auto_state["scraper"] = engine.get_scraper()
+        auto_state["args"] = _build_engine_args()
+    print(f"  {c['B']}{c['Y']}● AUTO-APPROVE{c['Z']} processing the next pending job…")
+    try:
+        process_job(
+            client,
+            auto_state["scraper"],
+            auto_state["args"],
+            jobs[0],
+            index_label="[auto]",
+            config=config,
+        )
+    except KeyboardInterrupt:
+        stop.stop_requested = True
+    except WorkerError as exc:
+        print(f"  {c['R']}auto-approve failed: {exc.code}{c['Z']}")
+        if config.debug and str(exc) != exc.code:
+            print(f"  {exc}")
+
+
+def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopController) -> int:
+    """Auto-refreshing visual of the enrichment queue cume.
+
+    The refresh interval seeds from the worker delay and is adjustable live with
+    +/-. Menu numbers 1-6 dispatch the same actions as the static manager menu.
+    Pressing [a] toggles auto-approve, which claims + completes one pending job
+    every AUTO_APPROVE_INTERVAL seconds with no further input.
+    """
+    interval = int(max(DASHBOARD_MIN_INTERVAL, min(DASHBOARD_MAX_INTERVAL, round(config.delay or DEFAULT_DELAY))))
+    baseline: dict[str, int] | None = None
+    refresh_now = True
+    auto_approve = False
+    auto_state: dict[str, Any] = {"scraper": None, "args": None}
+    c = _colors()
+    while not stop.stop_requested:
+        if refresh_now:
+            snapshot = _gather_dashboard_snapshot(client)
+            if baseline is None and not snapshot.get("error"):
+                baseline = dict(snapshot.get("counts") or {})
+            _render_dashboard(snapshot, baseline or {}, config, interval, auto_approve)
+            refresh_now = False
+
+        # Wait one cadence, polling for a keypress each second. When auto-approve
+        # is on the cadence is the fixed 5s tick; otherwise it is the refresh
+        # interval. Either way a keypress breaks out immediately.
+        action_key = ""
+        wait_total = AUTO_APPROVE_INTERVAL if auto_approve else interval
+        waited = 0
+        while waited < wait_total and not stop.stop_requested:
+            left = wait_total - waited
+            if auto_approve:
+                line = (
+                    f"  {c['Y']}● AUTO{c['Z']} {c['D']}approving next job in "
+                    f"{left:>2}s — press [a] to stop…{c['Z']}   "
+                )
+            else:
+                line = f"  {c['D']}next refresh in {left:>3}s…{c['Z']}   "
+            print(line, end="\r", flush=True)
+            slept = 0.0
+            while slept < 1.0:
+                key = _read_key_nonblocking()
+                if key:
+                    action_key = key
+                    break
+                time.sleep(0.1)
+                slept += 0.1
+            if action_key:
+                break
+            waited += 1
+        print(" " * 72, end="\r")  # wipe the countdown line
+
+        if stop.stop_requested:
+            break
+
+        key = action_key.lower()
+        if not action_key:
+            # The cadence elapsed with no key. In auto-approve mode that means
+            # it is time to process one job; otherwise just refresh the view.
+            if auto_approve:
+                _run_auto_approve(client, config, stop, auto_state)
+            refresh_now = True
+            continue
+        if key == "q":
+            break
+        if key == "a":
+            if not auto_approve and not config.auth_configured:
+                print(
+                    f"\n  {c['R']}Auto-approve needs a worker token. "
+                    f"Open SRT Set Engine via [M] to sign in first.{c['Z']}"
+                )
+                time.sleep(1.8)
+            else:
+                auto_approve = not auto_approve
+            refresh_now = True
+        elif key in ("+", "="):
+            interval = min(DASHBOARD_MAX_INTERVAL, interval + DASHBOARD_STEP)
+            refresh_now = True
+        elif key in ("-", "_"):
+            interval = max(DASHBOARD_MIN_INTERVAL, interval - DASHBOARD_STEP)
+            refresh_now = True
+        elif key in ("1", "2", "3", "4", "5", "6"):
+            print()
+            try:
+                dispatch_management_action(key, client, config, stop)
+            except WorkerError as exc:
+                print(f"Operation failed: {exc.code}")
+                if config.debug and str(exc) != exc.code:
+                    print(str(exc))
+            except KeyboardInterrupt:
+                print("\nAction interrupted.")
+            input("\nPress Enter to return to the dashboard… ")
+            refresh_now = True
+        else:
+            # 'r' or any other key — just refresh.
+            refresh_now = True
+    print("\nLeaving SRT Set Engine.")
+    return 0
+
+
+def _read_secret(label: str) -> str:
+    """Prompt for a secret value, hiding the typed characters where possible.
+
+    Falls back to a plain visible prompt on terminals that cannot mask input
+    (so pasting a token still works no matter where this runs)."""
+    try:
+        import getpass
+
+        return getpass.getpass(label)
+    except Exception:
+        return input(label)
+
+
+def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -> bool:
+    """Branded sign-in screen shown before the live dashboard opens.
+
+    Asks for the enrichment worker token, verifies it against the protected
+    job-list endpoint, and stores the accepted token on both the config and the
+    client. Returns True once access is granted, False if the operator backs
+    out. A token found in the environment is offered as the default.
+    """
+    c = _colors()
+    width = 64
+    env_token = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
+    while not stop.stop_requested:
+        os.system("cls" if os.name == "nt" else "clear")
+        print()
+        print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
+        print(f"   {c['B']}SRT SET ENGINE{c['Z']}   {c['D']}·   enrichment control{c['Z']}")
+        print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
+        print()
+        print(f"   {c['D']}API   {config.api_base_url}{c['Z']}")
+        print()
+        if env_token:
+            print(f"   {c['C']}A worker token was found in your environment.{c['Z']}")
+            print(f"   Press {c['B']}Enter{c['Z']} to use it, or paste a different token.")
+        else:
+            print(f"   Enter your {c['B']}enrichment worker token{c['Z']} to unlock the controls.")
+        print(f"   {c['D']}Typing is hidden. Submit an empty token to cancel.{c['Z']}")
+        print()
+        try:
+            entered = _read_secret(f"   {c['B']}token ›{c['Z']} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        token = entered or env_token
+        if not token:
+            print(f"\n   {c['Y']}No token provided — exiting.{c['Z']}")
+            return False
+        config.token = token
+        client.token = token
+        print(f"\n   {c['D']}Verifying token…{c['Z']}")
+        try:
+            client.list_jobs("pending", limit=1)
+        except WorkerError as exc:
+            if exc.code in ("api_auth_failed", "api_request_failed"):
+                print(f"   {c['R']}✗ Token rejected ({exc.code}).{c['Z']}")
+                env_token = ""  # a rejected env token should not be re-offered
+                try:
+                    input(f"   {c['D']}Press Enter to try again, or Ctrl+C to exit…{c['Z']} ")
+                except (EOFError, KeyboardInterrupt):
+                    return False
+                continue
+            # Network/server hiccup rather than a bad token — let the operator
+            # in and let the dashboard keep retrying its own calls on refresh.
+            print(f"   {c['Y']}⚠ Could not verify right now ({exc.code}); continuing anyway.{c['Z']}")
+            time.sleep(1.4)
+            return True
+        print(f"   {c['C']}✓ Access granted.{c['Z']}")
+        time.sleep(0.8)
+        return True
+    return False
+
+
+def launch_dashboard(api_base_url: str | None = None) -> int:
+    """Build a config from the environment and open the live dashboard.
+
+    This is the single entry point the main parser script imports for its
+    startup "Management" mode, and what the worker's --dashboard flag calls.
+    The operator must clear the token sign-in gate before the dashboard opens.
+    """
+    base = (api_base_url or os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
+    config = WorkerConfig(
+        api_base_url=base,
+        token=os.environ.get("ENRICHMENT_WORKER_TOKEN", ""),
+        delay=_env_float("ENRICHMENT_DEFAULT_DELAY", DEFAULT_DELAY),
+        jitter=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER),
+        limit=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT),
+        detail_timeout=8.0,
+        debug=False,
+        dry_run=False,
+    )
+    client = ApiClient(config.api_base_url, config.token)
+    stop = StopController()
+    stop.install()
+    try:
+        if not _login_gate(client, config, stop):
+            print("\nLeaving SRT Set Engine.")
+            return 0
+        return run_live_dashboard(client, config, stop)
+    except KeyboardInterrupt:
+        print("\nLeaving SRT Set Engine.")
+        return 0
 
 
 def ensure_token(config: WorkerConfig) -> None:
@@ -740,6 +1181,7 @@ def _prompt_float(label: str, default: float) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--management", action="store_true", help="Show the interactive management menu.")
+    parser.add_argument("--dashboard", action="store_true", help="Open the live auto-refreshing management dashboard.")
     parser.add_argument("--process-pending", action="store_true", help="Process pending enrichment jobs.")
     parser.add_argument("--warm-list", help="Path to one-query-per-line warm list.")
     parser.add_argument("--api-base-url", default=os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL))
@@ -775,6 +1217,8 @@ def main() -> int:
     stop.install()
 
     try:
+        if opts.dashboard:
+            return run_live_dashboard(client, config, stop)
         if opts.process_pending or opts.once:
             ensure_token(config)
             process_pending(client, config, stop=stop)
