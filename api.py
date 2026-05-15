@@ -1454,18 +1454,37 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     )
 
 
+def _identity_job_key(selected: engine.UnifiedFragrance) -> str:
+    """Stable fallback job_key when neither source URL is present.
+
+    Lower-cases brand|name so re-searches of the same fragrance dedupe to one
+    pending row. Returns "" when there is no name to key on.
+    """
+    brand = (selected.brand or "").strip().lower()
+    name = (selected.name or "").strip().lower()
+    if not name:
+        return ""
+    return f"id:{brand}|{name}"
+
+
 def _enqueue_enrichment_job(
     selected: engine.UnifiedFragrance, req: DetailRequest
 ) -> None:
     """Enqueue (or upsert) an enrichment job for a partial detail result.
 
-    Keyed by the canonical Fragrantica URL, so a repeated request for the same
-    fragrance bumps the job's requested_count instead of duplicating it. Any
-    failure here is swallowed -- enrichment is a background nicety and must
-    never break the user-facing /details response.
+    Job key prefers the canonical Fragrantica URL, falls back to the canonical
+    Basenotes URL, then to a brand|name identity slug -- so a BN-only candidate
+    still gets a pending row that the worker can resolve to FG at claim time.
+    Repeated requests for the same fragrance bump requested_count instead of
+    duplicating. Any failure here is swallowed -- enrichment is a background
+    nicety and must never break the user-facing /details response.
     """
     try:
-        job_key = _canonical_fg_url(selected.frag_url)
+        job_key = (
+            _canonical_fg_url(selected.frag_url)
+            or _canonical_fg_url(selected.bn_url)
+            or _identity_job_key(selected)
+        )
         if not job_key:
             return
         db.enqueue_job(
@@ -1518,14 +1537,11 @@ def details(req: DetailRequest) -> dict[str, Any]:
         fragrantica_cache_source = "json"
     fragrantica_cached = fragrantica_cache_source is not None
 
-    # Still partial: a Fragrantica URL is linked but no live/cached FG data
-    # exists. Enqueue an enrichment job so the offline worker can fetch it.
-    # Inert when DATABASE_URL is unset.
-    if (
-        not detail_bundle.frag_cards
-        and selected.frag_url
-        and not fragrantica_cached
-    ):
+    # Partial result: no live or cached FG data. Enqueue so the offline worker
+    # can fetch from an environment that is not 403'd. The worker resolves a
+    # missing fg_url from name/house at claim time, so BN-only candidates are
+    # eligible too. Inert when DATABASE_URL is unset.
+    if not detail_bundle.frag_cards and not fragrantica_cached:
         _enqueue_enrichment_job(selected, req)
 
     return _details_to_dict(
