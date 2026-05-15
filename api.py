@@ -907,9 +907,11 @@ def search(
 _ANSI_RE = __import__("re").compile(r"\x1b\[[0-9;]*m")
 
 # The engine's stdout line emitted by _search_core right after the first pass:
-#   [SYS] Found {X} BN links and {Y} FG native links.
-_BN_FG_COUNT_RE = __import__("re").compile(
-    r"Found\s+(\d+)\s+BN links and\s+(\d+)\s+FG native links"
+#   [SYS] First-pass resolver: {X} + {Y} candidate links.
+# Group(1) is the Basenotes-side count, group(2) is the Fragrantica-side count
+# (order preserved from the engine's emission order).
+_FIRST_PASS_COUNT_RE = __import__("re").compile(
+    r"First-pass resolver:\s*(\d+)\s*\+\s*(\d+)\s+candidate links"
 )
 
 # _ARGS fields that govern search timing / deadlines / budgets. Surfaced so a
@@ -973,8 +975,8 @@ def engine_search_diagnostics(
     scraper = engine.get_scraper()
     scraper_type = type(scraper).__module__ + "." + type(scraper).__name__
 
-    # Capture the engine's stdout so the [SYS] log lines (incl. the BN/FG link
-    # counts) are visible without touching resolver internals.
+    # Capture the engine's stdout so the [SYS] log lines (incl. the first-pass
+    # candidate counts) are visible without touching resolver internals.
     captured = io.StringIO()
     error: str | None = None
     results: list[engine.UnifiedFragrance] = []
@@ -987,11 +989,11 @@ def engine_search_diagnostics(
     sys_log = _ANSI_RE.sub("", captured.getvalue())
     sys_lines = [ln for ln in sys_log.splitlines() if "[SYS]" in ln]
 
-    # Pull the BN / FG native link counts straight out of the captured log
+    # Pull the first-pass candidate counts straight out of the captured log
     # line -- this reads no resolver internals, only what the engine printed.
     bn_native_count: int | None = None
     fg_native_count: int | None = None
-    count_match = _BN_FG_COUNT_RE.search(sys_log)
+    count_match = _FIRST_PASS_COUNT_RE.search(sys_log)
     if count_match:
         bn_native_count = int(count_match.group(1))
         fg_native_count = int(count_match.group(2))

@@ -2469,7 +2469,7 @@ def _bn_approval_score(details: UnifiedDetails) -> tuple[float | None, str]:
     score = pos_pct + (neu_pct * 0.35)
     label = f"{pos_pct}% positive"
     if total:
-        label += f" · {total} BN votes"
+        label += f" · {total} votes"
     return max(0.0, min(100.0, score)), label
 
 def build_metric_scorecard(details: UnifiedDetails) -> dict[str, Any]:
@@ -2516,7 +2516,7 @@ def print_scorecard(details: UnifiedDetails) -> None:
     val_score, val_label = card["value"]
     rows = [
         ("Rating", score_cell(fg_score), f"{fg_value} {fg_count}".strip()),
-        ("BN approval", score_cell(bn_score), bn_label),
+        ("Approval", score_cell(bn_score), bn_label),
         ("Performance", score_cell(perf_score), perf_label),
         ("Value", score_cell(val_score), val_label),
     ]
@@ -5713,12 +5713,12 @@ def print_dashboard(frag: UnifiedFragrance, details: UnifiedDetails, fetch_time:
     print(f"{C}│{Z} {Y}Gender:{Z} {gender}{' ' * max(0, width - len('Gender: ') - len(gender))} {C}│{Z}")
     print(f"{B}{C}╰{'─' * (width + 2)}╯{Z}")
     if debug:
-        print(f" {D}↳ BN: {frag.bn_url or 'N/A'}{Z}")
-        print(f" {D}↳ FG: {frag.frag_url or 'N/A'}{Z}")
+        print(f" {D}↳ ref 1: {frag.bn_url or 'N/A'}{Z}")
+        print(f" {D}↳ ref 2: {frag.frag_url or 'N/A'}{Z}")
         print(f" {D}↳ Resolver: {frag.resolver_source or 'N/A'} {frag.resolver_score:.2f}{Z}")
     print(f" {D}[Selected-detail data synchronized in {fetch_time:.2f}s]{Z}\n")
     if details.bn_consensus:
-        print(f" {B}✦ BASENOTES CONSENSUS ✦{Z}")
+        print(f" {B}✦ COMMUNITY CONSENSUS ✦{Z}")
         for key, label, color in (("pos", "Positive", G), ("neu", "Neutral ", Y), ("neg", "Negative", R)):
             votes, pct = details.bn_consensus.get(key, (0, 0))
             print(f"  {label}: {draw_bar(pct, 15, color)} {pct:>3}% {D}({votes} votes){Z}")
@@ -5751,8 +5751,8 @@ def fit_cell(text: object, width: int) -> str:
 def print_results_table(results: list[UnifiedFragrance], search_time: float, debug: bool = False) -> None:
     linked_count = sum(1 for item in results if item.frag_url)
     print(f"\n{G}✓ {len(results)} results · {linked_count} ★ linked · {search_time:.2f}s{Z}")
-    print(f"{D}Sorted by query match. BN Sent = BaseNotes positive sentiment; it is not the ranking key.{Z}\n")
-    headers = [("#", 2), ("Match", 5), ("BN Sent", 10), ("★", 3), ("Fragrance", 32), ("Brand", 22), ("Year", 6)]
+    print(f"{D}Sorted by query match. Sent % shows positive review sentiment; it is not the ranking key.{Z}\n")
+    headers = [("#", 2), ("Match", 5), ("Sent %", 10), ("★", 3), ("Fragrance", 32), ("Brand", 22), ("Year", 6)]
     if debug:
         headers.append(("Resolver", 12))
     line = "┬".join("─" * (w + 2) for _, w in headers)
@@ -5802,7 +5802,7 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     bn_results = initial.get("bn") or []
     frag_results = initial.get("fg") or []
     timer.mark("initial_fg_bn_fetch")
-    print(f"{D}[SYS] Found {len(bn_results)} BN links and {len(frag_results)} FG native links.{Z}")
+    print(f"{D}[SYS] First-pass resolver: {len(bn_results)} + {len(frag_results)} candidate links.{Z}")
     candidates = Orchestrator.match_and_merge(bn_results, frag_results)[: args.max_results]
     for item in candidates:
         item.query_score = IdentityTools.relevance_score(query, item)
@@ -5930,7 +5930,7 @@ def parse_local_fragrantica_html(path: str, max_results: int = 25) -> list[Unifi
     return FragranticaEngine.parse_search_html(markup, max_results=max_results)
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fast dual-source fragrance parser using BaseNotes and Fragrantica.")
+    parser = argparse.ArgumentParser(description="Fast dual-source fragrance parser.")
     parser.add_argument("query", nargs="?", help="Fragrance search query, e.g. 'Dior Sauvage'.")
     parser.add_argument(
         "--parse-fragrantica-html",
@@ -5939,15 +5939,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-frag-results", type=int, default=25, help="Max native Fragrantica search cards to parse.")
     parser.add_argument("--max-results", type=int, default=15, help="Max merged candidates to display.")
-    parser.add_argument("--initial-timeout", type=float, default=6.0, help="Shared deadline for BN + FG first-pass search.")
-    parser.add_argument("--detail-timeout", type=float, default=6.0, help="Shared deadline for selected BN + FG detail fetch.")
-    parser.add_argument("--metrics-budget", type=float, default=0.9, help="Shared budget for BaseNotes rating metrics. Use 0 to skip.")
+    parser.add_argument("--initial-timeout", type=float, default=6.0, help="Shared deadline for first-pass search.")
+    parser.add_argument("--detail-timeout", type=float, default=6.0, help="Shared deadline for selected detail fetch.")
+    parser.add_argument("--metrics-budget", type=float, default=0.9, help="Shared budget for rating metrics. Use 0 to skip.")
     parser.add_argument("--metrics-workers", type=int, default=5)
-    parser.add_argument("--metrics-max", type=int, default=5, help="Only fetch BN sentiment for the top N query-relevant rows before display.")
+    parser.add_argument("--metrics-max", type=int, default=5, help="Only fetch sentiment for the top N query-relevant rows before display.")
     parser.add_argument("--catalog-budget", type=float, default=3.5, help="Shared designer catalog resolver budget.")
     parser.add_argument("--catalog-workers", type=int, default=3)
     parser.add_argument("--catalog-slug-limit", type=int, default=6)
-    parser.add_argument("--related-budget", type=float, default=0.8, help="Budget for related-link expansion from known FG pages. Use 0 to skip.")
+    parser.add_argument("--related-budget", type=float, default=0.8, help="Budget for related-link expansion. Use 0 to skip.")
     parser.add_argument("--related-page-timeout", type=float, default=2.2)
     parser.add_argument("--related-max-pages", type=int, default=3)
     parser.add_argument("--external-search", action="store_true", help="Enable opt-in open-web sniper fallback.")
@@ -5957,7 +5957,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fg-cache", default=str(Path.home() / ".cache" / "fragrance_parser_fg_identity_cache_v2.json"))
     parser.add_argument("--debug", action="store_true", help="Print resolver diagnostics/timing trace. Alias for --debug-timing.")
     parser.add_argument("--debug-timing", action="store_true", help="Print timing checkpoints for each resolver stage.")
-    parser.add_argument("--show-source-urls", action="store_true", help="Show BN/FG URLs and resolver source in selected dashboard.")
+    parser.add_argument("--show-source-urls", action="store_true", help="Show source URLs and resolver source in selected dashboard.")
     return parser
 
 def main() -> None:
