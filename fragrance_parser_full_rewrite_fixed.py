@@ -2232,6 +2232,21 @@ def _strip_qualifiers(identity: str) -> str:
     return " ".join(tokens)
 
 
+# Junk characters that should never appear in a displayed olfactory note:
+# periods and trademark / registered / copyright / service-mark / sound-recording
+# symbols, plus common bullet/section glyphs that occasionally leak from scraped
+# HTML. Stripped from display only — identity keys already drop them.
+_NOTE_DISPLAY_JUNK_RE = re.compile(
+    r"[.™®©℠℗•·¶§⁃◦]"
+)
+
+
+def _clean_note_display(text: str) -> str:
+    text = _NOTE_DISPLAY_JUNK_RE.sub("", text)
+    text = TextSanitizer.SPACE.sub(" ", text).strip(" -–—,;:")
+    return text
+
+
 def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     """De-duplicate olfactory notes within and across pyramid layers.
 
@@ -2291,7 +2306,7 @@ def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     display: dict[str, str] = {}
     for layer in materialised:
         for note in layer:
-            text = TextSanitizer.clean(note)
+            text = _clean_note_display(TextSanitizer.clean(note))
             key = canonical_key(note)
             if not text or not key:
                 continue
