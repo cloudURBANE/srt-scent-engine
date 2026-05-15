@@ -2142,7 +2142,7 @@ def sentiment_cell(item: UnifiedFragrance) -> str:
     return f"{item.bn_positive_pct}%" + (f"/{item.bn_vote_count}" if item.bn_vote_count else "")
 
 def link_cell(item: UnifiedFragrance) -> str:
-    return "FG" if item.frag_url else "—"
+    return "★" if item.frag_url else "—"
 
 def match_cell(item: UnifiedFragrance) -> str:
     return f"{int(round(item.query_score * 100))}%"
@@ -2509,13 +2509,13 @@ def print_scorecard(details: UnifiedDetails) -> None:
     if card["overall"] is None:
         return
     print(f" {B}✦ OVERALL SCORECARD ✦{Z}")
-    print(f"  Composite:   {score_cell(card['overall'])} {D}(normalized from available BN + FG metrics; not a lab score){Z}")
+    print(f"  Composite:   {score_cell(card['overall'])} {D}(normalized from available metrics; not a lab score){Z}")
     fg_score, fg_value, fg_count = card["fg_rating"]
     bn_score, bn_label = card["bn_approval"]
     perf_score, perf_label = card["performance"]
     val_score, val_label = card["value"]
     rows = [
-        ("FG rating", score_cell(fg_score), f"{fg_value} {fg_count}".strip()),
+        ("Rating", score_cell(fg_score), f"{fg_value} {fg_count}".strip()),
         ("BN approval", score_cell(bn_score), bn_label),
         ("Performance", score_cell(perf_score), perf_label),
         ("Value", score_cell(val_score), val_label),
@@ -2549,11 +2549,13 @@ def metric_group_key(card_name: str) -> tuple[int, str]:
 def print_fragrantica_metric_groups(details: UnifiedDetails) -> None:
     if not details.frag_cards:
         return
-    print(f" {B}✦ FRAGRANTICA METRICS BY CATEGORY ✦{Z}")
+    print(f" {B}✦ METRICS BY CATEGORY ✦{Z}")
     for card_name, metrics in sorted(details.frag_cards.items(), key=lambda kv: metric_group_key(kv[0])):
         if not metrics:
             continue
-        print(f"  {Y}[{card_name}]{Z}")
+        # Internal card keys may carry a source name; strip it from the display only.
+        display_name = re.sub(r"(?i)\bfragrantica\s*", "", card_name).strip() or card_name
+        print(f"  {Y}[{display_name}]{Z}")
         shown = 0
         for metric in metrics:
             print_metric(metric, card_name)
@@ -2562,13 +2564,16 @@ def print_fragrantica_metric_groups(details: UnifiedDetails) -> None:
             print()
 
 def print_reviews_by_source(reviews: list[Review], limit_per_source: int = 4) -> None:
+    # Reviews are shown without their origin label. Still draw evenly from each
+    # internal source so the sample stays balanced.
+    selected: list[Review] = []
     for source in ("Basenotes", "Fragrantica"):
-        source_reviews = [r for r in reviews if r.source.lower() == source.lower()][:limit_per_source]
-        if not source_reviews:
-            continue
-        print(f"\n{B}✦ {source.upper()} SAMPLE REVIEWS ✦{Z}\n{D}{'─' * 74}{Z}")
-        for idx, review in enumerate(source_reviews, 1):
-            print(f"\n{Y}[{idx} - {review.source}]{Z} {review.text}\n{D}{'─' * 74}{Z}")
+        selected.extend([r for r in reviews if r.source.lower() == source.lower()][:limit_per_source])
+    if not selected:
+        return
+    print(f"\n{B}✦ SAMPLE REVIEWS ✦{Z}\n{D}{'─' * 74}{Z}")
+    for idx, review in enumerate(selected, 1):
+        print(f"\n{Y}[{idx}]{Z} {review.text}\n{D}{'─' * 74}{Z}")
 
 def bounded_parallel(
     jobs: dict[str, Callable[[], Any]],
@@ -5745,9 +5750,9 @@ def fit_cell(text: object, width: int) -> str:
 
 def print_results_table(results: list[UnifiedFragrance], search_time: float, debug: bool = False) -> None:
     linked_count = sum(1 for item in results if item.frag_url)
-    print(f"\n{G}✓ {len(results)} results · {linked_count} FG linked · {search_time:.2f}s{Z}")
+    print(f"\n{G}✓ {len(results)} results · {linked_count} ★ linked · {search_time:.2f}s{Z}")
     print(f"{D}Sorted by query match. BN Sent = BaseNotes positive sentiment; it is not the ranking key.{Z}\n")
-    headers = [("#", 2), ("Match", 5), ("BN Sent", 10), ("FG", 3), ("Fragrance", 32), ("Brand", 22), ("Year", 6)]
+    headers = [("#", 2), ("Match", 5), ("BN Sent", 10), ("★", 3), ("Fragrance", 32), ("Brand", 22), ("Year", 6)]
     if debug:
         headers.append(("Resolver", 12))
     line = "┬".join("─" * (w + 2) for _, w in headers)
@@ -5968,8 +5973,23 @@ def main() -> None:
         for index, item in enumerate(parsed, 1):
             print(f"{index:02d}. {item.brand} | {item.name} | {item.year or 'N/A'} | {item.frag_url}")
         return
-    scraper = get_scraper()
     current_query = args.query
+    # Interactive launch: let the user pick search vs. the management dashboard.
+    # A query passed on the CLI keeps today's straight-to-search behavior.
+    if not current_query:
+        mode = input(
+            f"\n{B}🔎 [S]earch fragrances  ·  🛠  [M] SRT Set Engine  —  choose [S/m]: {Z}"
+        ).strip().lower()
+        if mode in {"m", "manage", "management", "srt"}:
+            import importlib.util
+            worker_path = Path(__file__).resolve().parent / "scripts" / "enrichment_worker.py"
+            spec = importlib.util.spec_from_file_location("enrichment_worker", worker_path)
+            worker = importlib.util.module_from_spec(spec)
+            sys.modules["enrichment_worker"] = worker  # let @dataclass resolve its module
+            spec.loader.exec_module(worker)
+            worker.launch_dashboard()
+            return
+    scraper = get_scraper()
     while True:
         try:
             if not current_query:
