@@ -1933,7 +1933,31 @@ class QueryRepair:
         deadline = Deadline(seconds)
         records: dict = {}
 
-        
+        # Google autocomplete (suggestqueries.google.com) returns compact JSON
+        # and is stable across IPs. The SERP HTML scrape below is NOT: datacenter
+        # hosts (e.g. Railway) get a JS-shell page with no result links, so the
+        # scrape harvests nothing AND burns the whole deadline before the
+        # autocomplete fallback ever runs. Seed evidence from autocomplete FIRST
+        # so a dead SERP scrape can't starve it of the budget.
+        autocomplete_res = Http.get(
+            scraper,
+            QueryRepair._search_url("autocomplete", f"{query} fragrance"),
+            timeout=0.85,
+            deadline=deadline,
+            attempts=1,
+        )
+        if autocomplete_res:
+            autocomplete_hint = QueryRepair.extract_google_autocomplete(
+                autocomplete_res.text, query
+            )
+            if autocomplete_hint:
+                QueryRepair._add_candidate(
+                    records,
+                    autocomplete_hint,
+                    source="google_autocomplete",
+                    direct=True,
+                )
+
         tokens = QueryRepair._tokens(query)
 
         anchor_queries: list[str] = []
