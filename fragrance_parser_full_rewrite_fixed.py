@@ -361,16 +361,6 @@ class IdentityTools:
         return {item for item in forms if item}
 
     @staticmethod
-    def canonical_brand_query(query: str) -> str:
-        normalized = TextSanitizer.normalize_identity(query)
-        if not normalized:
-            return ""
-        for canonical, forms in IdentityTools.BRAND_ALIASES.items():
-            if normalized in ({canonical} | set(forms)):
-                return canonical
-        return normalized if normalized in IdentityTools.BRAND_ALIASES else ""
-
-    @staticmethod
     def compatible_brand(a: str, b: str) -> bool:
         a_forms = IdentityTools.brand_forms(a)
         b_forms = IdentityTools.brand_forms(b)
@@ -5917,9 +5907,6 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
 
 def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
     candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True)
-    if IdentityTools.canonical_brand_query(query) and not bn_results:
-        print(f"{Y}[SYS] Brand directory source returned no rows; refusing FG-only brand build-out fallback.{Z}")
-        return []
     if QueryRepair.needs_repair(bn_results, candidates):
         if args.spell_repair_budget > 0:
             suggestion = QueryRepair.suggest(scraper, query, seconds=args.spell_repair_budget)
