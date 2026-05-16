@@ -29,6 +29,7 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -791,7 +792,23 @@ def _parse_iso(value: Any) -> datetime | None:
 
 def _colors() -> dict[str, str]:
     """Reuse the engine's ANSI palette; degrade to plain text if unavailable."""
-    return {name: str(getattr(engine, name, "") or "") for name in ("B", "Y", "C", "D", "R", "Z")}
+    return {name: str(getattr(engine, name, "") or "") for name in ("B", "Y", "C", "D", "R", "G", "Z")}
+
+
+# Rolling buffer of the most recent operator-visible events. Rendered in the
+# LIVE_STREAM block on every refresh so messages emitted between frames are not
+# wiped by the screen clear. Keep the cap small — the block has a fixed height
+# in the layout and longer history just pushes old lines off-screen anyway.
+_LIVE_LOG: deque[tuple[str, str, str]] = deque(maxlen=4)
+
+
+def _log_event(message: str, kind: str = "info") -> None:
+    """Push a one-line event onto the LIVE_STREAM buffer.
+
+    kind ∈ {info, ok, warn, err} controls color in the rendered stream.
+    """
+    stamp = datetime.now().strftime("%H:%M:%S")
+    _LIVE_LOG.append((stamp, kind, message))
 
 
 def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
@@ -830,10 +847,17 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
 
 def _fmt_delta(delta: int, c: dict[str, str]) -> str:
     if delta > 0:
-        return f"{c['C']}(+{delta}){c['Z']}"
+        return f"{c['G']}[+{delta}]{c['Z']}"
     if delta < 0:
-        return f"{c['R']}({delta}){c['Z']}"
-    return f"{c['D']}( 0){c['Z']}"
+        return f"{c['R']}[{delta}]{c['Z']}"
+    return f"{c['D']}[ 0]{c['Z']}"
+
+
+def _section_header(label: str, c: dict[str, str], width: int) -> str:
+    """Hacker-style block header: ┌─[ LABEL ]──────── …"""
+    inside = f" {label} "
+    fill = max(0, width - len(inside) - 4)
+    return f"  {c['G']}┌─[{c['B']}{inside}{c['Z']}{c['G']}]{'─' * fill}{c['Z']}"
 
 
 def _render_dashboard(
@@ -846,66 +870,102 @@ def _render_dashboard(
     c = _colors()
     os.system("cls" if os.name == "nt" else "clear")
     width = 64
-    bar = f"  {c['D']}{'─' * width}{c['Z']}"
     now = datetime.now().strftime("%H:%M:%S")
+    top = f"  {c['G']}╔{'═' * width}╗{c['Z']}"
+    bot = f"  {c['G']}╚{'═' * width}╝{c['Z']}"
+
+    # ── Banner ────────────────────────────────────────────────────────────
     print()
-    print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
-    print(f"   {c['B']}SRT SET ENGINE{c['Z']}   {c['D']}·   enrichment control{c['Z']}")
-    print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
-    auth = f"{c['C']}● connected{c['Z']}" if config.auth_configured else f"{c['R']}● no token{c['Z']}"
-    print(f"   {c['D']}{now}   refreshes every {interval}s   {c['Z']}{auth}")
-    print(f"   {c['D']}API   {config.api_base_url}{c['Z']}")
-    print(bar)
-    # Make the auto-approve state impossible to miss — it acts on the queue
-    # without any further input once it is on.
+    print(top)
+    title = "SRT//SET-ENGINE ▒▒ enrichment.control"
+    title_pad = max(0, width - len(title) - 2)
+    print(f"  {c['G']}║{c['B']} {title}{c['Z']}{' ' * title_pad}{c['G']}║{c['Z']}")
+    print(bot)
+    auth = (
+        f"{c['G']}[LINK ▲ OK]{c['Z']}"
+        if config.auth_configured
+        else f"{c['R']}[LINK ▼ NO-TOKEN]{c['Z']}"
+    )
+    print(
+        f"   {c['G']}>{c['Z']} {c['D']}t={c['Z']}{c['G']}{now}{c['Z']}   "
+        f"{c['D']}refresh={c['Z']}{c['G']}{interval}s{c['Z']}   {auth}"
+    )
+    print(f"   {c['G']}>{c['Z']} {c['D']}api={c['Z']}{c['G']}{config.api_base_url}{c['Z']}")
+
+    # ── Auto-approve state ────────────────────────────────────────────────
     if auto_approve:
         print(
-            f"   {c['B']}{c['Y']}● AUTO-APPROVE ON{c['Z']}   "
-            f"{c['D']}claims + completes one pending job every {AUTO_APPROVE_INTERVAL}s{c['Z']}"
+            f"   {c['B']}{c['G']}▓▓ AUTO_APPROVE: ENGAGED ▓▓{c['Z']}   "
+            f"{c['D']}tick={AUTO_APPROVE_INTERVAL}s · claim+complete oldest pending{c['Z']}"
         )
     else:
-        print(f"   {c['D']}○ auto-approve off   press [a] to start hands-free approval{c['Z']}")
-    print(bar)
+        print(
+            f"   {c['D']}░░ auto_approve: idle ░░   "
+            f"press [a] to engage hands-free approval{c['Z']}"
+        )
+
+    # ── QUEUE_STATUS ──────────────────────────────────────────────────────
+    print(_section_header("QUEUE_STATUS", c, width))
     if snapshot.get("error"):
-        print(f"   {c['R']}Status endpoint unavailable: {snapshot['error']}{c['Z']}")
-        print(f"   {c['D']}Retrying on the next refresh…{c['Z']}")
-        print(bar)
+        print(f"  {c['G']}│{c['Z']}  {c['R']}!! status endpoint unavailable: {snapshot['error']}{c['Z']}")
+        print(f"  {c['G']}│{c['Z']}  {c['D']}retrying on next refresh…{c['Z']}")
     else:
         counts = snapshot.get("counts") or {}
-        print(f"   {c['B']}QUEUE{c['Z']}   {c['D']}(change since this session opened){c['Z']}")
         for name in _DASH_STATUSES:
             val = int(counts.get(name) or 0)
             delta = val - int(baseline.get(name) or 0)
-            print(f"     {name:<12}{c['B']}{val:>6}{c['Z']}   {_fmt_delta(delta, c)}")
-        print(bar)
-        print(f"   {c['B']}NEEDS ATTENTION{c['Z']}")
-        rf = snapshot.get("retryable_failures")
-        sp = snapshot.get("stale_processing")
-        rf_s = f"{c['Y']}{rf}{c['Z']}" if rf is not None else f"{c['D']}— (needs token){c['Z']}"
-        sp_s = f"{c['Y']}{sp}{c['Z']}" if sp is not None else f"{c['D']}— (needs token){c['Z']}"
-        print(f"     retryable failures   {rf_s}")
-        print(f"     stale processing     {sp_s}")
-        print(bar)
-    # Spell out every hotkey so the operator never has to guess.
-    print(f"   {c['B']}ACTIONS{c['Z']}   {c['D']}press a number{c['Z']}")
+            val_col = c["R"] if name == "failed" and val > 0 else c["G"]
+            print(
+                f"  {c['G']}│{c['Z']}  {c['G']}>{c['Z']} {name:<12}"
+                f"{c['B']}{val_col}{val:>6}{c['Z']}   {_fmt_delta(delta, c)}"
+            )
+
+    # ── NEEDS_ATTENTION ───────────────────────────────────────────────────
+    print(_section_header("NEEDS_ATTENTION", c, width))
+    rf = snapshot.get("retryable_failures")
+    sp = snapshot.get("stale_processing")
+    def _alert(val: Any) -> str:
+        if val is None:
+            return f"{c['D']}-- (needs token){c['Z']}"
+        n = int(val)
+        col = c["R"] if n > 0 else c["G"]
+        return f"{c['B']}{col}{n}{c['Z']}"
+    print(f"  {c['G']}│{c['Z']}  {c['G']}>{c['Z']} retryable_failures   {_alert(rf)}")
+    print(f"  {c['G']}│{c['Z']}  {c['G']}>{c['Z']} stale_processing     {_alert(sp)}")
+
+    # ── ACTIONS ───────────────────────────────────────────────────────────
+    print(_section_header("ACTIONS", c, width))
     left = [("1", DASHBOARD_ACTIONS["1"]), ("2", DASHBOARD_ACTIONS["2"]), ("3", DASHBOARD_ACTIONS["3"])]
     right = [("4", DASHBOARD_ACTIONS["4"]), ("5", DASHBOARD_ACTIONS["5"]), ("6", DASHBOARD_ACTIONS["6"])]
     for (lk, ll), (rk, rl) in zip(left, right):
-        plain = f"[{lk}] {ll}"
-        pad = max(3, 32 - len(plain))
+        plain_left = f"[{lk}] {ll}"
+        pad = max(3, 30 - len(plain_left))
         print(
-            f"     {c['Y']}[{lk}]{c['Z']} {ll}{' ' * pad}"
-            f"{c['Y']}[{rk}]{c['Z']} {rl}"
+            f"  {c['G']}│{c['Z']}  {c['G']}[{lk}]{c['Z']} {ll}{' ' * pad}"
+            f"{c['G']}[{rk}]{c['Z']} {rl}"
         )
-    print(bar)
+
+    # ── LIVE_STREAM ───────────────────────────────────────────────────────
+    print(_section_header("LIVE_STREAM", c, width))
+    if not _LIVE_LOG:
+        print(f"  {c['G']}│{c['Z']}  {c['D']}(no events yet — engage auto_approve or pick an action){c['Z']}")
+    else:
+        kind_col = {"ok": c["G"], "info": c["G"], "warn": c["Y"], "err": c["R"]}
+        for stamp, kind, msg in _LIVE_LOG:
+            col = kind_col.get(kind, c["G"])
+            marker = {"ok": "✓", "info": ">", "warn": "!", "err": "x"}.get(kind, ">")
+            print(f"  {c['G']}│{c['Z']}  {c['D']}{stamp}{c['Z']} {col}{marker}{c['Z']} {msg}")
+
+    # ── Footer / hotkeys ─────────────────────────────────────────────────
+    print(f"  {c['G']}└{'─' * width}{c['Z']}")
     auto_key = (
-        f"{c['Y']}[a] auto-approve: ON{c['Z']}"
+        f"{c['B']}{c['G']}[a] auto_approve=ON{c['Z']}"
         if auto_approve
-        else f"{c['D']}[a] auto-approve: off{c['Z']}"
+        else f"{c['D']}[a] auto_approve=off{c['Z']}"
     )
     print(f"   {auto_key}")
     print(
-        f"   {c['D']}[r] refresh now    [+/-] change interval    [q] quit{c['Z']}"
+        f"   {c['D']}[r] refresh   [+/-] interval   [q] quit{c['Z']}"
     )
 
 
@@ -922,36 +982,40 @@ def _run_auto_approve(
     returns. The engine scraper/args are built once and cached on auto_state so
     repeated ticks stay cheap.
     """
-    c = _colors()
     try:
         jobs = client.list_jobs("pending", limit=1)
     except WorkerError as exc:
-        print(f"  {c['R']}auto-approve: cannot read the queue ({exc.code}){c['Z']}")
-        time.sleep(1.0)
+        _log_event(f"auto: cannot read queue ({exc.code})", "err")
         return
     if not jobs:
-        print(f"  {c['D']}auto-approve: queue is empty — nothing to approve right now.{c['Z']}")
-        time.sleep(1.0)
+        _log_event("auto: queue empty — nothing to approve", "info")
         return
     if auto_state.get("scraper") is None:
         auto_state["scraper"] = engine.get_scraper()
         auto_state["args"] = _build_engine_args()
-    print(f"  {c['B']}{c['Y']}● AUTO-APPROVE{c['Z']} processing the next pending job…")
+    job = jobs[0]
+    target = job.get("name") or job.get("brand") or job.get("id") or "next job"
+    _log_event(f"auto: processing {target}", "info")
+    # process_job() prints progress to stdout; swallow it so the dashboard
+    # frame stays intact and only our LIVE_STREAM lines surface to the user.
     try:
-        process_job(
-            client,
-            auto_state["scraper"],
-            auto_state["args"],
-            jobs[0],
-            index_label="[auto]",
-            config=config,
-        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            process_job(
+                client,
+                auto_state["scraper"],
+                auto_state["args"],
+                job,
+                index_label="[auto]",
+                config=config,
+            )
     except KeyboardInterrupt:
         stop.stop_requested = True
+        _log_event("auto: interrupted by operator", "warn")
+        return
     except WorkerError as exc:
-        print(f"  {c['R']}auto-approve failed: {exc.code}{c['Z']}")
-        if config.debug and str(exc) != exc.code:
-            print(f"  {exc}")
+        _log_event(f"auto: failed ({exc.code})", "err")
+        return
+    _log_event(f"auto: completed {target}", "ok")
 
 
 def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopController) -> int:
@@ -1020,13 +1084,13 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
             break
         if key == "a":
             if not auto_approve and not config.auth_configured:
-                print(
-                    f"\n  {c['R']}Auto-approve needs a worker token. "
-                    f"Open SRT Set Engine via [M] to sign in first.{c['Z']}"
-                )
-                time.sleep(1.8)
+                _log_event("auto_approve needs a worker token — sign in via [M]", "err")
             else:
                 auto_approve = not auto_approve
+                _log_event(
+                    "auto_approve ENGAGED" if auto_approve else "auto_approve disengaged",
+                    "ok" if auto_approve else "info",
+                )
             refresh_now = True
         elif key in ("+", "="):
             interval = min(DASHBOARD_MAX_INTERVAL, interval + DASHBOARD_STEP)
