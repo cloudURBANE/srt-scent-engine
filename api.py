@@ -74,6 +74,25 @@ _ARGS.fg_cache = os.environ.get("FG_CACHE_PATH", _ARGS.fg_cache)
 _FG_DETAIL_CACHE_PATH = os.environ.get("FG_DETAIL_CACHE_PATH", "")
 _FG_DETAIL_CACHE: dict[str, Any] | None = None  # lazy-loaded once, see below
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# In production, DATABASE_URL means the durable fg_detail_cache is the source of
+# truth. Bundled JSON caches are only trusted there when explicitly opted in, so
+# deleting a row from the database does not leave stale filesystem data alive.
+_ALLOW_BUNDLED_FG_DETAIL_CACHE = _env_flag(
+    "ALLOW_BUNDLED_FG_DETAIL_CACHE", default=not db.ENABLED
+)
+_ALLOW_BUNDLED_FG_SEARCH_CACHE = _env_flag(
+    "ALLOW_BUNDLED_FG_SEARCH_CACHE", default=not db.ENABLED
+)
+_CACHE_SEARCH_MIN_SCORE = 0.60
+
 # Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
 # `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
 # offline worker only -- it is never sent to the frontend and is never logged.
@@ -167,6 +186,86 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
     }
 
 
+def _candidate_from_cache_entry(
+    entry: dict[str, Any], source: str
+) -> engine.UnifiedFragrance | None:
+    fg_url = _canonical_fg_url(
+        str(entry.get("canonical_fg_url") or entry.get("fg_url") or "")
+    )
+    if not fg_url:
+        return None
+    identity = _cache_entry_identity(entry, fg_url)
+    if not identity["name"] or not identity["house"]:
+        return None
+    candidate = engine.UnifiedFragrance(
+        name=identity["name"],
+        brand=identity["house"],
+        year=identity["year"],
+        frag_url=fg_url,
+        resolver_source=source,
+        resolver_score=0.95,
+    )
+    return candidate
+
+
+def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
+    if not _ALLOW_BUNDLED_FG_SEARCH_CACHE:
+        return []
+    candidates: list[engine.UnifiedFragrance] = []
+    seen: set[str] = set()
+    for url, entry in _load_fg_detail_cache().items():
+        item = _candidate_from_cache_entry(
+            {"canonical_fg_url": url, **entry}, "fg_detail_json_cache"
+        )
+        if not item:
+            continue
+        item.query_score = engine.IdentityTools.relevance_score(query, item)
+        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+            continue
+        key = item.frag_url or item.cache_key
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
+    candidates.sort(
+        key=lambda item: (item.query_score, item.resolver_score, item.year),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedFragrance], str | None]:
+    """Fallback search for blocked live providers, with DB as source of truth."""
+    seen: set[str] = set()
+    candidates: list[engine.UnifiedFragrance] = []
+    source: str | None = None
+
+    for entry in db.search_detail_cache(query, limit=limit * 2):
+        item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
+        if not item:
+            continue
+        item.query_score = engine.IdentityTools.relevance_score(query, item)
+        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+            continue
+        key = item.frag_url or item.cache_key
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
+    if candidates:
+        source = "db"
+    else:
+        candidates = _json_cache_search(query, limit)
+        if candidates:
+            source = "json"
+
+    candidates.sort(
+        key=lambda item: (item.query_score, item.resolver_score, item.year),
+        reverse=True,
+    )
+    return candidates[:limit], source
+
+
 def _source_coverage(
     selected: engine.UnifiedFragrance,
     details: engine.UnifiedDetails,
@@ -212,6 +311,40 @@ def _source_coverage(
         "derived_metrics": derived,
         "complete": bn_has_data and fg_has_data,
     }
+
+
+def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, str]:
+    """Best-effort identity from a DB/JSON cache entry or Fragrantica URL."""
+    raw_identity = entry.get("raw_identity") or {}
+    if not isinstance(raw_identity, dict):
+        raw_identity = {}
+    url = (
+        fg_url
+        or str(entry.get("canonical_fg_url") or "")
+        or str(entry.get("fg_url") or "")
+    )
+    name = str(entry.get("name") or raw_identity.get("name") or "").strip()
+    house = str(entry.get("house") or raw_identity.get("house") or "").strip()
+    year = str(entry.get("year") or raw_identity.get("year") or "").strip()
+    if url:
+        if not name:
+            name = engine.FragranticaEngine.name_from_url(url)
+        if not house:
+            house = engine.FragranticaEngine.brand_from_url(url)
+    return {"name": name, "house": house, "year": year}
+
+
+def _fill_selected_identity(
+    selected: engine.UnifiedFragrance, entry: dict[str, Any]
+) -> None:
+    """Fill blank request identity from a trusted cache entry."""
+    identity = _cache_entry_identity(entry, selected.frag_url)
+    if not selected.name and identity["name"]:
+        selected.name = identity["name"]
+    if not selected.brand and identity["house"]:
+        selected.brand = identity["house"]
+    if not selected.year and identity["year"]:
+        selected.year = identity["year"]
 
 
 def _details_to_dict(
@@ -308,6 +441,8 @@ def health() -> dict[str, bool]:
 _RUNTIME_ENV_KEYS = (
     "FG_CACHE_PATH",
     "FG_DETAIL_CACHE_PATH",
+    "ALLOW_BUNDLED_FG_DETAIL_CACHE",
+    "ALLOW_BUNDLED_FG_SEARCH_CACHE",
     "FRONTEND_ORIGINS",
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -451,6 +586,9 @@ def runtime_diagnostics() -> dict[str, Any]:
         "railway_deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID"),
         "railway_git_branch": os.environ.get("RAILWAY_GIT_BRANCH"),
         "railway_git_commit_message": os.environ.get("RAILWAY_GIT_COMMIT_MESSAGE"),
+        "database_enabled": db.ENABLED,
+        "allow_bundled_fg_detail_cache": _ALLOW_BUNDLED_FG_DETAIL_CACHE,
+        "allow_bundled_fg_search_cache": _ALLOW_BUNDLED_FG_SEARCH_CACHE,
     }
 
     scraper = engine.get_scraper()
@@ -883,10 +1021,22 @@ def search(
     except Exception as exc:  # engine degrades cleanly; surface a 502 if not
         raise HTTPException(status_code=502, detail=f"Search failed: {exc}") from exc
 
+    fallback_source: str | None = None
+    if not results:
+        results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
+
+    diagnostics = _search_diagnostics(results)
+    if fallback_source:
+        diagnostics["fallback_source"] = fallback_source
+        diagnostics["warning"] = (
+            "Live providers returned zero candidates; results came from the "
+            f"{fallback_source} detail cache."
+        )
+
     return {
         "query": query,
         "results": [_search_result_to_dict(item) for item in results],
-        "diagnostics": _search_diagnostics(results),
+        "diagnostics": diagnostics,
     }
 
 
@@ -1396,6 +1546,7 @@ def _apply_fg_detail_cache_db(
     entry = db.lookup_detail_cache(_canonical_fg_url(selected.frag_url))
     if not entry or entry.get("quality_status") != "complete":
         return False
+    _fill_selected_identity(selected, entry)
     return _hydrate_details_from_entry(details, entry)
 
 
@@ -1411,11 +1562,14 @@ def _apply_fg_detail_cache(
     # Live Fragrantica data present -> never touch it.
     if details.frag_cards:
         return False
+    if not _ALLOW_BUNDLED_FG_DETAIL_CACHE:
+        return False
     if not selected.frag_url:
         return False
     entry = _load_fg_detail_cache().get(_canonical_fg_url(selected.frag_url))
     if not entry:
         return False
+    _fill_selected_identity(selected, entry)
     return _hydrate_details_from_entry(details, entry)
 
 
@@ -1449,9 +1603,22 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     lowered = url.lower()
     bn_url = url if "basenotes" in lowered else ""
     frag_url = url if "fragrantica" in lowered or not bn_url else ""
-    return engine.UnifiedFragrance(
+    selected = engine.UnifiedFragrance(
         name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
     )
+    if frag_url:
+        entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
+        if entry and entry.get("quality_status") == "complete":
+            _fill_selected_identity(selected, entry)
+        elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
+            json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
+            if json_entry:
+                _fill_selected_identity(selected, json_entry)
+        if not selected.name:
+            selected.name = engine.FragranticaEngine.name_from_url(frag_url)
+        if not selected.brand:
+            selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+    return selected
 
 
 def _identity_job_key(selected: engine.UnifiedFragrance) -> str:

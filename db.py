@@ -423,6 +423,64 @@ def lookup_detail_cache(canonical_fg_url: str) -> dict[str, Any] | None:
         ctx.__exit__(None, None, None)
 
 
+def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Search completed detail-cache identities. Empty when absent/disabled."""
+    if not ENABLED:
+        return []
+    text = (query or "").strip()
+    if not text:
+        return []
+    limit = max(1, min(int(limit or 15), 50))
+    like = f"%{text}%"
+    ctx, conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM fg_detail_cache
+            WHERE quality_status = 'complete'
+              AND (
+                  name ILIKE %s
+                  OR house ILIKE %s
+                  OR concat_ws(' ', house, name) ILIKE %s
+                  OR concat_ws(' ', name, house) ILIKE %s
+              )
+            ORDER BY
+                CASE
+                    WHEN concat_ws(' ', house, name) ILIKE %s THEN 0
+                    WHEN name ILIKE %s THEN 1
+                    WHEN house ILIKE %s THEN 2
+                    ELSE 3
+                END,
+                updated_at DESC
+            LIMIT %s
+            """,
+            (like, like, like, like, like, like, like, limit),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "canonical_fg_url": row["canonical_fg_url"],
+                    "name": row["name"],
+                    "house": row["house"],
+                    "year": row["year"],
+                    "schema_version": row["schema_version"],
+                    "source": row["source"],
+                    "captured_at": _iso(row["captured_at"]),
+                    "updated_at": _iso(row["updated_at"]),
+                    "quality_status": row["quality_status"],
+                    "frag_cards": row["frag_cards_json"],
+                    "notes": row["notes_json"],
+                    "pros_cons": row["pros_cons_json"],
+                    "reviews": row["reviews_json"],
+                    "raw_identity": row["raw_identity_json"],
+                }
+            )
+        return out
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # Row serialization
 # ---------------------------------------------------------------------------
