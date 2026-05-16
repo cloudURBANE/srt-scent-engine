@@ -352,6 +352,7 @@ def _details_to_dict(
     details: engine.UnifiedDetails,
     fragrantica_cached: bool = False,
     fragrantica_cache_source: str | None = None,
+    enrichment_status: str | None = None,
 ) -> dict[str, Any]:
     """Serialize a full detail bundle.
 
@@ -365,7 +366,7 @@ def _details_to_dict(
     was hydrated from fg_detail_cache_v1.json. See `_source_coverage`.
     """
     notes = details.notes
-    return {
+    payload = {
         # Required top-level fields.
         "name": selected.name,
         "house": selected.brand,
@@ -400,6 +401,13 @@ def _details_to_dict(
             },
         },
     }
+    if enrichment_status:
+        payload["enrichment"] = {
+            "status": enrichment_status,
+            "requires_worker": enrichment_status == "pending",
+            "cache_source": fragrantica_cache_source,
+        }
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1636,7 +1644,7 @@ def _identity_job_key(selected: engine.UnifiedFragrance) -> str:
 
 def _enqueue_enrichment_job(
     selected: engine.UnifiedFragrance, req: DetailRequest
-) -> None:
+) -> bool:
     """Enqueue (or upsert) an enrichment job for a partial detail result.
 
     Job key prefers the canonical Fragrantica URL, falls back to the canonical
@@ -1653,7 +1661,7 @@ def _enqueue_enrichment_job(
             or _identity_job_key(selected)
         )
         if not job_key:
-            return
+            return False
         db.enqueue_job(
             job_key=job_key,
             query=(req.source_url or None),
@@ -1663,9 +1671,10 @@ def _enqueue_enrichment_job(
             bn_url=selected.bn_url or None,
             fg_url=selected.frag_url or None,
         )
+        return True
     except Exception:
         # Best-effort: never let queue write failures surface to the client.
-        pass
+        return False
 
 
 @app.post("/api/fragrances/details")
@@ -1708,11 +1717,20 @@ def details(req: DetailRequest) -> dict[str, Any]:
     # can fetch from an environment that is not 403'd. The worker resolves a
     # missing fg_url from name/house at claim time, so BN-only candidates are
     # eligible too. Inert when DATABASE_URL is unset.
-    if not detail_bundle.frag_cards and not fragrantica_cached:
-        _enqueue_enrichment_job(selected, req)
+    enrichment_status: str | None = None
+    if fragrantica_cache_source == "db":
+        enrichment_status = "complete"
+    elif fragrantica_cache_source == "json":
+        enrichment_status = "bundled_cache"
+    elif not detail_bundle.frag_cards:
+        enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
 
     return _details_to_dict(
-        selected, detail_bundle, fragrantica_cached, fragrantica_cache_source
+        selected,
+        detail_bundle,
+        fragrantica_cached,
+        fragrantica_cache_source,
+        enrichment_status,
     )
 
 
