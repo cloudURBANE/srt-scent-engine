@@ -5,3 +5,4 @@ __pycache__/
 venv/
 desktop.ini
 .cache/
+.black_sun_cache.json

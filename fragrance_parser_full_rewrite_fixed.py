@@ -7,13 +7,18 @@ hard gates, visual-bar metric extraction, and semantic pyramid note extraction.
 from __future__ import annotations
 import argparse
 import html
+from __future__ import annotations
+import argparse
+import html
 import base64
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from difflib import SequenceMatcher
@@ -29,6 +34,15 @@ try:
     import cloudscraper  # pyright: ignore[reportMissingImports]
 except ModuleNotFoundError:
     cloudscraper = None  # type: ignore[assignment]
+try:
+    from curl_cffi import requests as curl_requests  # pyright: ignore[reportMissingImports]
+except ModuleNotFoundError:
+    curl_requests = None  # type: ignore[assignment]
+try:
+    from DrissionPage import ChromiumOptions, ChromiumPage  # pyright: ignore[reportMissingImports]
+except ModuleNotFoundError:
+    ChromiumOptions = None  # type: ignore[assignment]
+    ChromiumPage = None  # type: ignore[assignment]
 from bs4 import BeautifulSoup
 
 C = "\033[36m"
@@ -2132,13 +2146,187 @@ class Http:
                 time.sleep(sleep_seconds)
         return None
 
+_BASENOTES_CACHE_FILE = Path(
+    os.environ.get(
+        "BASENOTES_CLEARANCE_CACHE",
+        str(Path(__file__).with_name(".black_sun_cache.json")),
+    )
+)
+_BASENOTES_CHALLENGE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "cf-challenge",
+    "cf-browser-verification",
+    "/cdn-cgi/challenge-platform",
+)
+_BASENOTES_SESSION_LOCK = threading.Lock()
+_BASENOTES_SESSION = None
+
+
+def _response_has_challenge(res: Any) -> bool:
+    if res is None:
+        return True
+    status = int(getattr(res, "status_code", 0) or 0)
+    body = str(getattr(res, "text", "") or "")
+    if status in {403, 429}:
+        return True
+    return any(marker in body[:5000].lower() for marker in _BASENOTES_CHALLENGE_MARKERS)
+
+
+def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
+    if curl_requests is None:
+        return None
+    session = curl_requests.Session(
+        impersonate=os.environ.get("BASENOTES_CURL_IMPERSONATE", "chrome120")
+    )
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept": Http.DEFAULT_HEADERS["Accept"],
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": BasenotesEngine.BASE_URL if "BasenotesEngine" in globals() else "https://basenotes.com/",
+    })
+    session.cookies.update(cookies)
+    return session
+
+
+def _load_basenotes_cache() -> tuple[str, dict[str, str]] | None:
+    try:
+        with _BASENOTES_CACHE_FILE.open("r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+        user_agent = str(cache.get("ua") or "").strip()
+        cookies = cache.get("cookies") or {}
+        if not user_agent or not isinstance(cookies, dict):
+            return None
+        return user_agent, {str(k): str(v) for k, v in cookies.items()}
+    except Exception:
+        return None
+
+
+def _save_basenotes_cache(user_agent: str, cookies: dict[str, str]) -> None:
+    try:
+        _BASENOTES_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _BASENOTES_CACHE_FILE.open("w", encoding="utf-8") as handle:
+            json.dump({"ua": user_agent, "cookies": cookies}, handle)
+    except Exception:
+        pass
+
+
+def _validate_basenotes_session(session: Any) -> bool:
+    try:
+        res = session.get("https://basenotes.com/", timeout=5)
+        return int(getattr(res, "status_code", 0) or 0) == 200 and not _response_has_challenge(res)
+    except Exception:
+        return False
+
+
+def _mint_basenotes_clearance():
+    if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
+        return None
+
+    page = None
+    try:
+        options = ChromiumOptions()
+        options.set_argument("--window-position=-2000,-2000")
+        options.set_argument("--mute-audio")
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+        if os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
+            options.set_argument("--headless=new")
+        options.auto_port()
+
+        page = ChromiumPage(options)
+        page.get("https://basenotes.com/")
+
+        wait_seconds = int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")
+        for _ in range(max(1, wait_seconds)):
+            title = str(getattr(page, "title", "") or "")
+            if not any(marker in title.lower() for marker in ("just a moment", "attention required")):
+                break
+            time.sleep(1)
+
+        cookie_data = page.cookies()
+        cookies = (
+            {str(c["name"]): str(c["value"]) for c in cookie_data if "name" in c and "value" in c}
+            if isinstance(cookie_data, list)
+            else {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
+        )
+        user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
+    except Exception:
+        return None
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:
+                pass
+
+    if not cookies:
+        return None
+    _save_basenotes_cache(user_agent, cookies)
+    session = _new_basenotes_http_session(user_agent, cookies)
+    return session if session is not None and _validate_basenotes_session(session) else None
+
+
+def get_basenotes_scraper(fallback: Any = None):
+    global _BASENOTES_SESSION
+    with _BASENOTES_SESSION_LOCK:
+        if _BASENOTES_SESSION is not None:
+            return _BASENOTES_SESSION
+
+        cached = _load_basenotes_cache()
+        if cached:
+            session = _new_basenotes_http_session(*cached)
+            if session is not None and _validate_basenotes_session(session):
+                _BASENOTES_SESSION = session
+                return _BASENOTES_SESSION
+
+        minted = _mint_basenotes_clearance()
+        if minted is not None:
+            _BASENOTES_SESSION = minted
+            return _BASENOTES_SESSION
+
+    return fallback
+
+
+def reset_basenotes_scraper(clear_cache: bool = False) -> None:
+    global _BASENOTES_SESSION
+    with _BASENOTES_SESSION_LOCK:
+        _BASENOTES_SESSION = None
+        if clear_cache:
+            try:
+                _BASENOTES_CACHE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+class RoutedScraper:
+    def __init__(self, default_scraper: Any, basenotes_scraper: Any = None):
+        self.default_scraper = default_scraper
+        self._basenotes_scraper = basenotes_scraper
+
+    def _for_url(self, url: str):
+        host = (urlparse(url).netloc or "").lower()
+        if host.endswith("basenotes.com"):
+            self._basenotes_scraper = get_basenotes_scraper(self._basenotes_scraper or self.default_scraper)
+            return self._basenotes_scraper or self.default_scraper
+        return self.default_scraper
+
+    def get(self, url: str, *args, **kwargs):
+        return self._for_url(url).get(url, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self.default_scraper, name)
+
+
 def get_scraper():
     if cloudscraper is not None:
-        return cloudscraper.create_scraper(
+        default = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
-    session = requests.Session()
-    return session
+    else:
+        default = requests.Session()
+    return RoutedScraper(default, get_basenotes_scraper(default))
+
 
 def draw_bar(pct: float | int | None, width: int = 20, color: str = G, empty_label: str = "No Data") -> str:
     if pct is None:
@@ -3062,6 +3250,11 @@ class SearchSniper:
 
 class BasenotesEngine:
     BASE_URL = "https://basenotes.com"
+    _YEAR_PATTERN = re.compile(r"\((\b(?:17|18|19|20)\d{2}\b)\)")
+    _YEAR_FALLBACK = re.compile(r"\b((?:17|18|19|20)\d{2})\b")
+    _BY_SPLIT = re.compile(r"(?i)\s+by\s+")
+    _CLEAN_CHARS = re.compile(r"[^a-zA-Z0-9\s\.\-\%\&'’]")
+    _CONSENSUS_PATTERN = re.compile(r"(\d+)\s*(Positive|Neutral|Negative)\s*\((\d+)%\)", re.I)
     
     @staticmethod
     def extract_search_data(scraper, query: str, deadline: Deadline | None = None) -> list[UnifiedFragrance]:
@@ -3093,15 +3286,27 @@ class BasenotesEngine:
         attempts: int = 2,
         deadline: Deadline | None = None,
     ):
-        return Http.get(
-            scraper,
-            url,
-            timeout=timeout,
-            referer=BasenotesEngine.BASE_URL,
-            deadline=deadline,
-            attempts=attempts,
-            sleep_seconds=0.25,
-        )
+        bn_scraper = get_basenotes_scraper(scraper)
+        for attempt in range(max(1, attempts)):
+            if deadline and deadline.expired():
+                break
+            try:
+                request_timeout = deadline.timeout(timeout) if deadline else timeout
+                res = bn_scraper.get(url, timeout=request_timeout)
+                if _response_has_challenge(res):
+                    if bn_scraper is not scraper:
+                        reset_basenotes_scraper(clear_cache=True)
+                        bn_scraper = get_basenotes_scraper(scraper)
+                    time.sleep(random.uniform(0.75, 1.5))
+                    continue
+                if int(getattr(res, "status_code", 0) or 0) >= 400:
+                    return None
+                return res
+            except Exception:
+                if attempt >= attempts - 1:
+                    break
+                time.sleep(0.25)
+        return None
         
     @staticmethod
     def _nearest_context_parent(node):
@@ -3130,9 +3335,9 @@ class BasenotesEngine:
         brand = "Unknown"
         year = ""
         combined = f"{title_text} | {context}"
-        year_match = re.search(r"\((\b(?:17|18|19|20)\d{2}\b)\)", combined)
+        year_match = BasenotesEngine._YEAR_PATTERN.search(combined)
         if not year_match:
-            year_match = re.search(r"\b((?:17|18|19|20)\d{2})\b", title_text)
+            year_match = BasenotesEngine._YEAR_FALLBACK.search(title_text)
         if year_match:
             year = year_match.group(1)
             
@@ -3142,12 +3347,12 @@ class BasenotesEngine:
             brand = right.strip()
         elif re.search(r"(?i)\bby\b", combined):
             # Guard against split failure when using strict whitespace vs boundary tests
-            parts = re.split(r"(?i)\bby\b", combined, maxsplit=1)
+            parts = BasenotesEngine._BY_SPLIT.split(combined, maxsplit=1)
             if len(parts) == 2:
                 name = parts[0].split("|")[-1].strip()
                 brand = parts[1].split("|")[0].strip()
-                name = re.sub(r"[^a-zA-Z0-9\s\.\-\%\&'’]", "", name)
-                brand = re.sub(r"[^a-zA-Z0-9\s\.\-\%\&'’]", "", brand)
+                name = BasenotesEngine._CLEAN_CHARS.sub("", name)
+                brand = BasenotesEngine._CLEAN_CHARS.sub("", brand)
                 
         if year:
             name = re.sub(rf"\b{re.escape(year)}\b", "", name)
@@ -3174,6 +3379,57 @@ class BasenotesEngine:
                 total += int(negative.group(1))
             frag.bn_vote_count = total
             frag.bn_positive_pct = int(positive.group(2))
+
+    @staticmethod
+    def _clean_note_items(text: str) -> list[str]:
+        if not text:
+            return []
+        items: list[str] = []
+        seen: set[str] = set()
+        for item in re.split(r"[,;\|\n\u2022]", text):
+            item = TextSanitizer.clean(item)
+            if not item or re.match(r"(?i)^(and\s+)?(top|head|heart|middle|base)\s*(notes?)?$", item):
+                continue
+            item = re.sub(
+                r"(?i)^(?:top|head|heart|middle|base)\s*(?:notes?)?\s*[:\-]?\s*",
+                "",
+                item,
+            ).strip()
+            if len(item) > 1 and item not in seen:
+                items.append(item)
+                seen.add(item)
+        return items
+
+    @staticmethod
+    def _apply_text_to_notes(raw_text: str, notes_obj: NotesList) -> None:
+        raw_text = TextSanitizer.clean(raw_text)
+        if not raw_text:
+            return
+
+        if re.search(r"(?i)(top|head|heart|middle|base)\s*notes?\s*[:\-]?", raw_text):
+            top_match = re.search(
+                r"(?i)(?:top|head)\s*notes?[\s:\-]*(.*?)(?=(?:heart|middle|base)\s*notes?|$)",
+                raw_text,
+                re.S,
+            )
+            heart_match = re.search(
+                r"(?i)(?:heart|middle)\s*notes?[\s:\-]*(.*?)(?=(?:base)\s*notes?|$)",
+                raw_text,
+                re.S,
+            )
+            base_match = re.search(r"(?i)(?:base)\s*notes?[\s:\-]*(.*)", raw_text, re.S)
+
+            if top_match:
+                notes_obj.top.extend(BasenotesEngine._clean_note_items(top_match.group(1)))
+                notes_obj.has_pyramid = True
+            if heart_match:
+                notes_obj.heart.extend(BasenotesEngine._clean_note_items(heart_match.group(1)))
+                notes_obj.has_pyramid = True
+            if base_match:
+                notes_obj.base.extend(BasenotesEngine._clean_note_items(base_match.group(1)))
+                notes_obj.has_pyramid = True
+        else:
+            notes_obj.flat.extend(BasenotesEngine._clean_note_items(raw_text))
             
     @staticmethod
     def fetch_details(
@@ -3209,39 +3465,88 @@ class BasenotesEngine:
         if reviews_container:
             for a in reviews_container.find_all("a"):
                 text = safe_get_text(a)
-                match = re.search(r"(\d+)\s*(Positive|Neutral|Negative)\s*\((\d+)%\)", text, re.I)
+                match = BasenotesEngine._CONSENSUS_PATTERN.search(text)
                 if match:
                     unified_details.bn_consensus[match.group(2).lower()[:3]] = (
                         int(match.group(1)),
                         int(match.group(3)),
                     )
         
-        # BN Pyramids - dissect h3/ul structures into Top/Heart/Base.
-        notes_container = soup.find(class_=re.compile(r"fragrancenotes", re.I))
-        if notes_container:
-            h3s = notes_container.find_all("h3")
-            if h3s:
-                for h3 in h3s:
-                    text = safe_get_text(h3).lower()
-                    ul = h3.find_next_sibling("ul") or h3.find_next("ul")
-                    if ul:
-                        notes = [safe_get_text(li) for li in ul.find_all("li") if safe_get_text(li)]
-                        if "top" in text:
+        if not unified_details.notes.has_pyramid:
+            ul_container = soup.find("ul", class_="fragrancenotes")
+            if ul_container:
+                list_items = ul_container.find_all("li", recursive=False)
+                if list_items and any(item.find("h3") for item in list_items):
+                    for item in list_items:
+                        heading = item.find("h3")
+                        nested_ul = item.find("ul")
+                        if not heading or not nested_ul:
+                            continue
+                        label = TextSanitizer.clean(heading.get_text(strip=True).lower())
+                        notes = BasenotesEngine._clean_note_items(
+                            nested_ul.get_text(separator=", ", strip=True)
+                        )
+                        if "head" in label or "top" in label:
                             unified_details.notes.top.extend(notes)
                             unified_details.notes.has_pyramid = True
-                        elif "heart" in text or "middle" in text:
+                        elif "heart" in label or "middle" in label:
                             unified_details.notes.heart.extend(notes)
                             unified_details.notes.has_pyramid = True
-                        elif "base" in text:
+                        elif "base" in label:
                             unified_details.notes.base.extend(notes)
                             unified_details.notes.has_pyramid = True
-
-            # Fallback extraction if no structured headers were found
-            if not unified_details.notes.has_pyramid:
-                notes_ul = notes_container if notes_container.name == "ul" else notes_container.find("ul")
-                if notes_ul:
-                    flat = [safe_get_text(li) for li in notes_ul.find_all("li")]
-                    unified_details.notes.flat.extend(note for note in flat if note)
+                else:
+                    BasenotesEngine._apply_text_to_notes(
+                        ul_container.get_text(separator="\n", strip=True),
+                        unified_details.notes,
+                    )
+            else:
+                div_container = soup.find("div", class_="fragrancenotes")
+                if div_container:
+                    BasenotesEngine._apply_text_to_notes(
+                        div_container.get_text(separator="\n", strip=True),
+                        unified_details.notes,
+                    )
+                else:
+                    notes_header = soup.find(
+                        lambda tag: tag.name in {"h2", "h3", "h4", "div", "b", "strong", "span"}
+                        and re.match(
+                            r"^(?:fragrance\s+)?notes$",
+                            TextSanitizer.clean(tag.get_text(strip=True)),
+                            re.I,
+                        )
+                    )
+                    if notes_header:
+                        blocks: list[str] = []
+                        stop_markers = (
+                            "latest reviews",
+                            "your tags",
+                            "by the same house",
+                            "advertisement",
+                            "where to buy",
+                            "add your review",
+                            "fragrance reviews",
+                            "similar fragrances",
+                        )
+                        for sibling in notes_header.find_next_siblings(limit=15):
+                            sibling_text = TextSanitizer.clean(
+                                sibling.get_text(separator=" ", strip=True).lower()
+                            )
+                            if any(marker in sibling_text for marker in stop_markers):
+                                break
+                            blocks.append(TextSanitizer.clean(sibling.get_text(separator="\n", strip=True)))
+                        BasenotesEngine._apply_text_to_notes(
+                            "\n".join(blocks).strip(),
+                            unified_details.notes,
+                        )
+                    elif soup.body:
+                        match = re.search(
+                            r"(?i)^(?:fragrance\s+)?notes\s*[\r\n]+(.*?)(?=(?:latest reviews|your tags|by the same house|advertisement|where to buy|add your review|fragrance reviews|similar fragrances)|$)",
+                            soup.body.get_text(separator="\n", strip=True),
+                            re.I | re.S | re.M,
+                        )
+                        if match:
+                            BasenotesEngine._apply_text_to_notes(match.group(1).strip(), unified_details.notes)
 
         for review_outer in soup.find_all("div", class_=re.compile(r"fragreviewouter", re.I)):
             for a in review_outer.find_all("a", string=re.compile(r"(?i)show all reviews")):
