@@ -1071,11 +1071,19 @@ def search(
     except Exception as exc:  # engine degrades cleanly; surface a 502 if not
         raise HTTPException(status_code=502, detail=f"Search failed: {exc}") from exc
 
+    brand_directory_query = engine.IdentityTools.canonical_brand_query(query)
     fallback_source: str | None = None
-    if not results:
+    if not results and not brand_directory_query:
         results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
 
     diagnostics = _search_diagnostics(results)
+    if brand_directory_query:
+        diagnostics["brand_directory_source"] = "basenotes_directory"
+        if not results:
+            diagnostics["warning"] = (
+                "Basenotes directory returned zero live candidates; no "
+                "Fragrantica or cache substitute was used for this brand build-out query."
+            )
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
         diagnostics["warning"] = (

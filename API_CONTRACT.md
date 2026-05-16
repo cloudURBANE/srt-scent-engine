@@ -67,7 +67,9 @@ Notes:
   directory searches. The backend uses Basenotes'
   `/directory/?search=<brand>&type=fragrances` result list as the source of the
   candidate set. Do not expect a separate `/brands` payload, and do not treat
-  Fragrantica designer/catalog enrichment as the authoritative list source.
+  Fragrantica designer/catalog enrichment as the authoritative list source. If
+  the live Basenotes directory source returns zero rows, the response stays
+  empty with a diagnostics warning instead of substituting a cache/catalog list.
 - `gender` is the engine's default placeholder at search time; the engine only
   resolves the real gender during the detail fetch. The detail response carries
   the resolved value.
