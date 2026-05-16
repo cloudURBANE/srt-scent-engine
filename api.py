@@ -234,6 +234,44 @@ def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
     return candidates[:limit]
 
 
+def _identity_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
+    """Last-resort search candidates from the engine's existing FG identity cache.
+
+    This is used only when live providers return zero candidates. It does not
+    alter resolver scoring or the normal search path; it simply exposes the same
+    warmed identity cache that SearchSniper already uses after candidates exist.
+    """
+    cache = engine.IdentityCache(getattr(_ARGS, "fg_cache", ""))
+    candidates: list[engine.UnifiedFragrance] = []
+    seen: set[str] = set()
+    for row in cache.data.values():
+        if not isinstance(row, dict):
+            continue
+        fg_url = _canonical_fg_url(str(row.get("url") or ""))
+        if not fg_url or fg_url in seen:
+            continue
+        item = engine.UnifiedFragrance(
+            name=str(row.get("name") or "").strip(),
+            brand=str(row.get("brand") or "").strip(),
+            year=str(row.get("year") or "").strip(),
+            frag_url=fg_url,
+            resolver_source="fg_identity_cache",
+            resolver_score=0.98,
+        )
+        if not item.name or not item.brand:
+            continue
+        item.query_score = engine.IdentityTools.relevance_score(query, item)
+        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+            continue
+        seen.add(fg_url)
+        candidates.append(item)
+    candidates.sort(
+        key=lambda item: (item.query_score, item.resolver_score, item.year),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
 def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedFragrance], str | None]:
     """Fallback search for blocked live providers, with DB as source of truth."""
     seen: set[str] = set()
@@ -258,6 +296,10 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
         candidates = _json_cache_search(query, limit)
         if candidates:
             source = "json"
+    if not candidates:
+        candidates = _identity_cache_search(query, limit)
+        if candidates:
+            source = "identity"
 
     candidates.sort(
         key=lambda item: (item.query_score, item.resolver_score, item.year),
