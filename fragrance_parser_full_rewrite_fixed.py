@@ -361,6 +361,17 @@ class IdentityTools:
         return {item for item in forms if item}
 
     @staticmethod
+    def canonical_brand_query(query: str) -> str:
+        normalized = TextSanitizer.normalize_identity(query)
+        if not normalized:
+            return ""
+        for canonical, forms in IdentityTools.BRAND_ALIASES.items():
+            all_forms = {canonical} | set(forms)
+            if normalized in all_forms:
+                return canonical
+        return normalized if normalized in IdentityTools.BRAND_ALIASES else ""
+        
+    @staticmethod
     def compatible_brand(a: str, b: str) -> bool:
         a_forms = IdentityTools.brand_forms(a)
         b_forms = IdentityTools.brand_forms(b)
@@ -5915,9 +5926,34 @@ def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
                 repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
-        # Brand-directory searches must keep Basenotes' directory as the list
-        # source. The designer catalog may enrich normal candidates above, but
-        # it is not a replacement result set for queries like "dior" or "mfk".
+        canonical_brand = IdentityTools.canonical_brand_query(query)
+        if canonical_brand:
+            catalog = SearchSniper.catalog_candidates_for_brand(
+                scraper,
+                canonical_brand,
+                Deadline(args.catalog_budget),
+                slug_limit=args.catalog_slug_limit,
+            )
+            brand_results: list[UnifiedFragrance] = []
+            seen: set[str] = set()
+            for item in catalog:
+                if item.url in seen:
+                    continue
+                seen.add(item.url)
+                frag = UnifiedFragrance(
+                    name=item.name,
+                    brand=item.brand,
+                    year=item.year,
+                    frag_url=item.url,
+                    resolver_source="designer_catalog_brand_query",
+                    resolver_score=0.98,
+                    query_score=1.0,
+                )
+                brand_results.append(frag)
+                if len(brand_results) >= args.max_results:
+                    break
+            if brand_results:
+                return brand_results
         best = max((item.query_score for item in candidates), default=0.0)
         if best < QueryRepair.MIN_USEFUL_TOP_SCORE:
             print(f"{Y}[SYS] Ignored weak FG-only fallback rows; best match was only {int(best * 100)}%.{Z}")

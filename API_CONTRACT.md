@@ -63,11 +63,6 @@ Run the dual-source resolver and return ranked candidates.
 Notes:
 - `id` is an **opaque token** — pass it back verbatim to `/api/fragrances/details`.
   Do not parse it.
-- Brand-name build-out searches, for example `dior`, are still fragrance
-  directory searches. The backend uses Basenotes'
-  `/directory/?search=<brand>&type=fragrances` result list as the source of the
-  candidate set. Do not expect a separate `/brands` payload, and do not treat
-  Fragrantica designer/catalog enrichment as the authoritative list source.
 - `gender` is the engine's default placeholder at search time; the engine only
   resolves the real gender during the detail fetch. The detail response carries
   the resolved value.
