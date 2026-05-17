@@ -27,11 +27,16 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 
 from fastapi.testclient import TestClient
+import requests
 
 import api
 import db
+import scripts.enrichment_worker as enrichment_worker
 
 _FAILURES: list[str] = []
 
@@ -97,6 +102,61 @@ def test_no_db_contract() -> None:
         )
     finally:
         api._ENRICHMENT_WORKER_TOKEN = saved
+
+    @dataclass
+    class ParserLeak:
+        amount: Decimal
+        captured_at: datetime
+
+    sanitized = api._json_for_db_blob(
+        {
+            "card": ParserLeak(Decimal("1.25"), datetime(2026, 1, 2, 3, 4, 5)),
+            "notes": {"top": {"bergamot", "lemon"}},
+        }
+    )
+    check(
+        "db blob sanitizer accepts parser-native objects",
+        sanitized["card"] == {"amount": 1.25, "captured_at": "2026-01-02T03:04:05"}
+        and sorted(sanitized["notes"]["top"]) == ["bergamot", "lemon"],
+    )
+
+    response = requests.Response()
+    response.status_code = 500
+    response.headers["Content-Type"] = "application/json"
+    response._content = b'{"detail":"complete_job failed (TypeError): bad payload"}'
+    check(
+        "worker extracts structured API error detail",
+        enrichment_worker._safe_response_text(response) == "complete_job failed (TypeError): bad payload",
+    )
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.last_json: dict[str, object] | None = None
+
+        def request(self, _method: str, _url: str, **kwargs: object) -> requests.Response:
+            self.last_json = kwargs.get("json")  # type: ignore[assignment]
+            ok = requests.Response()
+            ok.status_code = 200
+            ok._content = b"{}"
+            return ok
+
+    fake_session = FakeSession()
+    worker_client = enrichment_worker.ApiClient("https://api.example.test", "token")
+    worker_client.session = fake_session  # type: ignore[assignment]
+    worker_client._request(
+        "POST",
+        "/api/enrichment/jobs/test/complete",
+        json={
+            "card": ParserLeak(Decimal("2.50"), datetime(2026, 2, 3, 4, 5, 6)),
+            "tags": {"warm", "amber"},
+        },
+    )
+    sent = fake_session.last_json or {}
+    check(
+        "worker normalizes outbound JSON payloads before requests",
+        sent.get("card") == {"amount": 2.5, "captured_at": "2026-02-03T04:05:06"}
+        and sorted(sent.get("tags") or []) == ["amber", "warm"],
+    )
 
 
 # ---------------------------------------------------------------------------

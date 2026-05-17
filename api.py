@@ -36,16 +36,20 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import logging
 import os
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Engine handles (built once, reused)
@@ -2008,6 +2012,16 @@ class RequeueJobRequest(BaseModel):
     priority: int = 10
 
 
+def _json_for_db_blob(obj: Any) -> Any:
+    """Return strict JSON-native data for psycopg ``Json()`` payloads.
+
+    The worker/parser boundary is intentionally permissive, so normalize common
+    Python objects (dataclasses, Decimal, datetime) before the final round-trip
+    strips anything the stdlib encoder still cannot represent.
+    """
+    return json.loads(json.dumps(jsonable_encoder(obj), default=str))
+
+
 def _require_db() -> None:
     """Reject enrichment requests when durable storage is not configured."""
     if not db.ENABLED:
@@ -2182,14 +2196,21 @@ def complete_enrichment_job(
         "schema_version": payload.schema_version,
         "source": payload.source or "worker",
         "captured_at": payload.captured_at,
-        "frag_cards": payload.frag_cards,
-        "notes": payload.notes,
-        "pros_cons": payload.pros_cons,
-        "reviews": payload.reviews,
-        "raw_identity": payload.raw_identity,
+        "frag_cards": _json_for_db_blob(payload.frag_cards),
+        "notes": _json_for_db_blob(payload.notes or {}),
+        "pros_cons": _json_for_db_blob(payload.pros_cons or []),
+        "reviews": _json_for_db_blob(payload.reviews or []),
+        "raw_identity": _json_for_db_blob(payload.raw_identity or {}),
         "quality_status": quality,
     }
-    updated = db.complete_job(job_id, cache_row)
+    try:
+        updated = db.complete_job(job_id, cache_row)
+    except Exception as exc:
+        logger.exception("complete_job failed job_id=%s canonical=%s", job_id, canonical)
+        raise HTTPException(
+            status_code=500,
+            detail=f"complete_job failed ({type(exc).__name__}): {exc}",
+        ) from exc
     if not updated:
         raise HTTPException(status_code=404, detail="Job not found.")
     return {"completed": True, "canonical_fg_url": canonical, "job": updated}

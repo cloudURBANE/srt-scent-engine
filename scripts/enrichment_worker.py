@@ -14,15 +14,22 @@ Required environment:
 
 Examples:
     python scripts/enrichment_worker.py --management
+    python scripts/enrichment_worker.py --dashboard --debug
+    python scripts/enrichment_worker.py --dashboard --auto-approve
     python scripts/enrichment_worker.py --process-pending --limit 20 --delay 45 --jitter 15
     python scripts/enrichment_worker.py --process-pending --limit 10 --delay 90
     python scripts/enrichment_worker.py --warm-list top_queries.txt --delay 60
+
+Environment:
+    ENRICHMENT_WORKER_DEBUG=1  Verbose worker/engine output (same as --debug).
+    ENRICHMENT_DASHBOARD_AUTO_APPROVE=1  Start the dashboard with auto_approve engaged (same as --auto-approve).
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import io
+import json
 import os
 import random
 import re
@@ -37,6 +44,7 @@ from typing import Any
 from urllib.parse import urljoin, urlencode
 
 import requests
+from fastapi.encoders import jsonable_encoder
 
 # The engine module lives one directory up from scripts/.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -121,11 +129,12 @@ class ApiClient:
         json: dict[str, Any] | None = None,
         auth: bool = True,
     ) -> dict[str, Any]:
+        wire_json = _json_for_request(json)
         try:
             response = self.session.request(
                 method,
                 self._url(path, params),
-                json=json,
+                json=wire_json,
                 headers=self._headers(auth),
                 timeout=HTTP_TIMEOUT,
             )
@@ -208,7 +217,31 @@ class ApiClient:
 
 def _safe_response_text(response: requests.Response) -> str:
     text = (response.text or "").strip().replace("\n", " ")
-    return text[:300] if text else response.reason
+    if not text:
+        return response.reason or ""
+    detail = None
+    ctype = (response.headers.get("Content-Type") or "").lower()
+    looks_json = "json" in ctype or text.startswith("{")
+    if looks_json:
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                raw_detail = data.get("detail")
+                if isinstance(raw_detail, str):
+                    detail = raw_detail
+                elif raw_detail is not None:
+                    detail = json.dumps(raw_detail)
+        except ValueError:
+            detail = None
+    out = detail if detail else text
+    return out[:500] if len(out) > 500 else out
+
+
+def _json_for_request(obj: Any) -> Any:
+    """Return strict JSON-native data before handing payloads to requests."""
+    if obj is None:
+        return None
+    return json.loads(json.dumps(jsonable_encoder(obj), default=str))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -229,6 +262,13 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise SystemExit(f"{name} must be an integer, got {raw!r}.")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _now_iso() -> str:
@@ -1061,7 +1101,7 @@ def _render_dashboard(
     )
     print(f"   {auto_key}")
     print(
-        f"   {c['D']}[r] refresh   [+/-] interval   [q] quit{c['Z']}"
+        f"   {c['D']}[r] refresh   [m] paste token   [+/-] interval   [q] quit{c['Z']}"
     )
 
 
@@ -1215,13 +1255,22 @@ def _poll_phone_commands(
         _log_event(f"cmd: {kind} -> {'ok' if ok else 'fail'} ({msg})", "ok" if ok else "err")
 
 
-def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopController) -> int:
+def run_live_dashboard(
+    client: ApiClient,
+    config: WorkerConfig,
+    stop: StopController,
+    *,
+    initial_auto_approve: bool = False,
+) -> int:
     """Auto-refreshing visual of the enrichment queue cume.
 
     The refresh interval seeds from the worker delay and is adjustable live with
     +/-. Menu numbers 1-6 dispatch the same actions as the static manager menu.
     Pressing [a] toggles auto-approve, which claims + completes one pending job
     every AUTO_APPROVE_INTERVAL seconds with no further input.
+
+    Pass ``initial_auto_approve=True`` (or set ENRICHMENT_DASHBOARD_AUTO_APPROVE / ``--auto-approve``)
+    to start with that mode already engaged.
     """
     interval = int(max(DASHBOARD_MIN_INTERVAL, min(DASHBOARD_MAX_INTERVAL, round(config.delay or DEFAULT_DELAY))))
     baseline: dict[str, int] | None = None
@@ -1229,6 +1278,12 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
     # auto_approve is held inside `runtime` so phone-issued commands can flip
     # it from _execute_phone_command() without a second source of truth.
     runtime: dict[str, Any] = {"auto_approve": False}
+    if initial_auto_approve:
+        if config.auth_configured:
+            runtime["auto_approve"] = True
+            _log_event("auto_approve ENGAGED (from terminal flag/env)", "ok")
+        else:
+            _log_event("auto_approve not started: set ENRICHMENT_WORKER_TOKEN first", "err")
     auto_state: dict[str, Any] = {"scraper": None, "args": None}
     c = _colors()
     while not stop.stop_requested:
@@ -1288,7 +1343,7 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
             break
         if key == "a":
             if not runtime["auto_approve"] and not config.auth_configured:
-                _log_event("auto_approve needs a worker token — sign in via [M]", "err")
+                _log_event("auto_approve needs a worker token — press [m] to paste token", "err")
             else:
                 runtime["auto_approve"] = not runtime["auto_approve"]
                 _log_event(
@@ -1301,6 +1356,14 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
             refresh_now = True
         elif key in ("-", "_"):
             interval = max(DASHBOARD_MIN_INTERVAL, interval - DASHBOARD_STEP)
+            refresh_now = True
+        elif key == "m":
+            had_token = config.auth_configured
+            _dashboard_token_prompt(client, config)
+            if config.auth_configured and not had_token:
+                _log_event("worker token attached", "ok")
+            elif not config.auth_configured:
+                _log_event("worker token missing — paste with [m] or set ENRICHMENT_WORKER_TOKEN", "warn")
             refresh_now = True
         elif key in ("1", "2", "3", "4", "5", "6"):
             print()
@@ -1332,6 +1395,47 @@ def _read_secret(label: str) -> str:
         return getpass.getpass(label)
     except Exception:
         return input(label)
+
+
+def _dashboard_token_prompt(client: ApiClient, config: WorkerConfig) -> bool:
+    """Paste worker token while the live dashboard is running ([m]).
+
+    Updates ``config`` and ``client``. Returns True if a token is now configured."""
+    print()
+    c = _colors()
+    print(f"   {c['D']}Worker token — paste to attach (empty = cancel){c['Z']}")
+    try:
+        entered = _read_secret(f"   {c['B']}token ›{c['Z']} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(f"   {c['Y']}cancelled{c['Z']}")
+        return config.auth_configured
+    if not entered:
+        print(f"   {c['Y']}cancelled{c['Z']}")
+        return config.auth_configured
+
+    config.token = entered
+    client.token = entered
+    print(f"   {c['D']}verifying…{c['Z']}")
+    try:
+        client.list_jobs("pending", limit=1)
+    except WorkerError as exc:
+        if exc.code in ("api_auth_failed", "api_request_failed"):
+            print(f"   {c['R']}x token rejected ({exc.code}).{c['Z']}")
+            config.token = ""
+            client.token = ""
+        else:
+            print(
+                f"   {c['Y']}! could not verify right now ({exc.code}); keeping token — retry on refresh.{c['Z']}"
+            )
+            time.sleep(1.0)
+    else:
+        print(f"   {c['G']}✓ access granted.{c['Z']}")
+
+    try:
+        input(f"\n   {c['D']}Press Enter to return to the dashboard…{c['Z']} ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return config.auth_configured
 
 
 def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -> bool:
@@ -1401,14 +1505,23 @@ def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -
     return False
 
 
-def launch_dashboard(api_base_url: str | None = None) -> int:
+def launch_dashboard(
+    api_base_url: str | None = None,
+    *,
+    initial_auto_approve: bool | None = None,
+    debug: bool | None = None,
+) -> int:
     """Build a config from the environment and open the live dashboard.
 
     This is the single entry point the main parser script imports for its
     startup "Management" mode, and what the worker's --dashboard flag calls.
     The operator must clear the token sign-in gate before the dashboard opens.
+
+    If ``initial_auto_approve`` is None, reads ENRICHMENT_DASHBOARD_AUTO_APPROVE (1/true/on).
+    If ``debug`` is None, reads ENRICHMENT_WORKER_DEBUG (1/true/on).
     """
     base = (api_base_url or os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
+    dbg = bool(debug) if debug is not None else _env_bool("ENRICHMENT_WORKER_DEBUG", False)
     config = WorkerConfig(
         api_base_url=base,
         token=os.environ.get("ENRICHMENT_WORKER_TOKEN", ""),
@@ -1416,17 +1529,22 @@ def launch_dashboard(api_base_url: str | None = None) -> int:
         jitter=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER),
         limit=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT),
         detail_timeout=8.0,
-        debug=False,
+        debug=dbg,
         dry_run=False,
     )
-    client = ApiClient(config.api_base_url, config.token)
+    client = ApiClient(config.api_base_url, config.token, debug=config.debug)
     stop = StopController()
     stop.install()
     try:
         if not _login_gate(client, config, stop):
             print("\nLeaving SRT Set Engine.")
             return 0
-        return run_live_dashboard(client, config, stop)
+        auto0 = (
+            bool(initial_auto_approve)
+            if initial_auto_approve is not None
+            else _env_bool("ENRICHMENT_DASHBOARD_AUTO_APPROVE", False)
+        )
+        return run_live_dashboard(client, config, stop, initial_auto_approve=auto0)
     except KeyboardInterrupt:
         print("\nLeaving SRT Set Engine.")
         return 0
@@ -1435,7 +1553,8 @@ def launch_dashboard(api_base_url: str | None = None) -> int:
 def ensure_token(config: WorkerConfig) -> None:
     if not config.auth_configured:
         raise SystemExit(
-            "missing_worker_token: ENRICHMENT_WORKER_TOKEN is required for worker operations."
+            "missing_worker_token: set ENRICHMENT_WORKER_TOKEN, run `python scripts/enrichment_worker.py --dashboard` "
+            "interactively to use the sign-in screen, or from the live dashboard press [m] to paste a token."
         )
 
 
@@ -1457,6 +1576,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--management", action="store_true", help="Show the interactive management menu.")
     parser.add_argument("--dashboard", action="store_true", help="Open the live auto-refreshing management dashboard.")
+    parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="With --dashboard: start with hands-free auto_approve engaged (needs ENRICHMENT_WORKER_TOKEN). "
+        "Or set ENRICHMENT_DASHBOARD_AUTO_APPROVE=1.",
+    )
     parser.add_argument("--process-pending", action="store_true", help="Process pending enrichment jobs.")
     parser.add_argument("--warm-list", help="Path to one-query-per-line warm list.")
     parser.add_argument("--api-base-url", default=os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL))
@@ -1466,12 +1591,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="Alias for --process-pending --limit 1.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve and parse without mutating worker job state.")
     parser.add_argument("--detail-timeout", type=float, default=8.0, help="Per-page detail fetch deadline.")
-    parser.add_argument("--debug", action="store_true", help="Show engine output and full exceptions.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose worker/engine output and full API error text. Or set ENRICHMENT_WORKER_DEBUG=1.",
+    )
     return parser.parse_args()
 
 
 def build_config(opts: argparse.Namespace) -> WorkerConfig:
     limit = 1 if opts.once else max(1, int(opts.limit or DEFAULT_LIMIT))
+    debug_on = bool(opts.debug) or _env_bool("ENRICHMENT_WORKER_DEBUG", False)
     return WorkerConfig(
         api_base_url=str(opts.api_base_url or DEFAULT_API_BASE_URL).rstrip("/"),
         token=os.environ.get("ENRICHMENT_WORKER_TOKEN", ""),
@@ -1479,13 +1609,15 @@ def build_config(opts: argparse.Namespace) -> WorkerConfig:
         jitter=max(0.0, float(opts.jitter)),
         limit=limit,
         detail_timeout=max(0.1, float(opts.detail_timeout)),
-        debug=bool(opts.debug),
+        debug=debug_on,
         dry_run=bool(opts.dry_run),
     )
 
 
 def main() -> int:
     opts = parse_args()
+    if opts.auto_approve and not opts.dashboard:
+        raise SystemExit("--auto-approve only applies with --dashboard.")
     config = build_config(opts)
     client = ApiClient(config.api_base_url, config.token, debug=config.debug)
     stop = StopController()
@@ -1493,7 +1625,20 @@ def main() -> int:
 
     try:
         if opts.dashboard:
-            return run_live_dashboard(client, config, stop)
+            # Unlike `launch_dashboard()` (parser [M] entry), `--dashboard` used to skip the
+            # sign-in gate — operators pasted a token only in the parser flow, then hit this
+            # path without ENRICHMENT_WORKER_TOKEN and failed at ensure_token().
+            if not config.auth_configured:
+                if sys.stdin.isatty():
+                    if not _login_gate(client, config, stop):
+                        print("\nLeaving SRT Set Engine.")
+                        return 0
+                else:
+                    raise SystemExit(
+                        "missing_worker_token: set ENRICHMENT_WORKER_TOKEN (stdin is not interactive; cannot prompt)."
+                    )
+            initial_auto = opts.auto_approve or _env_bool("ENRICHMENT_DASHBOARD_AUTO_APPROVE", False)
+            return run_live_dashboard(client, config, stop, initial_auto_approve=initial_auto)
         if opts.process_pending or opts.once:
             ensure_token(config)
             process_pending(client, config, stop=stop)

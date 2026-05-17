@@ -203,6 +203,9 @@ or invalid token → `401`. `ENRICHMENT_WORKER_TOKEN` / `DATABASE_URL` unset →
 | `POST /api/enrichment/jobs/{id}/fail` | Record a failure (`retryable: true` returns the job to `pending`). |
 | `POST /api/enrichment/jobs/{id}/ignore` | Permanently retire a bad job. |
 
+`/complete` 5xx responses include a `detail` string with the underlying
+exception class so the worker can surface actionable failure logs.
+
 ---
 
 ## Example frontend flow (Vite)
