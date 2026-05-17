@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urljoin, urlencode
 
 import requests
 
@@ -190,6 +190,21 @@ class ApiClient:
             json={"note": note or "ignored from local worker"},
         )
 
+    def claim_command(self) -> dict[str, Any] | None:
+        payload = self._request("POST", "/api/enrichment/commands/claim")
+        cmd = payload.get("command")
+        return cmd if isinstance(cmd, dict) else None
+
+    def finish_command(self, command_id: str, *, ok: bool, result_text: str | None) -> None:
+        self._request(
+            "POST",
+            f"/api/enrichment/commands/{command_id}/finish",
+            json={"ok": bool(ok), "result_text": result_text},
+        )
+
+    def heartbeat(self) -> None:
+        self._request("POST", "/api/enrichment/commands/heartbeat")
+
 
 def _safe_response_text(response: requests.Response) -> str:
     text = (response.text or "").strip().replace("\n", " ")
@@ -293,6 +308,66 @@ def _raw_identity(candidate: engine.UnifiedFragrance, job: dict[str, Any] | None
     return {k: v for k, v in raw.items() if v not in ("", None)}
 
 
+def _specific_identity(candidate: engine.UnifiedFragrance) -> dict[str, Any]:
+    """Prefer the URL-derived Fragrantica identity when it is more specific."""
+    name = str(candidate.name or "").strip()
+    house = str(candidate.brand or "").strip()
+    year = candidate.year
+    if candidate.frag_url:
+        url_name = engine.FragranticaEngine.name_from_url(candidate.frag_url)
+        url_house = engine.FragranticaEngine.brand_from_url(candidate.frag_url)
+        if url_name and (not name or _url_name_is_more_specific(name, url_name)):
+            name = url_name
+        if url_house and (not house or house.lower() == "unknown"):
+            house = url_house
+    return {"name": name or None, "house": house or None, "year": _coerce_year(year) or None}
+
+
+def _url_name_is_more_specific(stored: str, url_derived: str) -> bool:
+    def _tokens(value: str) -> list[str]:
+        return [tok for tok in re.split(r"[^a-z0-9]+", value.lower()) if tok]
+
+    stored_tokens = _tokens(stored)
+    url_tokens = _tokens(url_derived)
+    return bool(url_tokens) and len(url_tokens) > len(stored_tokens)
+
+
+def _extract_image_url(scraper, fg_url: str, *, debug: bool = False) -> str:
+    """Best-effort Fragrantica bottle image extraction for cache refreshes."""
+    if not fg_url:
+        return ""
+    try:
+        res = _run_engine_call(
+            lambda: scraper.get(
+                fg_url, timeout=12, headers=dict(engine.Http.DEFAULT_HEADERS)
+            ),
+            debug=debug,
+        )
+    except Exception:
+        return ""
+    body = getattr(res, "text", "") or ""
+    if not body:
+        return ""
+    try:
+        soup = engine.BeautifulSoup(body, "html.parser")
+    except Exception:
+        return ""
+
+    selectors = [
+        ('meta[property="og:image"]', "content"),
+        ('meta[name="twitter:image"]', "content"),
+        ('img[itemprop="image"]', "src"),
+        ('img[src*="/mdimg/perfume/"]', "src"),
+        ('img[data-src*="/mdimg/perfume/"]', "data-src"),
+    ]
+    for selector, attr in selectors:
+        node = soup.select_one(selector)
+        value = str(node.get(attr) if node else "").strip()
+        if value:
+            return urljoin(fg_url, value)
+    return ""
+
+
 def _build_engine_args() -> argparse.Namespace:
     args = engine.build_parser().parse_args([])
     # Keep resolution conservative and close to API defaults; no open-web sniper.
@@ -380,8 +455,18 @@ def fetch_payload(
         retryable = bool(engine.FragranticaEngine.is_perfume_url(candidate.frag_url))
         raise WorkerError("parser_empty_frag_cards", retryable=retryable)
 
+    identity = _specific_identity(candidate)
+    image_url = _extract_image_url(scraper, candidate.frag_url, debug=debug)
+    raw_identity = _raw_identity(candidate, job)
+    if image_url:
+        raw_identity["image_url"] = image_url
+
     return {
         "fg_url": candidate.frag_url,
+        "name": identity["name"],
+        "house": identity["house"],
+        "year": identity["year"],
+        "image_url": image_url or None,
         "schema_version": SCHEMA_VERSION,
         "captured_at": _now_iso(),
         "source": "local_enrichment_worker",
@@ -389,7 +474,7 @@ def fetch_payload(
         "notes": _notes_payload(details.notes),
         "pros_cons": list(details.pros_cons or []),
         "reviews": _reviews_payload(details.reviews or []),
-        "raw_identity": _raw_identity(candidate, job),
+        "raw_identity": raw_identity,
         "quality_status": "complete",
     }
 
@@ -826,9 +911,14 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
     if snapshot["error"]:
         return snapshot
     try:
-        failed = client.list_jobs("failed", limit=MAX_LIST_LIMIT)
+        # Count pending jobs with prior failures — these are the ones the
+        # [5] Retry-failed action actually picks up. (Jobs that end up in
+        # status='failed' are non-retryable by definition per db.fail_job,
+        # so counting those would dangle the operator a number they can
+        # never action from the dashboard.)
+        pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
         snapshot["retryable_failures"] = sum(
-            1 for j in failed if int(j.get("failure_count") or 0) > 0
+            1 for j in pending if int(j.get("failure_count") or 0) > 0
         )
     except WorkerError:
         pass
@@ -854,10 +944,13 @@ def _fmt_delta(delta: int, c: dict[str, str]) -> str:
 
 
 def _section_header(label: str, c: dict[str, str], width: int) -> str:
-    """Hacker-style block header: ┌─[ LABEL ]──────── …"""
+    """Hacker-style block header: ├─[ LABEL ]──────── …┤
+
+    Spans width+2 columns so the corners align with the ╔/╗ on the top frame.
+    """
     inside = f" {label} "
-    fill = max(0, width - len(inside) - 4)
-    return f"  {c['G']}┌─[{c['B']}{inside}{c['Z']}{c['G']}]{'─' * fill}{c['Z']}"
+    fill = max(0, width - len(inside) - 2)
+    return f"  {c['G']}├─[{c['B']}{inside}{c['Z']}{c['G']}]{'─' * fill}┤{c['Z']}"
 
 
 def _render_dashboard(
@@ -872,15 +965,18 @@ def _render_dashboard(
     width = 64
     now = datetime.now().strftime("%H:%M:%S")
     top = f"  {c['G']}╔{'═' * width}╗{c['Z']}"
-    bot = f"  {c['G']}╚{'═' * width}╝{c['Z']}"
 
     # ── Banner ────────────────────────────────────────────────────────────
     print()
     print(top)
     title = "SRT//SET-ENGINE ▒▒ enrichment.control"
-    title_pad = max(0, width - len(title) - 2)
-    print(f"  {c['G']}║{c['B']} {title}{c['Z']}{' ' * title_pad}{c['G']}║{c['Z']}")
-    print(bot)
+    leftover = max(0, width - len(title))
+    left_pad = leftover // 2
+    right_pad = leftover - left_pad
+    print(
+        f"  {c['G']}║{c['Z']}{' ' * left_pad}{c['B']}{c['G']}{title}{c['Z']}"
+        f"{' ' * right_pad}{c['G']}║{c['Z']}"
+    )
     auth = (
         f"{c['G']}[LINK ▲ OK]{c['Z']}"
         if config.auth_configured
@@ -957,7 +1053,7 @@ def _render_dashboard(
             print(f"  {c['G']}│{c['Z']}  {c['D']}{stamp}{c['Z']} {col}{marker}{c['Z']} {msg}")
 
     # ── Footer / hotkeys ─────────────────────────────────────────────────
-    print(f"  {c['G']}└{'─' * width}{c['Z']}")
+    print(f"  {c['G']}└{'─' * width}┘{c['Z']}")
     auto_key = (
         f"{c['B']}{c['G']}[a] auto_approve=ON{c['Z']}"
         if auto_approve
@@ -1018,6 +1114,107 @@ def _run_auto_approve(
     _log_event(f"auto: completed {target}", "ok")
 
 
+def _execute_phone_command(
+    cmd: dict[str, Any],
+    client: ApiClient,
+    config: WorkerConfig,
+    stop: StopController,
+    auto_state: dict[str, Any],
+    runtime: dict[str, Any],
+) -> tuple[bool, str]:
+    """Execute one phone-issued command. Returns (ok, result_text).
+
+    runtime carries the live dashboard's mutable settings — currently the
+    auto_approve flag — so phone toggles match what the local UI does.
+    Scraping commands run inline; the dashboard tick is short and the operator
+    initiated the action remotely.
+    """
+    kind = cmd.get("kind") or ""
+    payload = cmd.get("payload") or {}
+
+    if kind == "toggle_auto_approve":
+        runtime["auto_approve"] = not bool(runtime.get("auto_approve"))
+        return True, f"auto_approve={'on' if runtime['auto_approve'] else 'off'}"
+
+    if kind == "set_auto_approve":
+        state = str(payload.get("state") or "").lower()
+        if state not in ("on", "off"):
+            return False, "bad state"
+        runtime["auto_approve"] = state == "on"
+        return True, f"auto_approve={state}"
+
+    if kind == "process_pending":
+        try:
+            limit = int(payload.get("limit") or 1)
+        except (TypeError, ValueError):
+            limit = 1
+        limit = max(1, min(limit, 50))
+        # Drive process_pending() with a clone config restricted to this batch.
+        batch_cfg = WorkerConfig(**{**config.__dict__, "limit": limit})
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                completed = process_pending(client, batch_cfg, stop=stop)
+            return True, f"processed {completed}/{limit}"
+        except SystemExit as exc:
+            return False, str(exc)
+        except WorkerError as exc:
+            return False, exc.code
+
+    if kind == "retry_failed":
+        retry_cfg = WorkerConfig(**{**config.__dict__})
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                completed = process_pending(client, retry_cfg, only_retries=True, stop=stop)
+            return True, f"retried {completed}"
+        except SystemExit as exc:
+            return False, str(exc)
+        except WorkerError as exc:
+            return False, exc.code
+
+    return False, f"unknown_kind:{kind}"
+
+
+def _poll_phone_commands(
+    client: ApiClient,
+    config: WorkerConfig,
+    stop: StopController,
+    auto_state: dict[str, Any],
+    runtime: dict[str, Any],
+) -> None:
+    """Heartbeat + drain queued phone commands. Best-effort: errors are logged
+    via LIVE_STREAM but never break the dashboard tick."""
+    if not config.auth_configured:
+        return
+    try:
+        client.heartbeat()
+    except WorkerError as exc:
+        _log_event(f"cmd: heartbeat failed ({exc.code})", "err")
+        return
+    # Drain up to a few commands per tick to keep latency low without
+    # starving the auto-approve loop.
+    for _ in range(3):
+        if stop.stop_requested:
+            return
+        try:
+            cmd = client.claim_command()
+        except WorkerError as exc:
+            _log_event(f"cmd: claim failed ({exc.code})", "err")
+            return
+        if not cmd:
+            return
+        kind = cmd.get("kind") or "?"
+        _log_event(f"cmd: executing {kind} (from phone)", "info")
+        try:
+            ok, msg = _execute_phone_command(cmd, client, config, stop, auto_state, runtime)
+        except Exception as exc:  # noqa: BLE001 - we report any failure back
+            ok, msg = False, f"exception:{type(exc).__name__}"
+        try:
+            client.finish_command(cmd["id"], ok=ok, result_text=msg[:240] if msg else None)
+        except WorkerError as exc:
+            _log_event(f"cmd: finish failed ({exc.code})", "err")
+        _log_event(f"cmd: {kind} -> {'ok' if ok else 'fail'} ({msg})", "ok" if ok else "err")
+
+
 def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopController) -> int:
     """Auto-refreshing visual of the enrichment queue cume.
 
@@ -1029,10 +1226,17 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
     interval = int(max(DASHBOARD_MIN_INTERVAL, min(DASHBOARD_MAX_INTERVAL, round(config.delay or DEFAULT_DELAY))))
     baseline: dict[str, int] | None = None
     refresh_now = True
-    auto_approve = False
+    # auto_approve is held inside `runtime` so phone-issued commands can flip
+    # it from _execute_phone_command() without a second source of truth.
+    runtime: dict[str, Any] = {"auto_approve": False}
     auto_state: dict[str, Any] = {"scraper": None, "args": None}
     c = _colors()
     while not stop.stop_requested:
+        auto_approve = bool(runtime["auto_approve"])
+        # Drain phone commands before drawing the frame so any auto_approve
+        # toggle issued from the phone shows up immediately on this refresh.
+        _poll_phone_commands(client, config, stop, auto_state, runtime)
+        auto_approve = bool(runtime["auto_approve"])
         if refresh_now:
             snapshot = _gather_dashboard_snapshot(client)
             if baseline is None and not snapshot.get("error"):
@@ -1083,13 +1287,13 @@ def run_live_dashboard(client: ApiClient, config: WorkerConfig, stop: StopContro
         if key == "q":
             break
         if key == "a":
-            if not auto_approve and not config.auth_configured:
+            if not runtime["auto_approve"] and not config.auth_configured:
                 _log_event("auto_approve needs a worker token — sign in via [M]", "err")
             else:
-                auto_approve = not auto_approve
+                runtime["auto_approve"] = not runtime["auto_approve"]
                 _log_event(
-                    "auto_approve ENGAGED" if auto_approve else "auto_approve disengaged",
-                    "ok" if auto_approve else "info",
+                    "auto_approve ENGAGED" if runtime["auto_approve"] else "auto_approve disengaged",
+                    "ok" if runtime["auto_approve"] else "info",
                 )
             refresh_now = True
         elif key in ("+", "="):
@@ -1141,50 +1345,57 @@ def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -
     c = _colors()
     width = 64
     env_token = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
+    title = "SRT//SET-ENGINE ▒▒ enrichment.control"
     while not stop.stop_requested:
         os.system("cls" if os.name == "nt" else "clear")
         print()
-        print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
-        print(f"   {c['B']}SRT SET ENGINE{c['Z']}   {c['D']}·   enrichment control{c['Z']}")
-        print(f"  {c['B']}{c['Y']}{'═' * width}{c['Z']}")
+        print(f"  {c['G']}╔{'═' * width}╗{c['Z']}")
+        leftover = max(0, width - len(title))
+        lp = leftover // 2
+        rp = leftover - lp
+        print(
+            f"  {c['G']}║{c['Z']}{' ' * lp}{c['B']}{c['G']}{title}{c['Z']}"
+            f"{' ' * rp}{c['G']}║{c['Z']}"
+        )
+        print(f"  {c['G']}╚{'═' * width}╝{c['Z']}")
         print()
-        print(f"   {c['D']}API   {config.api_base_url}{c['Z']}")
+        print(f"   {c['G']}>{c['Z']} {c['D']}api={c['Z']}{c['G']}{config.api_base_url}{c['Z']}")
         print()
         if env_token:
-            print(f"   {c['C']}A worker token was found in your environment.{c['Z']}")
-            print(f"   Press {c['B']}Enter{c['Z']} to use it, or paste a different token.")
+            print(f"   {c['G']}>{c['Z']} {c['G']}token detected in environment.{c['Z']}")
+            print(f"   {c['G']}>{c['Z']} press {c['B']}{c['G']}Enter{c['Z']} to use it, or paste a different token.")
         else:
-            print(f"   Enter your {c['B']}enrichment worker token{c['Z']} to unlock the controls.")
-        print(f"   {c['D']}Typing is hidden. Submit an empty token to cancel.{c['Z']}")
+            print(f"   {c['G']}>{c['Z']} enter your {c['B']}{c['G']}enrichment worker token{c['Z']} to unlock controls.")
+        print(f"   {c['D']}>> typing is hidden. submit an empty token to cancel.{c['Z']}")
         print()
         try:
-            entered = _read_secret(f"   {c['B']}token ›{c['Z']} ").strip()
+            entered = _read_secret(f"   {c['B']}{c['G']}token ›{c['Z']} ").strip()
         except (EOFError, KeyboardInterrupt):
             return False
         token = entered or env_token
         if not token:
-            print(f"\n   {c['Y']}No token provided — exiting.{c['Z']}")
+            print(f"\n   {c['Y']}!! no token provided — disconnecting.{c['Z']}")
             return False
         config.token = token
         client.token = token
-        print(f"\n   {c['D']}Verifying token…{c['Z']}")
+        print(f"\n   {c['D']}>> verifying token…{c['Z']}")
         try:
             client.list_jobs("pending", limit=1)
         except WorkerError as exc:
             if exc.code in ("api_auth_failed", "api_request_failed"):
-                print(f"   {c['R']}✗ Token rejected ({exc.code}).{c['Z']}")
+                print(f"   {c['R']}x token rejected ({exc.code}).{c['Z']}")
                 env_token = ""  # a rejected env token should not be re-offered
                 try:
-                    input(f"   {c['D']}Press Enter to try again, or Ctrl+C to exit…{c['Z']} ")
+                    input(f"   {c['D']}press Enter to retry, or Ctrl+C to exit…{c['Z']} ")
                 except (EOFError, KeyboardInterrupt):
                     return False
                 continue
             # Network/server hiccup rather than a bad token — let the operator
             # in and let the dashboard keep retrying its own calls on refresh.
-            print(f"   {c['Y']}⚠ Could not verify right now ({exc.code}); continuing anyway.{c['Z']}")
+            print(f"   {c['Y']}! could not verify right now ({exc.code}); continuing anyway.{c['Z']}")
             time.sleep(1.4)
             return True
-        print(f"   {c['C']}✓ Access granted.{c['Z']}")
+        print(f"   {c['G']}✓ access granted.{c['Z']}")
         time.sleep(0.8)
         return True
     return False

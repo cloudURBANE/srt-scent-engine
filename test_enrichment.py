@@ -85,6 +85,16 @@ def test_no_db_contract() -> None:
             r.status_code in expected,
             str(r.status_code),
         )
+
+        r = client.post(
+            "/api/fragrances/details/requeue",
+            json={"source_url": _TEST_JOB_KEY},
+        )
+        check(
+            "public requeue endpoint requires DB storage",
+            r.status_code in expected,
+            str(r.status_code),
+        )
     finally:
         api._ENRICHMENT_WORKER_TOKEN = saved
 
@@ -175,6 +185,31 @@ def test_db_lifecycle() -> None:
         check(
             "cached entry quality_status is complete",
             bool(cached and cached.get("quality_status") == "complete"),
+        )
+
+        requeued = db.requeue_job(job["id"], priority=25)
+        check("requeue_job resurrects completed jobs", requeued and requeued["status"] == "pending")
+        check("requeue_job raises priority", bool(requeued and requeued["priority"] >= 25))
+
+        refreshed = db.complete_job(
+            job["id"],
+            {
+                **cache_row,
+                "name": "Enrichment Selftest Fresh",
+                "house": "_fresh_",
+                "image_url": "https://img.example.test/fresh.jpg",
+                "frag_cards": {"Community Interest": [{"label": "Have", "count": "2"}]},
+            },
+        )
+        check("refreshed job completes", refreshed and refreshed["status"] == "completed")
+        cached = db.lookup_detail_cache(_TEST_JOB_KEY)
+        check(
+            "complete_job overwrites cached name",
+            bool(cached and cached.get("name") == "Enrichment Selftest Fresh"),
+        )
+        check(
+            "complete_job overwrites cached image_url",
+            bool(cached and cached.get("image_url") == "https://img.example.test/fresh.jpg"),
         )
     finally:
         _cleanup()

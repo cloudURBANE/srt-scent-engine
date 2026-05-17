@@ -45,6 +45,7 @@ from pydantic import BaseModel
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine
+import mobile
 
 # ---------------------------------------------------------------------------
 # Engine handles (built once, reused)
@@ -129,6 +130,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mobile router: /m/* HTML, /api/m/* JSON (cookie-authed), plus the
+# /api/enrichment/commands/* channel the desktop worker polls.
+app.include_router(mobile.router)
+
 # ---------------------------------------------------------------------------
 # Opaque id token: stateless encode/decode of an engine candidate.
 # ---------------------------------------------------------------------------
@@ -198,6 +203,7 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
         "name": name,
         "house": house,
         "year": _coerce_year(item.year),
+        "image_url": getattr(item, "image_url", None),
         "gender": "Unisex / Unspecified",  # engine default; resolved at detail
         "source_url": source_url,
     }
@@ -222,6 +228,9 @@ def _candidate_from_cache_entry(
         resolver_source=source,
         resolver_score=0.95,
     )
+    image_url = _cache_entry_image_url(entry)
+    if image_url:
+        setattr(candidate, "image_url", image_url)
     return candidate
 
 
@@ -372,6 +381,17 @@ def _source_coverage(
     }
 
 
+def _cache_entry_image_url(entry: dict[str, Any]) -> str:
+    raw_identity = entry.get("raw_identity") or {}
+    if not isinstance(raw_identity, dict):
+        raw_identity = {}
+    for key in ("image_url", "image", "thumbnail_url", "photo_url"):
+        value = str(entry.get(key) or raw_identity.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    return ""
+
+
 def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, str]:
     """Best-effort identity from a DB/JSON cache entry or Fragrantica URL.
 
@@ -458,6 +478,9 @@ def _fill_selected_identity(
         selected.brand = identity["house"]
     if not selected.year and identity["year"]:
         selected.year = identity["year"]
+    image_url = _cache_entry_image_url(entry)
+    if image_url and not getattr(selected, "image_url", ""):
+        setattr(selected, "image_url", image_url)
 
 
 def _details_to_dict(
@@ -484,6 +507,7 @@ def _details_to_dict(
         "name": selected.name,
         "house": selected.brand,
         "year": _coerce_year(selected.year),
+        "image_url": getattr(selected, "image_url", None),
         "gender": details.gender,
         "derived_metrics": details.derived_metrics,
         "source_coverage": _source_coverage(
@@ -531,6 +555,10 @@ def _details_to_dict(
 class DetailRequest(BaseModel):
     id: str | None = None
     source_url: str | None = None
+
+
+class RequeueDetailRequest(DetailRequest):
+    priority: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -1790,6 +1818,32 @@ def _enqueue_enrichment_job(
         return False
 
 
+def _requeue_enrichment_job(
+    selected: engine.UnifiedFragrance, req: RequeueDetailRequest
+) -> dict[str, Any] | None:
+    """Create or force-refresh the durable job for a detail identity."""
+    try:
+        job_key = (
+            _canonical_fg_url(selected.frag_url)
+            or _canonical_fg_url(selected.bn_url)
+            or _identity_job_key(selected)
+        )
+        if not job_key:
+            return None
+        return db.requeue_or_enqueue_job(
+            job_key=job_key,
+            query=(req.source_url or None),
+            name=selected.name or None,
+            house=selected.brand or None,
+            year=_coerce_year(selected.year),
+            bn_url=selected.bn_url or None,
+            fg_url=selected.frag_url or None,
+            priority=req.priority,
+        )
+    except Exception:
+        return None
+
+
 @app.post("/api/fragrances/details")
 def details(req: DetailRequest) -> dict[str, Any]:
     """Fetch the full detail bundle for a fragrance returned by /search.
@@ -1847,6 +1901,22 @@ def details(req: DetailRequest) -> dict[str, Any]:
     )
 
 
+@app.post("/api/fragrances/details/requeue")
+def requeue_details(req: RequeueDetailRequest) -> dict[str, Any]:
+    """Force-refresh a detail enrichment job for the same payload as /details."""
+    _require_db()
+    selected = _candidate_from_request(req)
+    if not selected.bn_url and not selected.frag_url and not _identity_job_key(selected):
+        raise HTTPException(
+            status_code=400,
+            detail="Request resolved to no usable source or identity.",
+        )
+    job = _requeue_enrichment_job(selected, req)
+    if not job:
+        raise HTTPException(status_code=500, detail="Could not requeue enrichment job.")
+    return {"queued": True, "job": job}
+
+
 # ---------------------------------------------------------------------------
 # Enrichment pipeline -- public status + protected worker API.
 #
@@ -1864,6 +1934,10 @@ def details(req: DetailRequest) -> dict[str, Any]:
 
 class CompleteJobRequest(BaseModel):
     fg_url: str | None = None
+    name: str | None = None
+    house: str | None = None
+    year: int | str | None = None
+    image_url: str | None = None
     schema_version: int = 1
     captured_at: str | None = None
     source: str | None = None
@@ -1883,6 +1957,10 @@ class FailJobRequest(BaseModel):
 class IgnoreJobRequest(BaseModel):
     note: str | None = None
     reason: str | None = None
+
+
+class RequeueJobRequest(BaseModel):
+    priority: int = 10
 
 
 def _require_db() -> None:
@@ -1910,6 +1988,55 @@ def _require_worker_token(authorization: str | None = Header(default=None)) -> N
     # Constant-time comparison; the token value never appears in logs or errors.
     if not hmac.compare_digest(presented, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing worker token.")
+
+
+def _payload_identity(
+    payload: CompleteJobRequest, job: dict[str, Any], canonical_fg_url: str
+) -> dict[str, Any]:
+    """Prefer the freshly resolved worker identity over the stale job row."""
+    raw_identity = payload.raw_identity if isinstance(payload.raw_identity, dict) else {}
+    name = str(
+        payload.name
+        or raw_identity.get("name")
+        or job.get("name")
+        or ""
+    ).strip()
+    house = str(
+        payload.house
+        or raw_identity.get("house")
+        or raw_identity.get("brand")
+        or job.get("house")
+        or ""
+    ).strip()
+    year = _coerce_year(
+        payload.year
+        if payload.year is not None
+        else raw_identity.get("year", job.get("year"))
+    )
+    image_url = str(
+        payload.image_url
+        or raw_identity.get("image_url")
+        or raw_identity.get("image")
+        or raw_identity.get("thumbnail_url")
+        or raw_identity.get("photo_url")
+        or ""
+    ).strip()
+    if image_url and not image_url.startswith(("http://", "https://")):
+        image_url = ""
+
+    if canonical_fg_url:
+        url_name = engine.FragranticaEngine.name_from_url(canonical_fg_url)
+        url_house = engine.FragranticaEngine.brand_from_url(canonical_fg_url)
+        if not name and url_name:
+            name = url_name
+        elif name and url_name and _cache_name_is_suspect(name, url_name):
+            name = url_name
+        if not house and url_house:
+            house = url_house
+        elif house and url_house and house.lower() == "unknown":
+            house = url_house
+
+    return {"name": name or None, "house": house or None, "year": year, "image_url": image_url or None}
 
 
 @app.get("/api/enrichment/status")
@@ -1943,6 +2070,22 @@ def claim_enrichment_job(job_id: str) -> dict[str, Any]:
     if result.get("reason") == "not_found":
         raise HTTPException(status_code=404, detail="Job not found.")
     return result
+
+
+@app.post(
+    "/api/enrichment/jobs/{job_id}/requeue",
+    dependencies=[Depends(_require_worker_token)],
+)
+def requeue_enrichment_job(
+    job_id: str, payload: RequeueJobRequest | None = None
+) -> dict[str, Any]:
+    """Protected: force a lost/stale job back to pending."""
+    _require_db()
+    priority = payload.priority if payload else 10
+    updated = db.requeue_job(job_id, priority=priority)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"queued": True, "job": updated}
 
 
 @app.post(
@@ -1984,11 +2127,13 @@ def complete_enrichment_job(
             status_code=400, detail=f"Unknown quality_status '{quality}'."
         )
 
+    identity = _payload_identity(payload, job, canonical)
     cache_row = {
         "canonical_fg_url": canonical,
-        "name": job.get("name"),
-        "house": job.get("house"),
-        "year": job.get("year"),
+        "name": identity["name"],
+        "house": identity["house"],
+        "year": identity["year"],
+        "image_url": identity["image_url"],
         "schema_version": payload.schema_version,
         "source": payload.source or "worker",
         "captured_at": payload.captured_at,

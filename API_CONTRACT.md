@@ -167,6 +167,26 @@ Aggregate job counts by status. No job content, no auth.
 
 `enabled` is `false` when `DATABASE_URL` is unset; `counts` is then `{}`.
 
+### `POST /api/fragrances/details/requeue` (public)
+
+Force-refresh the enrichment job for the same payload used by
+`POST /api/fragrances/details`. This is the endpoint a UI refresh button should
+call when enrichment was lost, stale, or produced bad identity/image data. The
+old cache row remains readable until the worker finishes; the next successful
+worker completion overwrites the durable `fg_detail_cache` row with the fresh
+name, house, year, image URL, cards, notes, pros/cons, reviews, and raw
+identity.
+
+```json
+{ "id": "<search result id>", "source_url": "https://www.fragrantica.com/...", "priority": 10 }
+```
+
+Response:
+
+```json
+{ "queued": true, "job": { "id": "...", "status": "pending" } }
+```
+
 ### Worker endpoints (protected — **not for the frontend**)
 
 These require `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. The token is
@@ -178,6 +198,7 @@ or invalid token → `401`. `ENRICHMENT_WORKER_TOKEN` / `DATABASE_URL` unset →
 |----------|---------|
 | `GET /api/enrichment/jobs?status=pending&limit=20` | List jobs, priority-first (`limit` ≤ 100). |
 | `POST /api/enrichment/jobs/{id}/claim` | Claim a pending (or stale-processing) job under a lease. |
+| `POST /api/enrichment/jobs/{id}/requeue` | Force an existing lost/stale job back to `pending`. |
 | `POST /api/enrichment/jobs/{id}/complete` | Upload parsed Fragrantica detail; rejects empty `frag_cards`. |
 | `POST /api/enrichment/jobs/{id}/fail` | Record a failure (`retryable: true` returns the job to `pending`). |
 | `POST /api/enrichment/jobs/{id}/ignore` | Permanently retire a bad job. |
