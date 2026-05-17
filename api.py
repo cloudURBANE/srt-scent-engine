@@ -141,9 +141,10 @@ app.include_router(mobile.router)
 
 def _encode_id(item: engine.UnifiedFragrance) -> str:
     """Pack the fields fetch_selected_details needs into an opaque token."""
+    identity = _recover_candidate_identity(item)
     payload = {
-        "n": item.name,
-        "b": item.brand,
+        "n": identity["name"] or item.name,
+        "b": identity["house"] or item.brand,
         "y": item.year,
         "bn": item.bn_url,
         "fg": item.frag_url,
@@ -168,6 +169,48 @@ def _coerce_year(year: Any) -> int | None:
     return int(text) if text.isdigit() else None
 
 
+def _identity_needs_recovery(value: str) -> bool:
+    text = (value or "").strip()
+    if not text or text.lower() == "unknown":
+        return True
+    checker = getattr(engine, "_identity_looks_real", None)
+    return bool(callable(checker) and not checker(text))
+
+
+def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]:
+    """Recover name/house from canonical source URLs when fields are weak."""
+    name = (item.name or "").strip()
+    house = (item.brand or "").strip()
+
+    if item.frag_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
+        if _identity_needs_recovery(name):
+            url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
+            if url_name:
+                name = url_name
+        if _identity_needs_recovery(house):
+            url_house = engine.FragranticaEngine.brand_from_url(item.frag_url)
+            if url_house:
+                house = url_house
+
+    if item.bn_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
+        bn_candidate = engine.BasenotesEngine._parse_name_metadata(
+            item.bn_url, "", ""
+        )
+        if _identity_needs_recovery(name) and bn_candidate.name:
+            name = bn_candidate.name
+        if _identity_needs_recovery(house) and bn_candidate.brand:
+            house = bn_candidate.brand
+
+    return {"name": name, "house": house}
+
+
+def _candidate_has_display_identity(item: engine.UnifiedFragrance) -> bool:
+    identity = _recover_candidate_identity(item)
+    return not _identity_needs_recovery(identity["name"]) and not _identity_needs_recovery(
+        identity["house"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers (read-only reshaping of engine dataclasses)
 # ---------------------------------------------------------------------------
@@ -188,20 +231,11 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
     fragrance_parser_full_rewrite_fixed.py.
     """
     source_url = item.frag_url or item.bn_url
-    name = (item.name or "").strip()
-    house = (item.brand or "").strip()
-    if (not house or house.lower() == "unknown") and item.frag_url:
-        url_brand = engine.FragranticaEngine.brand_from_url(item.frag_url)
-        if url_brand:
-            house = url_brand
-    if not name and item.frag_url:
-        url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
-        if url_name:
-            name = url_name
+    identity = _recover_candidate_identity(item)
     return {
         "id": _encode_id(item),
-        "name": name,
-        "house": house,
+        "name": identity["name"],
+        "house": identity["house"],
         "year": _coerce_year(item.year),
         "image_url": getattr(item, "image_url", None),
         "gender": "Unisex / Unspecified",  # engine default; resolved at detail
@@ -1174,6 +1208,11 @@ def search(
     if not results:
         results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
 
+    # Final wire-level guard: if a candidate still has no recoverable identity
+    # after URL-based backfills, suppress it instead of surfacing a broken
+    # "House unavailable" row to the client.
+    results = [item for item in results if _candidate_has_display_identity(item)]
+
     diagnostics = _search_diagnostics(results)
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
@@ -1735,38 +1774,44 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
             raise HTTPException(
                 status_code=400, detail=f"Invalid 'id' token: {exc}"
             ) from exc
-        return engine.UnifiedFragrance(
+        selected = engine.UnifiedFragrance(
             name=data.get("n", ""),
             brand=data.get("b", ""),
             year=data.get("y", ""),
             bn_url=data.get("bn", ""),
             frag_url=data.get("fg", ""),
         )
-
-    url = (req.source_url or "").strip()
-    if not url:
-        raise HTTPException(
-            status_code=400,
-            detail="Either 'id' or 'source_url' is required.",
+    else:
+        url = (req.source_url or "").strip()
+        if not url:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'id' or 'source_url' is required.",
+            )
+        lowered = url.lower()
+        bn_url = url if "basenotes" in lowered else ""
+        frag_url = url if "fragrantica" in lowered or not bn_url else ""
+        selected = engine.UnifiedFragrance(
+            name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
         )
-    lowered = url.lower()
-    bn_url = url if "basenotes" in lowered else ""
-    frag_url = url if "fragrantica" in lowered or not bn_url else ""
-    selected = engine.UnifiedFragrance(
-        name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
-    )
-    if frag_url:
-        entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
-        if entry and entry.get("quality_status") == "complete":
-            _fill_selected_identity(selected, entry)
-        elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
-            json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
-            if json_entry:
-                _fill_selected_identity(selected, json_entry)
-        if not selected.name:
-            selected.name = engine.FragranticaEngine.name_from_url(frag_url)
-        if not selected.brand:
-            selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+        if frag_url:
+            entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
+            if entry and entry.get("quality_status") == "complete":
+                _fill_selected_identity(selected, entry)
+            elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
+                json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
+                if json_entry:
+                    _fill_selected_identity(selected, json_entry)
+            if not selected.name:
+                selected.name = engine.FragranticaEngine.name_from_url(frag_url)
+            if not selected.brand:
+                selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+
+    identity = _recover_candidate_identity(selected)
+    if _identity_needs_recovery(selected.name) and identity["name"]:
+        selected.name = identity["name"]
+    if _identity_needs_recovery(selected.brand) and identity["house"]:
+        selected.brand = identity["house"]
     return selected
 
 
