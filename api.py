@@ -45,7 +45,6 @@ from pydantic import BaseModel
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine
-import mobile
 
 # ---------------------------------------------------------------------------
 # Engine handles (built once, reused)
@@ -129,10 +128,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# Mobile router: /m/* HTML, /api/m/* JSON (cookie-authed), plus the
-# /api/enrichment/commands/* channel the desktop worker polls.
-app.include_router(mobile.router)
 
 # ---------------------------------------------------------------------------
 # Opaque id token: stateless encode/decode of an engine candidate.
