@@ -534,6 +534,7 @@ class IdentityTools:
 class QueryRepair:
     _LAST_NATIVE_CANDIDATES: list = []
     MIN_USEFUL_TOP_SCORE = 0.72
+    MIN_RESULT_SCORE = 0.72
     MIN_BN_STRONG_SCORE = 0.72
     MIN_DIRECT_SCORE = 0.74
     MIN_REPAIR_CONFIDENCE = 0.86
@@ -2075,16 +2076,6 @@ class QueryRepair:
             search_plan.insert(3, ("bing", canonical_queries[1]))
 
         search_plan = search_plan[:10]
-
-        for search_query in canonical_queries:
-            search_plan.append(("google", search_query))
-
-        search_plan.insert(3, ("bing", canonical_queries[0]))
-
-        if len(canonical_queries) > 3:
-            search_plan.insert(4, ("bing", canonical_queries[3]))
-
-        search_plan = search_plan[:10]
         
         for engine, search_query in search_plan:
             if deadline.expired():
@@ -2147,6 +2138,19 @@ class QueryRepair:
             return QueryRepair.normalized_query(anchor)
 
         return ""
+
+def filter_relevant_candidates(
+    query: str,
+    candidates: list[UnifiedFragrance],
+    minimum: float = QueryRepair.MIN_RESULT_SCORE,
+) -> list[UnifiedFragrance]:
+    """Score candidates and drop provider default/popular rows."""
+    relevant: list[UnifiedFragrance] = []
+    for item in candidates:
+        item.query_score = IdentityTools.relevance_score(query, item)
+        if item.query_score >= minimum:
+            relevant.append(item)
+    return relevant
 
 class Http:
     DEFAULT_HEADERS = {
@@ -6217,9 +6221,10 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     frag_results = initial.get("fg") or []
     timer.mark("initial_fg_bn_fetch")
     print(f"{D}[SYS] First-pass resolver: {len(bn_results)} + {len(frag_results)} candidate links.{Z}")
-    candidates = Orchestrator.match_and_merge(bn_results, frag_results)[: args.max_results]
-    for item in candidates:
-        item.query_score = IdentityTools.relevance_score(query, item)
+    candidates = filter_relevant_candidates(
+        query,
+        Orchestrator.match_and_merge(bn_results, frag_results),
+    )[: args.max_results]
     candidates.sort(key=lambda item: (item.query_score, bool(item.frag_url), item.resolver_score), reverse=True)
     timer.mark("build_candidates")
     if allow_repair and QueryRepair.needs_repair(bn_results, candidates):
@@ -6293,8 +6298,7 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
         timer.mark("bn_metrics")
     else:
         timer.mark("bn_metrics", skipped=True)
-    for item in candidates:
-        item.query_score = IdentityTools.relevance_score(query, item)
+    candidates = filter_relevant_candidates(query, candidates)
     candidates.sort(key=lambda item: (item.query_score, bool(item.frag_url), item.resolver_score, item.bn_vote_count), reverse=True)
     SearchSniper.cache_successes(candidates, cache)
     trace.add_skip("browser_catalog", "disabled")

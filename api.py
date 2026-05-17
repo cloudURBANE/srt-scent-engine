@@ -92,7 +92,7 @@ _ALLOW_BUNDLED_FG_DETAIL_CACHE = _env_flag(
 _ALLOW_BUNDLED_FG_SEARCH_CACHE = _env_flag(
     "ALLOW_BUNDLED_FG_SEARCH_CACHE", default=not db.ENABLED
 )
-_CACHE_SEARCH_MIN_SCORE = 0.60
+_CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
 
 # Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
 # `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
