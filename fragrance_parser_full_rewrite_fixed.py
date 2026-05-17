@@ -1,12 +1,4 @@
-#!/usr/bin/env python3
-"""
-fragrance_parser_v35_fast_surgical.py
-Fast dual-source fragrance parser with guarded autocomplete repair, strict identity
-hard gates, visual-bar metric extraction, and semantic pyramid note extraction.
-"""
-from __future__ import annotations
-import argparse
-import html
+
 from __future__ import annotations
 import argparse
 import html
@@ -311,6 +303,59 @@ class TextSanitizer:
         value = re.sub(r"[-_]+", " ", value)
         value = cls.SPACE.sub(" ", value).strip()
         return value.title()
+
+# Identity sanity: reject parser captures that are obviously page UI debris
+# (pure digits, year-only, vote counters, gender chips) instead of a real
+# name/brand. The Fragrantica search markup periodically shifts the year or
+# vote count into the <h3> our card parser reads first, and Basenotes can
+# return numeric-only slug fragments. Without this guard those leak through
+# as `name: "2017"` or `house: "342"` candidates. Centralised here so both
+# parsers and the cache reader use the same definition of "looks real".
+_IDENTITY_BAD_TOKENS = frozenset({
+    "unknown", "n a", "na", "none", "null", "tbd",
+    "votes", "vote", "review", "reviews", "rating", "ratings",
+    "male", "female", "unisex", "men", "women",
+    "perfume", "fragrance", "fragrances",
+})
+_IDENTITY_YEAR_RE = re.compile(r"^(?:17|18|19|20)\d{2}$")
+_IDENTITY_LONG_DIGIT_RE = re.compile(r"^\d{4,}$")
+
+
+def _identity_looks_real(text: str) -> bool:
+    """True when a markup-captured string plausibly represents a real identity.
+
+    Used to validate fields read out of card HTML *before* trusting them over
+    the canonical URL slug. The URL slug is always trusted as a fallback by
+    the caller, so this function is intentionally strict -- we would rather
+    fall back to a slightly-uglier URL-derived name ("L Air" instead of
+    "L'Air") than surface "342 votes" as a brand.
+
+    Rejects:
+      * empty / single-character strings
+      * pure year (1700-2099)
+      * pure long digit strings (4+ digits) -- vote counters, fragrance IDs
+      * exact sentinel strings ("Unknown", "votes", ...)
+      * any string containing a sentinel token ("342 votes", "1999 vote")
+
+    Allows short pure-digit names like "212" / "112" / "4711" only when they
+    are not year-shaped, because those are real perfume names (Carolina
+    Herrera 212, 4711 cologne).
+    """
+    cleaned = TextSanitizer.clean(text)
+    if not cleaned or len(cleaned) < 2:
+        return False
+    lowered = cleaned.lower()
+    if _IDENTITY_YEAR_RE.match(cleaned):
+        return False
+    if _IDENTITY_LONG_DIGIT_RE.match(cleaned):
+        return False
+    if lowered in _IDENTITY_BAD_TOKENS:
+        return False
+    tokens = lowered.split()
+    if any(tok in _IDENTITY_BAD_TOKENS for tok in tokens):
+        return False
+    return True
+
 
 class IdentityTools:
     STOPWORDS = {
@@ -3332,7 +3377,13 @@ class BasenotesEngine:
         slug = re.sub(r"\.\d+$", "", slug)
         raw_name = TextSanitizer.title_from_slug(slug)
         name = raw_name
-        brand = "Unknown"
+        # Empty default (not "Unknown"): the upstream gate at extract_search_data
+        # is `if candidate.name and candidate.brand`, so an empty brand drops the
+        # row cleanly. Previously we used the literal sentinel "Unknown", which
+        # passed the truthy check and surfaced anonymous candidates as
+        # `house: "Unknown"`. The merge step still recovers a real brand from a
+        # Fragrantica match when one exists -- see Orchestrator.match_and_merge.
+        brand = ""
         year = ""
         combined = f"{title_text} | {context}"
         year_match = BasenotesEngine._YEAR_PATTERN.search(combined)
@@ -3340,7 +3391,7 @@ class BasenotesEngine:
             year_match = BasenotesEngine._YEAR_FALLBACK.search(title_text)
         if year_match:
             year = year_match.group(1)
-            
+
         if " By " in raw_name:
             left, right = raw_name.split(" By ", 1)
             name = left.strip()
@@ -3353,12 +3404,20 @@ class BasenotesEngine:
                 brand = parts[1].split("|")[0].strip()
                 name = BasenotesEngine._CLEAN_CHARS.sub("", name)
                 brand = BasenotesEngine._CLEAN_CHARS.sub("", brand)
-                
+
         if year:
             name = re.sub(rf"\b{re.escape(year)}\b", "", name)
             brand = re.sub(rf"\b{re.escape(year)}\b", "", brand)
         name = TextSanitizer.clean(re.sub(r"\(\s*\)", "", name))
         brand = TextSanitizer.clean(re.sub(r"\(\s*\)", "", brand))
+        # Sanity gate: if the slug parser produced a pure-number "name" (e.g.
+        # the URL was /fragrances/12345 with no descriptive slug), zero it so
+        # the extract_search_data gate drops the row. Otherwise we would emit
+        # `name: "12345"` candidates that look broken to the frontend.
+        if not _identity_looks_real(name):
+            name = ""
+        if brand and not _identity_looks_real(brand):
+            brand = ""
         return UnifiedFragrance(name=name, brand=brand, year=year, bn_url=url)
         
     @staticmethod
@@ -4010,6 +4069,21 @@ class FragranticaEngine:
         name = TextSanitizer.clean(name)
         brand = TextSanitizer.clean(brand)
         year = TextSanitizer.clean(year)
+        # Markup-drift guard: Fragrantica occasionally rearranges the search
+        # card so the <h3> we read first holds a year, vote count, or other UI
+        # debris instead of the perfume name. The same can happen for the brand
+        # sibling. When the captured identity fails the sanity check, fall back
+        # to the URL slug -- the URL is always derived from the canonical
+        # /perfume/<brand>/<name>-<id>.html path and is therefore the source
+        # of truth for what fragrance the page is. URL-derived fallbacks are
+        # trusted as long as they are non-empty (do NOT re-run the strict
+        # validator on them, or short legitimate names like "212" would be
+        # dropped). Only when both markup AND URL fail to yield a usable
+        # string do we drop the card.
+        if not _identity_looks_real(name):
+            name = TextSanitizer.clean(FragranticaEngine.name_from_url(frag_url)) or name
+        if not _identity_looks_real(brand):
+            brand = TextSanitizer.clean(FragranticaEngine.brand_from_url(frag_url)) or brand
         if not name or not brand:
             return None
         return UnifiedFragrance(name=name, brand=brand, year=year, frag_url=frag_url)
@@ -5898,7 +5972,14 @@ class Orchestrator:
                 bn.resolver_score = best_score
                 if not bn.year and match.year:
                     bn.year = match.year
-                if bn.brand.lower() == "unknown" and match.brand:
+                # Backfill brand from the Fragrantica match whenever the
+                # Basenotes side is missing or sentinel ("unknown" was the old
+                # default; "" is the new default after the BN parser stopped
+                # surfacing anonymous-brand rows). Names are left to BN since
+                # BN's slug/title parser preserves modifiers ("Allure Homme"
+                # vs "Allure") more reliably than FG's card markup.
+                bn_brand_clean = (bn.brand or "").strip().lower()
+                if (not bn_brand_clean or bn_brand_clean == "unknown") and match.brand:
                     bn.brand = match.brand
                 used_frag.add(best_index)
             merged.append(bn)

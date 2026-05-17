@@ -45,6 +45,7 @@ from pydantic import BaseModel
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine
+import mobile
 
 # ---------------------------------------------------------------------------
 # Engine handles (built once, reused)
@@ -129,6 +130,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mobile router: /m/* HTML, /api/m/* JSON (cookie-authed), plus the
+# /api/enrichment/commands/* channel the desktop worker polls.
+app.include_router(mobile.router)
+
 # ---------------------------------------------------------------------------
 # Opaque id token: stateless encode/decode of an engine candidate.
 # ---------------------------------------------------------------------------
@@ -174,12 +179,29 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
     `gender` is not known at search time -- the engine only resolves it during
     the detail fetch -- so the engine's own default placeholder is surfaced
     here. It is not fabricated; the real value arrives in the detail response.
+
+    Final identity guard: if anything upstream emitted an empty or sentinel
+    brand ("Unknown") despite the parser and cache fixes, recover it from
+    the source URL slug before serialising. Same for the name. This is the
+    last line of defence against `house: ""` or `name: "342"` ever reaching
+    the wire; cheap belt-and-braces over the parser-level rejections in
+    fragrance_parser_full_rewrite_fixed.py.
     """
     source_url = item.frag_url or item.bn_url
+    name = (item.name or "").strip()
+    house = (item.brand or "").strip()
+    if (not house or house.lower() == "unknown") and item.frag_url:
+        url_brand = engine.FragranticaEngine.brand_from_url(item.frag_url)
+        if url_brand:
+            house = url_brand
+    if not name and item.frag_url:
+        url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
+        if url_name:
+            name = url_name
     return {
         "id": _encode_id(item),
-        "name": item.name,
-        "house": item.brand,
+        "name": name,
+        "house": house,
         "year": _coerce_year(item.year),
         "gender": "Unisex / Unspecified",  # engine default; resolved at detail
         "source_url": source_url,
@@ -356,7 +378,17 @@ def _source_coverage(
 
 
 def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, str]:
-    """Best-effort identity from a DB/JSON cache entry or Fragrantica URL."""
+    """Best-effort identity from a DB/JSON cache entry or Fragrantica URL.
+
+    Older cache rows were written when the FG search-card parser sometimes
+    captured a truncated or wrong name (e.g. stored "Gabrielle" for the URL
+    `Gabrielle-Essence-56076.html`, or "Allure Homme" for an Allure EDP URL).
+    The URL slug is the canonical Fragrantica identity and is always correct
+    by construction. When the stored name disagrees materially with the URL
+    slug -- shorter and not a prefix-aligned subset -- we trust the URL and
+    overwrite the stored value at read time. Writes are left alone; the
+    enrichment pipeline is responsible for healing the row durably.
+    """
     raw_identity = entry.get("raw_identity") or {}
     if not isinstance(raw_identity, dict):
         raw_identity = {}
@@ -369,11 +401,55 @@ def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, 
     house = str(entry.get("house") or raw_identity.get("house") or "").strip()
     year = str(entry.get("year") or raw_identity.get("year") or "").strip()
     if url:
-        if not name:
-            name = engine.FragranticaEngine.name_from_url(url)
-        if not house:
-            house = engine.FragranticaEngine.brand_from_url(url)
+        url_name = engine.FragranticaEngine.name_from_url(url)
+        url_house = engine.FragranticaEngine.brand_from_url(url)
+        if not name and url_name:
+            name = url_name
+        elif name and url_name and _cache_name_is_suspect(name, url_name):
+            name = url_name
+        if not house and url_house:
+            house = url_house
+        elif house and url_house and house.strip().lower() == "unknown":
+            house = url_house
     return {"name": name, "house": house, "year": year}
+
+
+def _cache_name_is_suspect(stored: str, url_derived: str) -> bool:
+    """True when the stored cache name should be overridden by the URL slug.
+
+    The Fragrantica URL slug is the canonical, page-identity name; cache rows
+    were written at search time from a card parser that occasionally captured
+    a truncated or wrong title. Two failure shapes have to be caught:
+
+      * Truncated qualifier: URL "Gabrielle-Essence" but stored "Gabrielle"
+        -- same brand, different product (Chanel ships both). The stored name
+        is a strict token-prefix of the URL slug, but the URL is more
+        specific, so prefer the URL.
+      * Wrong product entirely: URL "Allure-Eau-de-Parfum" but stored
+        "Allure Homme" -- the URL is authoritative for what the page is.
+
+    The unifying rule: when the URL slug has more tokens than the stored
+    name, the URL is the more specific (and therefore safer) identity. If the
+    stored name already has at least as many tokens, leave it alone -- it may
+    carry nicer formatting (apostrophes, accents) the slug loses.
+    """
+    stored_clean = stored.strip().lower()
+    url_clean = url_derived.strip().lower()
+    if not stored_clean or not url_clean:
+        return False
+    if stored_clean == url_clean:
+        return False
+    # Normalize both sides identically so apostrophe/hyphen-only formatting
+    # differences (e.g. "L'Air du Temps" vs URL slug "L Air Du Temps") do
+    # not trigger an override -- they are the same identity, just different
+    # punctuation, and stored carries the prettier formatting we want to keep.
+    def _tokenize(value: str) -> list[str]:
+        return [tok for tok in re.split(r"[^a-z0-9]+", value) if tok]
+    stored_tokens = _tokenize(stored_clean)
+    url_tokens = _tokenize(url_clean)
+    if stored_tokens == url_tokens:
+        return False
+    return len(url_tokens) > len(stored_tokens)
 
 
 def _fill_selected_identity(
