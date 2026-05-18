@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 # psycopg / psycopg_pool are only imported when DATABASE_URL is present, so the
@@ -223,26 +223,28 @@ def enqueue_job(
         return
     ctx, conn = _conn()
     try:
-        conn.execute(
-            """
-            INSERT INTO enrichment_jobs
-                (id, job_key, query, name, house, year, bn_url, fg_url,
-                 status, requested_count, created_at, last_requested_at)
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s,
-                 'pending', 1, now(), now())
-            ON CONFLICT (job_key) DO UPDATE SET
-                requested_count   = enrichment_jobs.requested_count + 1,
-                last_requested_at = now(),
-                query             = COALESCE(EXCLUDED.query, enrichment_jobs.query),
-                name              = COALESCE(EXCLUDED.name, enrichment_jobs.name),
-                house             = COALESCE(EXCLUDED.house, enrichment_jobs.house),
-                year              = COALESCE(EXCLUDED.year, enrichment_jobs.year),
-                bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url)
-            WHERE enrichment_jobs.status <> 'ignored'
-            """,
-            (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url),
-        )
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO enrichment_jobs
+                    (id, job_key, query, name, house, year, bn_url, fg_url,
+                     status, requested_count, created_at, last_requested_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s,
+                     'pending', 1, now(), now())
+                ON CONFLICT (job_key) DO UPDATE SET
+                    requested_count   = enrichment_jobs.requested_count + 1,
+                    last_requested_at = now(),
+                    query             = COALESCE(EXCLUDED.query, enrichment_jobs.query),
+                    name              = COALESCE(EXCLUDED.name, enrichment_jobs.name),
+                    house             = COALESCE(EXCLUDED.house, enrichment_jobs.house),
+                    year              = COALESCE(EXCLUDED.year, enrichment_jobs.year),
+                    bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url),
+                    fg_url            = COALESCE(EXCLUDED.fg_url, enrichment_jobs.fg_url)
+                WHERE enrichment_jobs.status <> 'ignored'
+                """,
+                (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url),
+            )
     finally:
         ctx.__exit__(None, None, None)
 
@@ -394,34 +396,53 @@ def claim_job(job_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> dict[s
     Claimable when status is 'pending', or 'processing' with an expired lease
     (the previous claimant died). Returns {"claimed": bool, ...}.
     """
-    expires = _now() + timedelta(seconds=lease_seconds)
+    lease_seconds = max(1, int(lease_seconds or DEFAULT_LEASE_SECONDS))
     ctx, conn = _conn()
     try:
-        row = conn.execute(
-            """
-            UPDATE enrichment_jobs
-            SET status = 'processing', claimed_at = now(), claim_expires_at = %s
-            WHERE id = %s
-              AND (status = 'pending'
-                   OR (status = 'processing' AND claim_expires_at < now()))
-            RETURNING claim_expires_at
-            """,
-            (expires, job_id),
-        ).fetchone()
-        if row:
+        with conn.transaction():
+            existing = conn.execute(
+                """
+                SELECT status, claim_expires_at, now() AS db_now
+                FROM enrichment_jobs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (job_id,),
+            ).fetchone()
+            if not existing:
+                return {"claimed": False, "reason": "not_found"}
+
+            status = existing["status"]
+            claim_expires_at = existing["claim_expires_at"]
+            db_now = existing["db_now"]
+            lease_expired = (
+                status == "processing"
+                and (claim_expires_at is None or claim_expires_at <= db_now)
+            )
+            if status != "pending" and not lease_expired:
+                reason = (
+                    "already_processing"
+                    if status == "processing"
+                    else f"status_{status}"
+                )
+                return {
+                    "claimed": False,
+                    "reason": reason,
+                    "claim_expires_at": _iso(claim_expires_at),
+                }
+
+            row = conn.execute(
+                """
+                UPDATE enrichment_jobs
+                SET status = 'processing',
+                    claimed_at = now(),
+                    claim_expires_at = now() + (%s || ' seconds')::interval
+                WHERE id = %s
+                RETURNING claim_expires_at
+                """,
+                (str(lease_seconds), job_id),
+            ).fetchone()
             return {"claimed": True, "claim_expires_at": _iso(row["claim_expires_at"])}
-        # Not claimable -- report why.
-        existing = conn.execute(
-            "SELECT status FROM enrichment_jobs WHERE id = %s", (job_id,)
-        ).fetchone()
-        if not existing:
-            return {"claimed": False, "reason": "not_found"}
-        reason = (
-            "already_processing"
-            if existing["status"] == "processing"
-            else f"status_{existing['status']}"
-        )
-        return {"claimed": False, "reason": reason}
     finally:
         ctx.__exit__(None, None, None)
 
@@ -824,17 +845,32 @@ def consume_magic_link(token_hash: str) -> dict[str, Any] | None:
     """Atomically consume a fresh, unexpired link. Returns the row or None."""
     ctx, conn = _conn()
     try:
-        row = conn.execute(
-            """
-            UPDATE magic_links
-            SET consumed_at = now()
-            WHERE token_hash = %s
-              AND consumed_at IS NULL
-              AND expires_at > now()
-            RETURNING *
-            """,
-            (token_hash,),
-        ).fetchone()
+        with conn.transaction():
+            link = conn.execute(
+                """
+                SELECT id
+                FROM magic_links
+                WHERE token_hash = %s
+                  AND consumed_at IS NULL
+                  AND expires_at > now()
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (token_hash,),
+            ).fetchone()
+            if not link:
+                return None
+            row = conn.execute(
+                """
+                UPDATE magic_links
+                SET consumed_at = now()
+                WHERE id = %s
+                  AND consumed_at IS NULL
+                RETURNING *
+                """,
+                (link["id"],),
+            ).fetchone()
         if not row:
             return None
         return {
