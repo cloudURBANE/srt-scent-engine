@@ -1368,6 +1368,387 @@ def engine_search_diagnostics(
     }
 
 
+def _bn_diag_error(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _bn_diag_elapsed_ms(started: float) -> int:
+    import time as _time
+
+    return int((_time.monotonic() - started) * 1000)
+
+
+def _bn_diag_response_length(res: Any) -> int | None:
+    content = getattr(res, "content", None)
+    if content is not None:
+        try:
+            return len(content)
+        except Exception:
+            pass
+    text = getattr(res, "text", None)
+    if text is not None:
+        try:
+            return len(text)
+        except Exception:
+            pass
+    return None
+
+
+def _bn_diag_response_text(res: Any) -> str:
+    text = getattr(res, "text", None)
+    if isinstance(text, str):
+        return text
+    content = getattr(res, "content", None)
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return ""
+
+
+def _bn_diag_headers(res: Any) -> Any:
+    headers = getattr(res, "headers", {}) or {}
+    return headers
+
+
+def _bn_diag_cf_ray_present(headers: Any) -> bool:
+    try:
+        return "cf-ray" in {str(key).lower() for key in headers}
+    except Exception:
+        return False
+
+
+def _bn_diag_package_version(distribution: str, module_obj: Any) -> str | None:
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            module_version = getattr(module_obj, "__version__", None)
+            return str(module_version) if module_version is not None else None
+    except Exception:
+        module_version = getattr(module_obj, "__version__", None)
+        return str(module_version) if module_version is not None else None
+
+
+def _bn_diag_imports() -> dict[str, dict[str, Any]]:
+    cloud_module = getattr(engine, "cloudscraper", None)
+    curl_module = getattr(engine, "curl_requests", None)
+    drission_available = (
+        getattr(engine, "ChromiumOptions", None) is not None
+        and getattr(engine, "ChromiumPage", None) is not None
+    )
+    drission_module = None
+    if drission_available:
+        try:
+            drission_module = __import__("DrissionPage")
+        except Exception:
+            drission_module = None
+
+    return {
+        "cloudscraper": {
+            "available": cloud_module is not None,
+            "version": _bn_diag_package_version("cloudscraper", cloud_module),
+        },
+        "curl_cffi": {
+            "available": curl_module is not None,
+            "version": _bn_diag_package_version("curl_cffi", curl_module),
+        },
+        "DrissionPage": {
+            "available": drission_available,
+            "version": _bn_diag_package_version("DrissionPage", drission_module),
+        },
+    }
+
+
+def _bn_diag_default_scraper() -> Any:
+    if getattr(engine, "cloudscraper", None) is not None:
+        return engine.cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
+        )
+    return engine.requests.Session()
+
+
+def _bn_diag_chromium_binary() -> dict[str, Any]:
+    import shutil
+
+    names = [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+    ]
+    found = None
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            break
+    return {"which": found, "tried": names}
+
+
+def _bn_diag_clearance_cache() -> dict[str, Any]:
+    cache_file = getattr(engine, "_BASENOTES_CACHE_FILE", None)
+    configured_path = str(cache_file) if cache_file is not None else ""
+    exists = False
+    size_bytes: int | None = None
+    try:
+        exists = bool(cache_file is not None and cache_file.exists())
+        size_bytes = int(cache_file.stat().st_size) if exists else None
+    except Exception:
+        exists = False
+        size_bytes = None
+
+    cached = None
+    try:
+        cached = engine._load_basenotes_cache()
+    except Exception:
+        cached = None
+
+    user_agent_present = False
+    cookie_count: int | None = None
+    if cached:
+        user_agent, cookies = cached
+        user_agent_present = bool(str(user_agent or "").strip())
+        cookie_count = len(cookies) if isinstance(cookies, dict) else None
+
+    return {
+        "configured_path": configured_path,
+        "env_override": os.environ.get("BASENOTES_CLEARANCE_CACHE") or None,
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "user_agent_present": user_agent_present,
+        "cookie_count": cookie_count,
+    }
+
+
+def _bn_diag_session_state() -> dict[str, Any]:
+    import time as _time
+
+    session = getattr(engine, "_BASENOTES_SESSION", None)
+    if session is None:
+        return {
+            "active": False,
+            "validated_now": None,
+            "validation_elapsed_ms": None,
+        }
+
+    started = _time.monotonic()
+    try:
+        validated = bool(engine._validate_basenotes_session(session))
+    except Exception:
+        validated = False
+    return {
+        "active": True,
+        "validated_now": validated,
+        "validation_elapsed_ms": _bn_diag_elapsed_ms(started),
+    }
+
+
+def _bn_diag_search_url(query: str) -> str:
+    from urllib.parse import quote
+
+    return (
+        "https://basenotes.com/directory/?sort=pop-desc&search="
+        f"{quote(query)}&type=fragrances&page=1"
+    )
+
+
+def _bn_diag_direct_probe() -> dict[str, Any]:
+    import time as _time
+
+    url = "https://basenotes.com/"
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "response_server_header": None,
+        "cf_ray_present": False,
+        "elapsed_ms": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        res = _bn_diag_default_scraper().get(url, timeout=10)
+        headers = _bn_diag_headers(res)
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "response_server_header": headers.get("Server"),
+                "cf_ray_present": _bn_diag_cf_ray_present(headers),
+                "elapsed_ms": _bn_diag_elapsed_ms(started),
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _bn_diag_search_probe(query: str) -> dict[str, Any]:
+    import time as _time
+
+    url = _bn_diag_search_url(query)
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "elapsed_ms": None,
+        "fragrance_anchor_count": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        deadline = engine.Deadline(10)
+        res = engine.BasenotesEngine._get_with_retries(
+            scraper,
+            url,
+            timeout=10,
+            attempts=1,
+            deadline=deadline,
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        if res is None:
+            return result
+
+        body = _bn_diag_response_text(res)
+        try:
+            soup = engine.BeautifulSoup(body, "html.parser")
+            anchor_count = sum(
+                1
+                for anchor in soup.find_all("a", href=True)
+                if "/fragrances/" in str(anchor.get("href", ""))
+            )
+        except Exception:
+            anchor_count = None
+
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "fragrance_anchor_count": anchor_count,
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
+    import concurrent.futures
+    import time as _time
+
+    result: dict[str, Any] = {
+        "ran": bool(mint),
+        "success": None,
+        "elapsed_ms": None,
+        "error": None,
+        "session_validated_after_mint": None,
+    }
+    if not mint:
+        return result
+
+    started = _time.monotonic()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(engine._mint_basenotes_clearance)
+    try:
+        session = future.result(timeout=30)
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = session is not None
+        if session is not None:
+            try:
+                result["session_validated_after_mint"] = bool(
+                    engine._validate_basenotes_session(session)
+                )
+            except Exception:
+                result["session_validated_after_mint"] = False
+    except concurrent.futures.TimeoutError:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = "TimeoutError: mint attempt exceeded 30 seconds"
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = _bn_diag_error(exc)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
+def _bn_diag_engine_search(query: str) -> dict[str, Any]:
+    import time as _time
+
+    result: dict[str, Any] = {
+        "row_count": 0,
+        "elapsed_ms": 0,
+        "sample_rows": [],
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        rows = engine.BasenotesEngine.extract_search_data(
+            scraper,
+            query,
+            deadline=engine.Deadline(10),
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["row_count"] = len(rows)
+        result["sample_rows"] = [
+            {
+                "name": getattr(row, "name", ""),
+                "brand": getattr(row, "brand", ""),
+                "bn_url": getattr(row, "frag_url", None)
+                or getattr(row, "bn_url", None),
+            }
+            for row in rows[:3]
+        ]
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Basenotes diagnostics (TEMPORARY -- remove after Basenotes/Railway clearance
+# gap is resolved).
+#
+# /api/diagnostics/engine-search showed candidates reaching the resolver but
+# being rejected by score, while Basenotes may be returning zero native links on
+# Railway. This endpoint isolates import availability, Chromium discovery,
+# clearance-cache state, current session validity, raw Basenotes reachability,
+# the BN-aware search fetch path, optional clearance minting, and the actual
+# BasenotesEngine.extract_search_data result for one query. It is additive and
+# diagnostic-only; delete this block once the Railway clearance gap is resolved.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/diagnostics/basenotes")
+def basenotes_diagnostics(
+    q: str = Query("xerjoff", min_length=1),
+    mint: bool = Query(False),
+) -> dict[str, Any]:
+    query = q.strip()
+
+    return {
+        "query": query,
+        "imports": _bn_diag_imports(),
+        "chromium_binary": _bn_diag_chromium_binary(),
+        "clearance_cache": _bn_diag_clearance_cache(),
+        "session_state": _bn_diag_session_state(),
+        "direct_probe": _bn_diag_direct_probe(),
+        "search_probe": _bn_diag_search_probe(query),
+        "mint_attempt": _bn_diag_mint_attempt(mint),
+        "engine_search_for_q": _bn_diag_engine_search(query),
+    }
+
+
 def _jsonable(value: Any) -> Any:
     """Best-effort coerce an argparse value into something JSON can carry."""
     if isinstance(value, (str, int, float, bool)) or value is None:
