@@ -1134,9 +1134,12 @@ def _run_auto_approve(
     _log_event(f"auto: processing {target}", "info")
     # process_job() prints progress to stdout; swallow it so the dashboard
     # frame stays intact and only our LIVE_STREAM lines surface to the user.
+    # It also catches its own scraping errors and returns False rather than
+    # re-raising, so we MUST inspect the return value — otherwise a row that
+    # silently fails-and-requeues looks identical to a success here.
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            process_job(
+            ok = process_job(
                 client,
                 auto_state["scraper"],
                 auto_state["args"],
@@ -1151,7 +1154,10 @@ def _run_auto_approve(
     except WorkerError as exc:
         _log_event(f"auto: failed ({exc.code})", "err")
         return
-    _log_event(f"auto: completed {target}", "ok")
+    if ok:
+        _log_event(f"auto: completed {target}", "ok")
+    else:
+        _log_event(f"auto: failed {target}", "err")
 
 
 def _execute_phone_command(

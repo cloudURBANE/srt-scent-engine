@@ -47,6 +47,11 @@ DEFAULT_JOB_LIMIT = 20
 MAX_JOB_LIMIT = 100
 # Lease window for a claimed job; a processing job past this is reclaimable.
 DEFAULT_LEASE_SECONDS = 15 * 60
+# Hard cap on retryable failures before a job is forcibly demoted to 'failed'.
+# Without this, a row that hits the same parser error every tick (e.g. a stale
+# Fragrantica URL returning 403) loops forever and starves the rest of the
+# pending queue. fail_job() consults this whenever retryable=True.
+MAX_RETRYABLE_FAILURES = 10
 
 VALID_JOB_STATUSES = ("pending", "processing", "completed", "failed", "ignored")
 VALID_QUALITY_STATUSES = ("complete", "partial", "bad_parse", "stale")
@@ -495,22 +500,34 @@ def complete_job(job_id: str, cache_row: dict[str, Any]) -> dict[str, Any] | Non
 
 
 def fail_job(job_id: str, error: str, retryable: bool) -> dict[str, Any] | None:
-    """Record a failure. Retryable -> back to 'pending'; otherwise -> 'failed'."""
-    new_status = "pending" if retryable else "failed"
+    """Record a failure. Retryable -> back to 'pending' (until the retry cap is
+    hit, at which point we force 'failed'); non-retryable -> 'failed' immediately.
+
+    The status decision is made inside the UPDATE via a CASE expression so the
+    threshold is evaluated atomically against the row's current failure_count
+    (no read-then-write race with a concurrent worker). last_requested_at is
+    refreshed so a chronically failing row rotates to the back of the pending
+    queue instead of permanently occupying the head — see
+    idx_enrichment_jobs_status which orders by (priority DESC, last_requested_at).
+    """
     ctx, conn = _conn()
     try:
         row = conn.execute(
             """
             UPDATE enrichment_jobs
-            SET status = %s,
+            SET status = CASE
+                    WHEN %s AND failure_count + 1 < %s THEN 'pending'
+                    ELSE 'failed'
+                END,
                 failure_count = failure_count + 1,
                 last_error = %s,
                 failed_at = now(),
+                last_requested_at = now(),
                 claim_expires_at = NULL
             WHERE id = %s
             RETURNING *
             """,
-            (new_status, error, job_id),
+            (retryable, MAX_RETRYABLE_FAILURES, error, job_id),
         ).fetchone()
         return _job_to_dict(row) if row else None
     finally:
