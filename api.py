@@ -1553,6 +1553,168 @@ def _bn_diag_chromium_binary() -> dict[str, Any]:
     }
 
 
+def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
+    """Spawn chromium with --remote-debugging-port=N directly and probe CDP.
+
+    Bypasses DrissionPage entirely so we can tell whether the WS 404 we get from
+    /api/diagnostics/basenotes?mint=1 is a DrissionPage URL-construction bug or
+    a chromium-side problem (port closed, /json/version returns garbage, WS
+    upgrade actually 404s, etc.). Delete this block once the clearance gap is
+    resolved.
+    """
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+    import time
+
+    import requests  # transitive dep via engine
+
+    result: dict[str, Any] = {
+        "ran": False,
+        "binary": None,
+        "port": None,
+        "spawn_pid": None,
+        "spawn_exit_code": None,
+        "port_open_after_wait": None,
+        "wait_elapsed_ms": None,
+        "json_version_status": None,
+        "json_version_body_first_500": None,
+        "json_list_status": None,
+        "json_list_body_first_500": None,
+        "ws_url_attempted": None,
+        "ws_upgrade_ok": None,
+        "ws_upgrade_error": None,
+        "stderr_tail": None,
+    }
+
+    binary = (
+        os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+    )
+    result["binary"] = binary
+    if not binary:
+        return result
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    finally:
+        sock.close()
+    result["port"] = port
+
+    user_data_dir = tempfile.mkdtemp(prefix="bn-rawcdp-")
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        result["ran"] = True
+        proc = subprocess.Popen(
+            [
+                binary,
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--mute-audio",
+                f"--user-data-dir={user_data_dir}",
+                f"--remote-debugging-port={port}",
+                "--remote-allow-origins=*",
+                "about:blank",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        result["spawn_pid"] = proc.pid
+
+        start = time.time()
+        port_open = False
+        deadline = start + 10.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    port_open = True
+                    break
+            except OSError:
+                time.sleep(0.2)
+        result["port_open_after_wait"] = port_open
+        result["wait_elapsed_ms"] = int((time.time() - start) * 1000)
+
+        if port_open:
+            import json as _json
+            try:
+                r = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=5)
+                result["json_version_status"] = r.status_code
+                result["json_version_body_first_500"] = r.text[:500]
+                ws_url = None
+                try:
+                    payload = r.json()
+                    ws_url = payload.get("webSocketDebuggerUrl")
+                except Exception:
+                    ws_url = None
+            except Exception as exc:
+                result["json_version_status"] = f"ERR: {type(exc).__name__}: {exc}"
+                ws_url = None
+
+            try:
+                r2 = requests.get(f"http://127.0.0.1:{port}/json", timeout=5)
+                result["json_list_status"] = r2.status_code
+                result["json_list_body_first_500"] = r2.text[:500]
+                if not ws_url:
+                    try:
+                        lst = r2.json()
+                        if isinstance(lst, list) and lst:
+                            ws_url = lst[0].get("webSocketDebuggerUrl")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                result["json_list_status"] = f"ERR: {type(exc).__name__}: {exc}"
+
+            if ws_url:
+                result["ws_url_attempted"] = ws_url
+                try:
+                    import websocket  # type: ignore[import-not-found]
+                    ws = websocket.create_connection(ws_url, timeout=5)
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_upgrade_ok"] = True
+                    result["ws_upgrade_error"] = None
+                    result["ws_first_reply_first_500"] = str(reply)[:500]
+                except Exception as exc:
+                    result["ws_upgrade_ok"] = False
+                    result["ws_upgrade_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        result["spawn_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
+            result["spawn_exit_code"] = proc.returncode
+            try:
+                err = proc.stderr.read() if proc.stderr else b""
+                result["stderr_tail"] = err.decode("utf-8", errors="replace")[-1500:]
+            except Exception:
+                pass
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return result
+
+
 def _bn_diag_clearance_cache() -> dict[str, Any]:
     cache_file = getattr(engine, "_BASENOTES_CACHE_FILE", None)
     configured_path = str(cache_file) if cache_file is not None else ""
@@ -1807,6 +1969,7 @@ def basenotes_diagnostics(
         "query": query,
         "imports": _bn_diag_imports(),
         "chromium_binary": _bn_diag_chromium_binary(),
+        "raw_cdp_probe": _bn_diag_raw_cdp_probe() if mint else {"skipped": "set mint=1 to spawn chromium"},
         "clearance_cache": _bn_diag_clearance_cache(),
         "session_state": _bn_diag_session_state(),
         "direct_probe": _bn_diag_direct_probe(),
