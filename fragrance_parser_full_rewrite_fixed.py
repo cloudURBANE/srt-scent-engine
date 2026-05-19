@@ -2346,7 +2346,7 @@ def _mint_basenotes_clearance():
     return None
 
 
-def get_basenotes_scraper(fallback: Any = None):
+def get_basenotes_scraper(fallback: Any = None, *, mint_clearance: bool = False):
     global _BASENOTES_SESSION
     with _BASENOTES_SESSION_LOCK:
         if _BASENOTES_SESSION is not None:
@@ -2359,10 +2359,11 @@ def get_basenotes_scraper(fallback: Any = None):
                 _BASENOTES_SESSION = session
                 return _BASENOTES_SESSION
 
-        minted = _mint_basenotes_clearance()
-        if minted is not None:
-            _BASENOTES_SESSION = minted
-            return _BASENOTES_SESSION
+        if mint_clearance:
+            minted = _mint_basenotes_clearance()
+            if minted is not None:
+                _BASENOTES_SESSION = minted
+                return _BASENOTES_SESSION
 
     return fallback
 
