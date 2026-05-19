@@ -106,6 +106,25 @@ _CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
 # Unset => the worker endpoints are unconfigured and return 503.
 _ENRICHMENT_WORKER_TOKEN = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
 
+
+def _require_clearance_token(authorization: str | None = Header(default=None)) -> None:
+    if not _ENRICHMENT_WORKER_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Clearance endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset).",
+        )
+    expected = f"Bearer {_ENRICHMENT_WORKER_TOKEN}"
+    if not hmac.compare_digest(authorization or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
+
+
+class ClearanceCookieRequest(BaseModel):
+    user_agent: str
+    cookie_header: str | None = None
+    cookies: dict[str, str] | None = None
+    validate_session: bool = True
+
+
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
 
@@ -1833,6 +1852,9 @@ def _bn_diag_clearance_cache() -> dict[str, Any]:
     return {
         "configured_path": configured_path,
         "env_override": os.environ.get("BASENOTES_CLEARANCE_CACHE") or None,
+        "env_user_agent_present": bool(os.environ.get("BASENOTES_CLEARANCE_UA")),
+        "env_cookie_header_present": bool(os.environ.get("BASENOTES_CLEARANCE_COOKIE_HEADER")),
+        "env_cookies_json_present": bool(os.environ.get("BASENOTES_CLEARANCE_COOKIES_JSON")),
         "exists": exists,
         "size_bytes": size_bytes,
         "user_agent_present": user_agent_present,
@@ -2034,6 +2056,61 @@ def _bn_diag_engine_search(query: str) -> dict[str, Any]:
     return result
 
 
+def _coerce_clearance_payload(payload: ClearanceCookieRequest) -> tuple[str, dict[str, str]]:
+    user_agent = str(payload.user_agent or "").strip()
+    cookies = {
+        str(k).strip(): str(v)
+        for k, v in (payload.cookies or {}).items()
+        if str(k).strip()
+    }
+    if not cookies and payload.cookie_header:
+        cookies = engine._parse_cookie_header(payload.cookie_header)
+    if not user_agent:
+        raise HTTPException(status_code=400, detail="user_agent is required.")
+    if not cookies:
+        raise HTTPException(status_code=400, detail="cookies or cookie_header is required.")
+    return user_agent, cookies
+
+
+def _install_manual_clearance(source: str, payload: ClearanceCookieRequest) -> dict[str, Any]:
+    user_agent, cookies = _coerce_clearance_payload(payload)
+    if source == "basenotes":
+        engine.reset_basenotes_scraper(clear_cache=True)
+        engine._save_basenotes_cache(user_agent, cookies)
+        session = engine._new_basenotes_http_session(user_agent, cookies)
+        validated = (
+            bool(engine._validate_basenotes_session(session))
+            if payload.validate_session and session is not None
+            else None
+        )
+        if validated:
+            engine._BASENOTES_SESSION = session
+            engine._BASENOTES_LAST_MINT_ERROR = None
+    elif source == "fragrantica":
+        engine.reset_fragrantica_scraper(clear_cache=True)
+        engine._save_fragrantica_cache(user_agent, cookies)
+        session = engine._new_fragrantica_http_session(user_agent, cookies)
+        validated = (
+            bool(engine._validate_fragrantica_session(session))
+            if payload.validate_session and session is not None
+            else None
+        )
+        if validated:
+            engine._FRAGRANTICA_SESSION = session
+            engine._FRAGRANTICA_LAST_MINT_ERROR = None
+    else:
+        raise HTTPException(status_code=400, detail="source must be basenotes or fragrantica.")
+
+    return {
+        "source": source,
+        "saved": True,
+        "validated": validated,
+        "cookie_count": len(cookies),
+        "has_cf_clearance": "cf_clearance" in cookies,
+        "user_agent_present": bool(user_agent),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Basenotes diagnostics (TEMPORARY -- remove after Basenotes/Railway clearance
 # gap is resolved).
@@ -2090,6 +2167,14 @@ def basenotes_diagnostics(
     }
 
 
+@app.post(
+    "/api/diagnostics/basenotes/clearance",
+    dependencies=[Depends(_require_clearance_token)],
+)
+def install_basenotes_clearance(payload: ClearanceCookieRequest) -> dict[str, Any]:
+    return _install_manual_clearance("basenotes", payload)
+
+
 # ---------------------------------------------------------------------------
 # Fragrantica diagnostics. Mirrors /api/diagnostics/basenotes for the FG-side
 # clearance pipeline. Cloudflare blocks Railway's datacenter IP on
@@ -2130,6 +2215,9 @@ def _fg_diag_clearance_cache() -> dict[str, Any]:
     return {
         "configured_path": configured_path,
         "env_override": os.environ.get("FRAGRANTICA_CLEARANCE_CACHE") or None,
+        "env_user_agent_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_UA")),
+        "env_cookie_header_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_COOKIE_HEADER")),
+        "env_cookies_json_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_COOKIES_JSON")),
         "exists": exists,
         "size_bytes": size_bytes,
         "user_agent_present": user_agent_present,
@@ -2342,6 +2430,14 @@ def fragrantica_diagnostics(
         "engine_search_for_q": _fg_diag_engine_search(query),
         "last_mint_error": getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None),
     }
+
+
+@app.post(
+    "/api/diagnostics/fragrantica/clearance",
+    dependencies=[Depends(_require_clearance_token)],
+)
+def install_fragrantica_clearance(payload: ClearanceCookieRequest) -> dict[str, Any]:
+    return _install_manual_clearance("fragrantica", payload)
 
 
 def _jsonable(value: Any) -> Any:

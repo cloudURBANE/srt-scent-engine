@@ -2317,6 +2317,38 @@ _FRAGRANTICA_SESSION = None
 _FRAGRANTICA_LAST_MINT_ERROR: str | None = None
 
 
+def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def _load_clearance_from_env(prefix: str) -> tuple[str, dict[str, str]] | None:
+    user_agent = str(os.environ.get(f"{prefix}_CLEARANCE_UA") or "").strip()
+    cookie_header = str(os.environ.get(f"{prefix}_CLEARANCE_COOKIE_HEADER") or "").strip()
+    cookies_json = str(os.environ.get(f"{prefix}_CLEARANCE_COOKIES_JSON") or "").strip()
+    cookies: dict[str, str] = {}
+    if cookies_json:
+        try:
+            parsed = json.loads(cookies_json)
+            if isinstance(parsed, dict):
+                cookies = {str(k): str(v) for k, v in parsed.items() if str(k).strip()}
+        except Exception:
+            cookies = {}
+    if not cookies and cookie_header:
+        cookies = _parse_cookie_header(cookie_header)
+    if not user_agent or not cookies:
+        return None
+    return user_agent, cookies
+
+
 def _kill_chromiums_for_user_data_dir(user_data_dir: str) -> None:
     if not user_data_dir or os.name == "nt":
         return
@@ -2654,6 +2686,9 @@ def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
 
 
 def _load_basenotes_cache() -> tuple[str, dict[str, str]] | None:
+    env_clearance = _load_clearance_from_env("BASENOTES")
+    if env_clearance:
+        return env_clearance
     try:
         with _BASENOTES_CACHE_FILE.open("r", encoding="utf-8") as handle:
             cache = json.load(handle)
@@ -2864,6 +2899,9 @@ def _new_fragrantica_http_session(user_agent: str, cookies: dict[str, str]):
 
 
 def _load_fragrantica_cache() -> tuple[str, dict[str, str]] | None:
+    env_clearance = _load_clearance_from_env("FRAGRANTICA")
+    if env_clearance:
+        return env_clearance
     try:
         with _FRAGRANTICA_CACHE_FILE.open("r", encoding="utf-8") as handle:
             cache = json.load(handle)
