@@ -4,7 +4,10 @@
 # does not run inside Railway's container, so DrissionPage's ChromiumPage timed
 # out with BrowserConnectError on every mint. nixPkgs gives us a real Chromium
 # binary on PATH (Nix-managed, not snap), which DrissionPage can drive.
-nixPkgs = ["chromium"]
+#
+# Declaring [phases.setup] replaces the auto-detected provider setup, so we have
+# to list Python here too -- otherwise `python -m venv` fails with exit 127.
+nixPkgs = ["python311", "gcc", "chromium"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
