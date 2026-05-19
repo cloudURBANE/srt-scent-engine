@@ -23,6 +23,47 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 
+_DRISSION_ORIGIN_PATCH_ACTIVE = False
+
+
+def _install_drission_websocket_origin_patch() -> None:
+    """Force an Origin header for DrissionPage's DevTools websocket on Railway."""
+    global _DRISSION_ORIGIN_PATCH_ACTIVE
+
+    configured_origin = os.environ.get("DRISSION_FORCE_ORIGIN", "").strip()
+    enabled = configured_origin.lower() in {"1", "true", "yes", "on"}
+    explicit_origin = configured_origin.startswith(("http://", "https://"))
+    if not (enabled or explicit_origin):
+        return
+
+    try:
+        import websocket as _ws_lib  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return
+
+    original_create_connection = _ws_lib.create_connection
+    if getattr(original_create_connection, "_srt_forces_origin", False):
+        _DRISSION_ORIGIN_PATCH_ACTIVE = True
+        return
+
+    def _create_connection_with_origin(url: str, *args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("suppress_origin", None)
+        if "origin" not in kwargs:
+            if explicit_origin:
+                kwargs["origin"] = configured_origin
+            else:
+                parsed = urlparse(url)
+                scheme = "https" if parsed.scheme == "wss" else "http"
+                kwargs["origin"] = f"{scheme}://{parsed.netloc}"
+        return original_create_connection(url, *args, **kwargs)
+
+    _create_connection_with_origin._srt_forces_origin = True  # type: ignore[attr-defined]
+    _ws_lib.create_connection = _create_connection_with_origin
+    _DRISSION_ORIGIN_PATCH_ACTIVE = True
+
+
+_install_drission_websocket_origin_patch()
+
 try:
     import cloudscraper  # pyright: ignore[reportMissingImports]
 except ModuleNotFoundError:
@@ -33,6 +74,14 @@ except ModuleNotFoundError:
     curl_requests = None  # type: ignore[assignment]
 try:
     from DrissionPage import ChromiumOptions, ChromiumPage  # pyright: ignore[reportMissingImports]
+    if _DRISSION_ORIGIN_PATCH_ACTIVE:
+        try:
+            import DrissionPage._base.driver as _drission_driver  # pyright: ignore[reportMissingImports]
+            import websocket as _ws_lib  # pyright: ignore[reportMissingImports]
+
+            _drission_driver.create_connection = _ws_lib.create_connection
+        except Exception:
+            pass
 except ModuleNotFoundError:
     ChromiumOptions = None  # type: ignore[assignment]
     ChromiumPage = None  # type: ignore[assignment]
@@ -2250,6 +2299,37 @@ _FRAGRANTICA_SESSION = None
 _FRAGRANTICA_LAST_MINT_ERROR: str | None = None
 
 
+def _kill_chromiums_for_user_data_dir(user_data_dir: str) -> None:
+    if not user_data_dir or os.name == "nt":
+        return
+    pgrep = shutil.which("pgrep")
+    if not pgrep:
+        return
+    try:
+        import signal
+        import subprocess
+
+        proc = subprocess.run(
+            [pgrep, "-f", user_data_dir],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        my_pid = os.getpid()
+        for raw_pid in proc.stdout.split():
+            if not raw_pid.isdigit():
+                continue
+            pid = int(raw_pid)
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _response_has_challenge(res: Any) -> bool:
     if res is None:
         return True
@@ -2381,6 +2461,7 @@ def _mint_basenotes_clearance():
                 page.quit()
             except Exception:
                 pass
+        _kill_chromiums_for_user_data_dir(user_data_dir)
         try:
             shutil.rmtree(user_data_dir, ignore_errors=True)
         except Exception:
@@ -2554,6 +2635,7 @@ def _mint_fragrantica_clearance():
                 page.quit()
             except Exception:
                 pass
+        _kill_chromiums_for_user_data_dir(user_data_dir)
         try:
             shutil.rmtree(user_data_dir, ignore_errors=True)
         except Exception:

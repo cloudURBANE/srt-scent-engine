@@ -8,16 +8,16 @@
 # Declaring [phases.setup] replaces the auto-detected provider setup, so we have
 # to list Python here too -- otherwise `python -m venv` fails with exit 127.
 #
-# nixpkgsArchive pins Chromium to 122.0.6261.69 (2024-02-24). The current
-# DrissionPage release on PyPI (4.1.1.2) cannot complete the DevTools WebSocket
-# handshake against Chromium 130 -- it gets HTTP 404 on the WS path even with
-# --remote-allow-origins=*. Chromium 122 is the last version known to work with
-# this DrissionPage build. Do NOT unpin without first verifying a newer
-# DrissionPage release supports Chromium >=130 (`pip index versions DrissionPage`).
+# nixpkgsArchive currently pins Chromium to 122.0.6261.69 (2024-02-24). This
+# did not by itself fix Railway's DevTools WebSocket 404, so do not treat
+# Chromium 130 as the sole root cause. The app also enables
+# DRISSION_FORCE_ORIGIN below because DrissionPage 4.1.1.2 suppresses the
+# websocket Origin header during browser attach.
 nixpkgsArchive = "336eda0d07dc5e2be1f923990ad9fdb6bc8e28e3"
 nixPkgs = ["python311", "gcc", "chromium"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
+DRISSION_FORCE_ORIGIN = "1"
 # BASENOTES_CHROMIUM_PATH intentionally unset: the engine's mint helpers fall
 # back to shutil.which("chromium") which resolves to the nixPkgs binary.

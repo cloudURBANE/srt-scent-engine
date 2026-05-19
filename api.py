@@ -1461,6 +1461,10 @@ def _bn_diag_imports() -> dict[str, dict[str, Any]]:
         "DrissionPage": {
             "available": drission_available,
             "version": _bn_diag_package_version("DrissionPage", drission_module),
+            "force_origin_env": os.environ.get("DRISSION_FORCE_ORIGIN") or None,
+            "origin_patch_active": bool(
+                getattr(engine, "_DRISSION_ORIGIN_PATCH_ACTIVE", False)
+            ),
         },
     }
 
