@@ -143,16 +143,20 @@ def _ensure_device_cookie(request: Request, response: Response) -> str:
     if existing and 16 <= len(existing) <= 128:
         return existing
     new_device = secrets.token_urlsafe(24)
+    _set_device_cookie(response, new_device)
+    return new_device
+
+
+def _set_device_cookie(response: Response, device: str) -> None:
     response.set_cookie(
         DEVICE_COOKIE,
-        new_device,
+        device,
         max_age=60 * 60 * 24 * 365 * 2,
         secure=True,
         httponly=True,
         samesite="strict",
         path="/",
     )
-    return new_device
 
 
 def _set_session_cookie(response: Response, session_id: str) -> None:
@@ -573,7 +577,8 @@ def m_verify(
         ttl_days=SESSION_TTL_DAYS,
     )
     response = RedirectResponse("/m/dashboard", status_code=302)
-    _ensure_device_cookie(request, response)
+    if DEVICE_COOKIE not in request.cookies:
+        _set_device_cookie(response, device)
     _set_session_cookie(response, session_id)
     return response
 
