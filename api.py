@@ -38,6 +38,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -94,7 +95,8 @@ _ALLOW_BUNDLED_FG_DETAIL_CACHE = _env_flag(
     "ALLOW_BUNDLED_FG_DETAIL_CACHE", default=not db.ENABLED
 )
 _ALLOW_BUNDLED_FG_SEARCH_CACHE = _env_flag(
-    "ALLOW_BUNDLED_FG_SEARCH_CACHE", default=not db.ENABLED
+    "ALLOW_BUNDLED_FG_SEARCH_CACHE",
+    default=not db.ENABLED or bool(os.environ.get("FG_CACHE_PATH")),
 )
 _CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
 
@@ -273,7 +275,7 @@ def _candidate_from_cache_entry(
 
 
 def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
-    if not _ALLOW_BUNDLED_FG_SEARCH_CACHE:
+    if not _ALLOW_BUNDLED_FG_DETAIL_CACHE:
         return []
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
@@ -1220,9 +1222,12 @@ def search(
     diagnostics = _search_diagnostics(results)
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
+        fallback_label = (
+            "identity cache" if fallback_source == "identity" else f"{fallback_source} detail cache"
+        )
         diagnostics["warning"] = (
             "Live providers returned zero candidates; results came from the "
-            f"{fallback_source} detail cache."
+            f"{fallback_label}."
         )
 
     return {

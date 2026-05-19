@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import api
 import fragrance_parser_full_rewrite_fixed as engine
@@ -122,6 +123,37 @@ def test_details_request_recovers_identity_from_legacy_blank_id() -> None:
     )
 
 
+def test_bundled_identity_cache_rescues_deploy_repros() -> None:
+    print("Bundled identity-cache fallback checks:")
+    old_cache = api._ARGS.fg_cache
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_db_search = api.db.search_detail_cache
+    try:
+        api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+        api.db.search_detail_cache = lambda query, limit=15: []
+        xerjoff_rows, xerjoff_source = api._cache_search_fallback("xerjoff", 15)
+        santal_rows, santal_source = api._cache_search_fallback("santal 33", 15)
+    finally:
+        api._ARGS.fg_cache = old_cache
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_detail_cache = old_db_search
+
+    check(
+        "xerjoff falls back to shipped identity cache",
+        xerjoff_source == "identity" and any(row.brand == "Xerjoff" for row in xerjoff_rows),
+        f"{xerjoff_source} {[(row.brand, row.name) for row in xerjoff_rows[:5]]}",
+    )
+    check(
+        "santal 33 falls back to shipped identity cache",
+        santal_source == "identity" and any(row.brand == "Le Labo" and row.name == "Santal 33" for row in santal_rows),
+        f"{santal_source} {[(row.brand, row.name) for row in santal_rows[:5]]}",
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_brand_plus_name_filter()
@@ -129,6 +161,7 @@ def main() -> int:
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()
+    test_bundled_identity_cache_rescues_deploy_repros()
 
     print()
     if _FAILURES:
