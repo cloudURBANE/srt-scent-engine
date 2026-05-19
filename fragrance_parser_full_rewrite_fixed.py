@@ -24,6 +24,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 import requests
 
 _DRISSION_ORIGIN_PATCH_ACTIVE = False
+_DRISSION_LAST_WS_CONNECT: dict[str, Any] | None = None
 
 
 def _install_drission_websocket_origin_patch() -> None:
@@ -56,14 +57,20 @@ def _install_drission_websocket_origin_patch() -> None:
         return
 
     def _create_connection_with_origin(url: str, *args: Any, **kwargs: Any) -> Any:
+        global _DRISSION_LAST_WS_CONNECT
+        had_suppress_origin = "suppress_origin" in kwargs
         kwargs.pop("suppress_origin", None)
         if "origin" not in kwargs:
             if explicit_origin:
                 kwargs["origin"] = configured_origin
             else:
-                parsed = urlparse(url)
-                scheme = "https" if parsed.scheme == "wss" else "http"
-                kwargs["origin"] = f"{scheme}://{parsed.netloc}"
+                kwargs["origin"] = "http://127.0.0.1"
+        _DRISSION_LAST_WS_CONNECT = {
+            "url": url,
+            "origin": kwargs.get("origin"),
+            "had_suppress_origin": had_suppress_origin,
+            "enable_multithread": kwargs.get("enable_multithread"),
+        }
         return original_create_connection(url, *args, **kwargs)
 
     _create_connection_with_origin._srt_forces_origin = True  # type: ignore[attr-defined]

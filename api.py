@@ -1443,11 +1443,16 @@ def _bn_diag_imports() -> dict[str, dict[str, Any]]:
         and getattr(engine, "ChromiumPage", None) is not None
     )
     drission_module = None
+    drission_driver_module = None
     if drission_available:
         try:
             drission_module = __import__("DrissionPage")
         except Exception:
             drission_module = None
+        try:
+            import DrissionPage._base.driver as drission_driver_module  # type: ignore[import-not-found]
+        except Exception:
+            drission_driver_module = None
 
     return {
         "cloudscraper": {
@@ -1465,6 +1470,15 @@ def _bn_diag_imports() -> dict[str, dict[str, Any]]:
             "origin_patch_active": bool(
                 getattr(engine, "_DRISSION_ORIGIN_PATCH_ACTIVE", False)
             ),
+            "driver_create_connection_patched": bool(
+                drission_driver_module is not None
+                and getattr(
+                    getattr(drission_driver_module, "create_connection", None),
+                    "_srt_forces_origin",
+                    False,
+                )
+            ),
+            "last_ws_connect": getattr(engine, "_DRISSION_LAST_WS_CONNECT", None),
         },
     }
 
