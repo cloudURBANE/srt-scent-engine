@@ -2508,7 +2508,11 @@ def _mint_fragrantica_clearance():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-blink-features=AutomationControlled")
-        if os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
+        headless_env = (
+            os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+            or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+        )
+        if headless_env.lower() in {"1", "true", "yes"}:
             options.set_argument("--headless=new")
         options.auto_port()
 
