@@ -2355,6 +2355,7 @@ def _mint_clearance_with_raw_cdp(
     user_data_dir: str,
     wait_seconds: int,
     headless: bool,
+    display_mode: str,
 ) -> tuple[str, dict[str, str]] | None:
     global _CLEARANCE_RAW_CDP_LAST_RESULT
     import socket
@@ -2362,6 +2363,7 @@ def _mint_clearance_with_raw_cdp(
 
     result: dict[str, Any] = {
         "site_url": site_url,
+        "display_mode": display_mode,
         "step": "start",
         "ok": False,
         "port": None,
@@ -2395,7 +2397,9 @@ def _mint_clearance_with_raw_cdp(
     args = [
         chromium_path,
         "--window-position=-2000,-2000",
+        "--window-size=1280,900",
         "--mute-audio",
+        "--no-first-run",
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
@@ -2415,6 +2419,18 @@ def _mint_clearance_with_raw_cdp(
     ]
     if headless:
         args.insert(1, "--headless=new")
+    elif display_mode == "xvfb":
+        xvfb_run = shutil.which("xvfb-run")
+        if not xvfb_run:
+            fail("xvfb_missing", "xvfb-run not found on PATH")
+            return None
+        args = [
+            xvfb_run,
+            "-a",
+            "-s",
+            "-screen 0 1280x900x24",
+            *args,
+        ]
 
     proc: subprocess.Popen[bytes] | None = None
     ws = None
@@ -2746,12 +2762,31 @@ def _mint_basenotes_clearance():
             user_data_dir=user_data_dir,
             wait_seconds=max(35, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
             headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
+            display_mode="headless",
         )
+        if raw_minted is None and shutil.which("xvfb-run"):
+            xvfb_user_data_dir = tempfile.mkdtemp(prefix="bn-xvfb-chromium-")
+            try:
+                raw_minted = _mint_clearance_with_raw_cdp(
+                    chromium_path=chromium_path,
+                    site_url="https://basenotes.com/",
+                    user_data_dir=xvfb_user_data_dir,
+                    wait_seconds=max(45, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
+                    headless=False,
+                    display_mode="xvfb",
+                )
+            finally:
+                _kill_chromiums_for_user_data_dir(xvfb_user_data_dir)
+                try:
+                    shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
         if raw_minted is None:
             raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
             _BASENOTES_LAST_MINT_ERROR = (
                 f"{_BASENOTES_LAST_MINT_ERROR}; raw_cdp_step="
-                f"{raw_result.get('step')}; raw_cdp_error={raw_result.get('error')}"
+                f"{raw_result.get('step')}; raw_cdp_mode={raw_result.get('display_mode')}; "
+                f"raw_cdp_error={raw_result.get('error')}"
             )
             return None
         user_agent, cookies = raw_minted
@@ -2941,12 +2976,31 @@ def _mint_fragrantica_clearance():
                 os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
                 or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
             ).lower() in {"1", "true", "yes"},
+            display_mode="headless",
         )
+        if raw_minted is None and shutil.which("xvfb-run"):
+            xvfb_user_data_dir = tempfile.mkdtemp(prefix="fg-xvfb-chromium-")
+            try:
+                raw_minted = _mint_clearance_with_raw_cdp(
+                    chromium_path=chromium_path,
+                    site_url="https://www.fragrantica.com/",
+                    user_data_dir=xvfb_user_data_dir,
+                    wait_seconds=max(45, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                    headless=False,
+                    display_mode="xvfb",
+                )
+            finally:
+                _kill_chromiums_for_user_data_dir(xvfb_user_data_dir)
+                try:
+                    shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
         if raw_minted is None:
             raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
             _FRAGRANTICA_LAST_MINT_ERROR = (
                 f"{_FRAGRANTICA_LAST_MINT_ERROR}; raw_cdp_step="
-                f"{raw_result.get('step')}; raw_cdp_error={raw_result.get('error')}"
+                f"{raw_result.get('step')}; raw_cdp_mode={raw_result.get('display_mode')}; "
+                f"raw_cdp_error={raw_result.get('error')}"
             )
             return None
         user_agent, cookies = raw_minted

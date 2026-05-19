@@ -13,7 +13,7 @@
 # Chromium 130 as the sole root cause. The app also patches DrissionPage's
 # suppressed websocket Origin header automatically when running on Railway.
 nixpkgsArchive = "336eda0d07dc5e2be1f923990ad9fdb6bc8e28e3"
-nixPkgs = ["python311", "gcc", "chromium"]
+nixPkgs = ["python311", "gcc", "chromium", "xvfb-run"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
