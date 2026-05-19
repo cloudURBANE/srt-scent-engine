@@ -40,6 +40,7 @@ import logging
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -2837,15 +2838,69 @@ def _apply_fg_detail_cache(
     return _hydrate_details_from_entry(details, entry)
 
 
+def _candidate_from_source_url(source_url: str) -> engine.UnifiedFragrance:
+    url = (source_url or "").strip()
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'id' or 'source_url' is required.",
+        )
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        raise HTTPException(
+            status_code=400,
+            detail="source_url must be an http(s) Basenotes or Fragrantica URL.",
+        )
+    is_basenotes = host == "basenotes.com" or host.endswith(".basenotes.com")
+    is_fragrantica = host == "fragrantica.com" or host.endswith(".fragrantica.com")
+    if not (is_basenotes or is_fragrantica):
+        raise HTTPException(
+            status_code=400,
+            detail="source_url must identify a Basenotes or Fragrantica fragrance page.",
+        )
+    bn_url = url if is_basenotes else ""
+    frag_url = url if is_fragrantica else ""
+    selected = engine.UnifiedFragrance(
+        name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
+    )
+    if frag_url:
+        entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
+        if entry and entry.get("quality_status") == "complete":
+            _fill_selected_identity(selected, entry)
+        elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
+            json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
+            if json_entry:
+                _fill_selected_identity(selected, json_entry)
+        if not selected.name:
+            selected.name = engine.FragranticaEngine.name_from_url(frag_url)
+        if not selected.brand:
+            selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+    return selected
+
+
 def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     """Reconstruct the engine candidate from the detail request.
 
     Prefers the opaque `id` token (carries both source URLs). Falls back to a
     bare `source_url`, routed to bn_url/frag_url by domain.
     """
-    if req.id:
+    id_text = (req.id or "").strip()
+    if id_text.startswith("source:"):
+        selected = _candidate_from_source_url(id_text[len("source:") :])
+    elif id_text.startswith(("catalog:", "dataset:", "local:")):
+        prefix = id_text.split(":", 1)[0]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"id '{prefix}:...' routes to the local Express API at "
+                "/api/fragrances/details on the api-server, not to this "
+                "engine; send a source_url or call the app details endpoint."
+            ),
+        )
+    elif id_text:
         try:
-            data = _decode_id(req.id)
+            data = _decode_id(id_text)
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"Invalid 'id' token: {exc}"
@@ -2858,30 +2913,7 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
             frag_url=data.get("fg", ""),
         )
     else:
-        url = (req.source_url or "").strip()
-        if not url:
-            raise HTTPException(
-                status_code=400,
-                detail="Either 'id' or 'source_url' is required.",
-            )
-        lowered = url.lower()
-        bn_url = url if "basenotes" in lowered else ""
-        frag_url = url if "fragrantica" in lowered or not bn_url else ""
-        selected = engine.UnifiedFragrance(
-            name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
-        )
-        if frag_url:
-            entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
-            if entry and entry.get("quality_status") == "complete":
-                _fill_selected_identity(selected, entry)
-            elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
-                json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
-                if json_entry:
-                    _fill_selected_identity(selected, json_entry)
-            if not selected.name:
-                selected.name = engine.FragranticaEngine.name_from_url(frag_url)
-            if not selected.brand:
-                selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+        selected = _candidate_from_source_url(req.source_url or "")
 
     identity = _recover_candidate_identity(selected)
     if _identity_needs_recovery(selected.name) and identity["name"]:

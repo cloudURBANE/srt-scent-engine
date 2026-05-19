@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from fastapi import HTTPException
+
 import api
 import fragrance_parser_full_rewrite_fixed as engine
 
@@ -123,6 +125,37 @@ def test_details_request_recovers_identity_from_legacy_blank_id() -> None:
     )
 
 
+def test_details_request_accepts_source_prefixed_id() -> None:
+    print("Source-prefixed id recovery checks:")
+    url = "https://www.fragrantica.com/perfume/Le-Labo/Santal-33-12201.html"
+    selected = api._candidate_from_request(api.DetailRequest(id=f"source:{url}"))
+    check("source: id routes to fragrantica URL", selected.frag_url == url, selected.frag_url)
+    check("source: id recovers display name", selected.name == "Santal 33", selected.name)
+    check("source: id recovers display house", selected.brand == "Le Labo", selected.brand)
+
+
+def test_details_request_rejects_bad_source_prefixed_id() -> None:
+    print("Source-prefixed id validation checks:")
+    try:
+        api._candidate_from_request(api.DetailRequest(id="source:javascript:fragrantica.com"))
+    except HTTPException as exc:
+        check("bad source: id returns 400", exc.status_code == 400, str(exc.status_code))
+        check("bad source: id error is clear", "source_url must" in str(exc.detail), str(exc.detail))
+    else:
+        check("bad source: id returns 400", False, "no exception")
+
+
+def test_details_request_rejects_app_catalog_ids_clearly() -> None:
+    print("App-catalog id routing checks:")
+    try:
+        api._candidate_from_request(api.DetailRequest(id="catalog:test"))
+    except HTTPException as exc:
+        check("catalog id returns a clear 400", exc.status_code == 400, str(exc.status_code))
+        check("catalog id error is not base64 padding", "padding" not in str(exc.detail).lower(), str(exc.detail))
+    else:
+        check("catalog id returns a clear 400", False, "no exception")
+
+
 def test_bundled_identity_cache_rescues_deploy_repros() -> None:
     print("Bundled identity-cache fallback checks:")
     old_cache = api._ARGS.fg_cache
@@ -161,6 +194,9 @@ def main() -> int:
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()
+    test_details_request_accepts_source_prefixed_id()
+    test_details_request_rejects_bad_source_prefixed_id()
+    test_details_request_rejects_app_catalog_ids_clearly()
     test_bundled_identity_cache_rescues_deploy_repros()
 
     print()

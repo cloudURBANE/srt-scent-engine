@@ -57,6 +57,9 @@ DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
 DEFAULT_JITTER = 15.0
 DEFAULT_LIMIT = 10
+# Per-page fetch deadline (FG+BN). Previously 8s, which left FG without
+# headroom on slow responses and surfaced as parser_empty_frag_cards.
+DEFAULT_DETAIL_TIMEOUT = 15.0
 SCHEMA_VERSION = 1
 MAX_LIST_LIMIT = 100
 HTTP_TIMEOUT = 30.0
@@ -190,6 +193,13 @@ class ApiClient:
             "POST",
             f"/api/enrichment/jobs/{job_id}/fail",
             json={"error": error, "retryable": bool(retryable)},
+        )
+
+    def requeue_job(self, job_id: str, *, priority: int = 10) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/enrichment/jobs/{job_id}/requeue",
+            json={"priority": int(priority)},
         )
 
     def ignore_job(self, job_id: str, note: str | None = None) -> dict[str, Any]:
@@ -493,7 +503,17 @@ def fetch_payload(
     frag_cards = details.frag_cards or {}
     if not isinstance(frag_cards, dict) or not frag_cards:
         retryable = bool(engine.FragranticaEngine.is_perfume_url(candidate.frag_url))
-        raise WorkerError("parser_empty_frag_cards", retryable=retryable)
+        fetch_errors = getattr(details, "fetch_errors", {}) or {}
+        fg_err = fetch_errors.get("fg")
+        url_shape_ok = engine.FragranticaEngine.is_perfume_url(candidate.frag_url)
+        parts = [f"url_shape_ok={url_shape_ok}"]
+        if fg_err:
+            parts.append(f"fg_fetch_error={fg_err}")
+        else:
+            parts.append("fg_fetch_error=none (parser produced no cards from fetched HTML)")
+        if debug:
+            print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
+        raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
     identity = _specific_identity(candidate)
     image_url = _extract_image_url(scraper, candidate.frag_url, debug=debug)
@@ -606,6 +626,30 @@ def process_job(
         return False
 
 
+def requeue_terminal_failed_jobs(
+    client: ApiClient,
+    config: WorkerConfig,
+    *,
+    limit: int,
+) -> int:
+    """Move terminal `failed` rows back to `pending` so the worker can process them."""
+    failed_jobs = client.list_jobs("failed", limit=max(limit, MAX_LIST_LIMIT))
+    requeued = 0
+    for job in failed_jobs[:limit]:
+        job_id = str(job.get("id") or "").strip()
+        if not job_id:
+            continue
+        if config.dry_run:
+            print(f"Dry run: would requeue failed job {job_id}")
+            requeued += 1
+            continue
+        client.requeue_job(job_id, priority=max(10, int(job.get("priority") or 0) + 1))
+        requeued += 1
+    if requeued:
+        print(f"Requeued {requeued} terminal failed job(s) to pending.")
+    return requeued
+
+
 def process_pending(
     client: ApiClient,
     config: WorkerConfig,
@@ -616,7 +660,12 @@ def process_pending(
     if not config.auth_configured:
         raise SystemExit("ENRICHMENT_WORKER_TOKEN is required for worker operations.")
 
-    jobs = client.list_jobs("pending", limit=max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit))
+    if only_retries:
+        requeue_terminal_failed_jobs(client, config, limit=config.limit)
+
+    list_limit = max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit)
+    pending_all = client.list_jobs("pending", limit=list_limit)
+    jobs = pending_all
     if only_retries:
         jobs = [j for j in jobs if int(j.get("failure_count") or 0) > 0]
     jobs = jobs[: config.limit]
@@ -951,15 +1000,11 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
     if snapshot["error"]:
         return snapshot
     try:
-        # Count pending jobs with prior failures — these are the ones the
-        # [5] Retry-failed action actually picks up. (Jobs that end up in
-        # status='failed' are non-retryable by definition per db.fail_job,
-        # so counting those would dangle the operator a number they can
-        # never action from the dashboard.)
+        # Pending with prior failures plus terminal failed rows (requeued on retry).
         pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
-        snapshot["retryable_failures"] = sum(
-            1 for j in pending if int(j.get("failure_count") or 0) > 0
-        )
+        pending_retries = sum(1 for j in pending if int(j.get("failure_count") or 0) > 0)
+        terminal_failed = int((snapshot.get("counts") or {}).get("failed") or 0)
+        snapshot["retryable_failures"] = pending_retries + terminal_failed
     except WorkerError:
         pass
     try:
@@ -1534,7 +1579,7 @@ def launch_dashboard(
         delay=_env_float("ENRICHMENT_DEFAULT_DELAY", DEFAULT_DELAY),
         jitter=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER),
         limit=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT),
-        detail_timeout=8.0,
+        detail_timeout=DEFAULT_DETAIL_TIMEOUT,
         debug=dbg,
         dry_run=False,
     )
@@ -1596,7 +1641,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jitter", type=float, default=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER))
     parser.add_argument("--once", action="store_true", help="Alias for --process-pending --limit 1.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve and parse without mutating worker job state.")
-    parser.add_argument("--detail-timeout", type=float, default=8.0, help="Per-page detail fetch deadline.")
+    parser.add_argument(
+        "--detail-timeout",
+        type=float,
+        default=DEFAULT_DETAIL_TIMEOUT,
+        help="Per-page detail fetch deadline (seconds).",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",

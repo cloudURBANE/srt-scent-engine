@@ -2305,6 +2305,7 @@ _BASENOTES_CHALLENGE_MARKERS = (
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
 _BASENOTES_LAST_MINT_ERROR: str | None = None
+_BASENOTES_NEXT_MINT_AFTER = 0.0
 
 _FRAGRANTICA_CACHE_FILE = Path(
     os.environ.get(
@@ -2315,6 +2316,19 @@ _FRAGRANTICA_CACHE_FILE = Path(
 _FRAGRANTICA_SESSION_LOCK = threading.Lock()
 _FRAGRANTICA_SESSION = None
 _FRAGRANTICA_LAST_MINT_ERROR: str | None = None
+_FRAGRANTICA_NEXT_MINT_AFTER = 0.0
+
+
+def _clearance_mint_cooldown_seconds() -> float:
+    try:
+        raw = (
+            os.environ.get("SRT_MINT_COOLDOWN_SECONDS")
+            or os.environ.get("CLEARANCE_MINT_COOLDOWN_SECONDS")
+            or "300"
+        )
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
 
 
 def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
@@ -3108,12 +3122,26 @@ class RoutedScraper:
         self._fragrantica_scraper = fragrantica_scraper
 
     def _for_url(self, url: str):
+        global _BASENOTES_NEXT_MINT_AFTER, _FRAGRANTICA_NEXT_MINT_AFTER
+
         host = (urlparse(url).netloc or "").lower()
         if host.endswith("fragrantica.com"):
-            self._fragrantica_scraper = get_fragrantica_scraper(self._fragrantica_scraper or self.default_scraper)
+            mint_clearance = _FRAGRANTICA_SESSION is None and time.monotonic() >= _FRAGRANTICA_NEXT_MINT_AFTER
+            if mint_clearance:
+                _FRAGRANTICA_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
+            self._fragrantica_scraper = get_fragrantica_scraper(
+                self._fragrantica_scraper or self.default_scraper,
+                mint_clearance=mint_clearance,
+            )
             return self._fragrantica_scraper or self.default_scraper
         if host.endswith("basenotes.com"):
-            self._basenotes_scraper = get_basenotes_scraper(self._basenotes_scraper or self.default_scraper)
+            mint_clearance = _BASENOTES_SESSION is None and time.monotonic() >= _BASENOTES_NEXT_MINT_AFTER
+            if mint_clearance:
+                _BASENOTES_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
+            self._basenotes_scraper = get_basenotes_scraper(
+                self._basenotes_scraper or self.default_scraper,
+                mint_clearance=mint_clearance,
+            )
             return self._basenotes_scraper or self.default_scraper
         return self.default_scraper
 
