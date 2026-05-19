@@ -1977,7 +1977,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine._mint_basenotes_clearance)
     try:
-        session = future.result(timeout=60)
+        session = future.result(timeout=90)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = session is not None
         if session is not None:
@@ -1990,7 +1990,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     except concurrent.futures.TimeoutError:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 60 seconds"
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
     except Exception as exc:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
@@ -2267,7 +2267,7 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine._mint_fragrantica_clearance)
     try:
-        session = future.result(timeout=60)
+        session = future.result(timeout=90)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = session is not None
         if session is not None:
@@ -2280,7 +2280,7 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     except concurrent.futures.TimeoutError:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 60 seconds"
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
     except Exception as exc:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False

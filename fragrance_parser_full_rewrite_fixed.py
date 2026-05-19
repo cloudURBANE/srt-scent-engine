@@ -2756,22 +2756,15 @@ def _mint_basenotes_clearance():
     except Exception as exc:
         _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
         _kill_chromiums_for_user_data_dir(user_data_dir)
-        raw_minted = _mint_clearance_with_raw_cdp(
-            chromium_path=chromium_path,
-            site_url="https://basenotes.com/",
-            user_data_dir=user_data_dir,
-            wait_seconds=max(35, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
-            headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
-            display_mode="headless",
-        )
-        if raw_minted is None and shutil.which("xvfb-run"):
+        raw_minted = None
+        if shutil.which("xvfb-run"):
             xvfb_user_data_dir = tempfile.mkdtemp(prefix="bn-xvfb-chromium-")
             try:
                 raw_minted = _mint_clearance_with_raw_cdp(
                     chromium_path=chromium_path,
                     site_url="https://basenotes.com/",
                     user_data_dir=xvfb_user_data_dir,
-                    wait_seconds=max(45, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
+                    wait_seconds=max(50, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
                     headless=False,
                     display_mode="xvfb",
                 )
@@ -2781,6 +2774,15 @@ def _mint_basenotes_clearance():
                     shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
                 except Exception:
                     pass
+        if raw_minted is None and not shutil.which("xvfb-run"):
+            raw_minted = _mint_clearance_with_raw_cdp(
+                chromium_path=chromium_path,
+                site_url="https://basenotes.com/",
+                user_data_dir=user_data_dir,
+                wait_seconds=max(35, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
+                headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
+                display_mode="headless",
+            )
         if raw_minted is None:
             raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
             _BASENOTES_LAST_MINT_ERROR = (
@@ -2967,25 +2969,15 @@ def _mint_fragrantica_clearance():
     except Exception as exc:
         _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
         _kill_chromiums_for_user_data_dir(user_data_dir)
-        raw_minted = _mint_clearance_with_raw_cdp(
-            chromium_path=chromium_path,
-            site_url="https://www.fragrantica.com/",
-            user_data_dir=user_data_dir,
-            wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
-            headless=(
-                os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
-                or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
-            ).lower() in {"1", "true", "yes"},
-            display_mode="headless",
-        )
-        if raw_minted is None and shutil.which("xvfb-run"):
+        raw_minted = None
+        if shutil.which("xvfb-run"):
             xvfb_user_data_dir = tempfile.mkdtemp(prefix="fg-xvfb-chromium-")
             try:
                 raw_minted = _mint_clearance_with_raw_cdp(
                     chromium_path=chromium_path,
                     site_url="https://www.fragrantica.com/",
                     user_data_dir=xvfb_user_data_dir,
-                    wait_seconds=max(45, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                    wait_seconds=max(50, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
                     headless=False,
                     display_mode="xvfb",
                 )
@@ -2995,6 +2987,18 @@ def _mint_fragrantica_clearance():
                     shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
                 except Exception:
                     pass
+        if raw_minted is None and not shutil.which("xvfb-run"):
+            raw_minted = _mint_clearance_with_raw_cdp(
+                chromium_path=chromium_path,
+                site_url="https://www.fragrantica.com/",
+                user_data_dir=user_data_dir,
+                wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                headless=(
+                    os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+                    or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+                ).lower() in {"1", "true", "yes"},
+                display_mode="headless",
+            )
         if raw_minted is None:
             raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
             _FRAGRANTICA_LAST_MINT_ERROR = (
