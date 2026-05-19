@@ -2312,6 +2312,7 @@ def _mint_basenotes_clearance():
         return None
 
     page = None
+    user_data_dir = tempfile.mkdtemp(prefix="bn-chromium-")
     try:
         options = ChromiumOptions()
         chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
@@ -2346,7 +2347,9 @@ def _mint_basenotes_clearance():
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-gpu")
         options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument(f"--user-data-dir={user_data_dir}")
         if os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
             options.set_argument("--headless=new")
         options.auto_port()
@@ -2377,6 +2380,10 @@ def _mint_basenotes_clearance():
                 page.quit()
             except Exception:
                 pass
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     if not cookies:
         return None
@@ -2473,6 +2480,7 @@ def _mint_fragrantica_clearance():
         return None
 
     page = None
+    user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
     try:
         options = ChromiumOptions()
         chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
@@ -2507,7 +2515,9 @@ def _mint_fragrantica_clearance():
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-gpu")
         options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument(f"--user-data-dir={user_data_dir}")
         headless_env = (
             os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
             or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
@@ -2542,6 +2552,10 @@ def _mint_fragrantica_clearance():
                 page.quit()
             except Exception:
                 pass
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     if not cookies:
         return None
