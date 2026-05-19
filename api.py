@@ -1553,6 +1553,41 @@ def _bn_diag_chromium_binary() -> dict[str, Any]:
     }
 
 
+def _bn_diag_kill_orphan_chromiums() -> dict[str, Any]:
+    """Kill any leftover chromium processes from previous failed mint attempts.
+
+    DrissionPage's mint raises during ChromiumPage(options) construction when
+    the WS handshake fails, which leaves the spawned chromium process orphaned
+    (the mint's finally only calls page.quit() if `page` was bound, but the
+    exception happens before assignment). On Railway these orphans accumulate
+    across mint=1 calls and wedge subsequent chromium spawns. Delete this block
+    once the clearance gap is resolved.
+    """
+    import subprocess
+
+    info: dict[str, Any] = {"ran": True, "killed_pids": [], "error": None}
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        pids = [int(p) for p in proc.stdout.split() if p.strip().isdigit()]
+        my_pid = os.getpid()
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, 9)
+                info["killed_pids"].append(pid)
+            except Exception as exc:
+                info["error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
 def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
     """Spawn chromium with --remote-debugging-port=N directly and probe CDP.
 
@@ -1999,14 +2034,32 @@ def _bn_diag_engine_search(query: str) -> dict[str, Any]:
 def basenotes_diagnostics(
     q: str = Query("xerjoff", min_length=1),
     mint: bool = Query(False),
+    probe: bool = Query(False),
+    kill_orphans: bool = Query(False),
 ) -> dict[str, Any]:
     query = q.strip()
+
+    # Run orphan-kill BEFORE either probe/mint so the container starts each call
+    # from a clean process table. Without this, a failed mint leaves chromium
+    # zombies that wedge subsequent spawns.
+    orphan_info: dict[str, Any] = (
+        _bn_diag_kill_orphan_chromiums()
+        if (kill_orphans or probe or mint)
+        else {"skipped": "set kill_orphans=1, probe=1, or mint=1 to run"}
+    )
+
+    raw_info: dict[str, Any] = (
+        _bn_diag_raw_cdp_probe()
+        if probe
+        else {"skipped": "set probe=1 to spawn chromium directly (independent of mint)"}
+    )
 
     return {
         "query": query,
         "imports": _bn_diag_imports(),
         "chromium_binary": _bn_diag_chromium_binary(),
-        "raw_cdp_probe": _bn_diag_raw_cdp_probe() if mint else {"skipped": "set mint=1 to spawn chromium"},
+        "orphan_chromium_cleanup": orphan_info,
+        "raw_cdp_probe": raw_info,
         "clearance_cache": _bn_diag_clearance_cache(),
         "session_state": _bn_diag_session_state(),
         "direct_probe": _bn_diag_direct_probe(),
