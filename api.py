@@ -1755,6 +1755,260 @@ def basenotes_diagnostics(
     }
 
 
+# ---------------------------------------------------------------------------
+# Fragrantica diagnostics. Mirrors /api/diagnostics/basenotes for the FG-side
+# clearance pipeline. Cloudflare blocks Railway's datacenter IP on
+# fragrantica.com the same way it blocks basenotes.com; the engine now has a
+# parallel _mint_fragrantica_clearance / _FRAGRANTICA_SESSION path, and this
+# endpoint is the one-shot trigger to mint clearance on the Railway box (cache
+# file is written to disk; subsequent normal requests reuse it). Like the BN
+# diagnostic, mint=1 is what actually runs Chromium -- without it the endpoint
+# is strictly read-only.
+# ---------------------------------------------------------------------------
+
+
+def _fg_diag_clearance_cache() -> dict[str, Any]:
+    cache_file = getattr(engine, "_FRAGRANTICA_CACHE_FILE", None)
+    configured_path = str(cache_file) if cache_file is not None else ""
+    exists = False
+    size_bytes: int | None = None
+    try:
+        exists = bool(cache_file is not None and cache_file.exists())
+        size_bytes = int(cache_file.stat().st_size) if exists else None
+    except Exception:
+        exists = False
+        size_bytes = None
+
+    cached = None
+    try:
+        cached = engine._load_fragrantica_cache()
+    except Exception:
+        cached = None
+
+    user_agent_present = False
+    cookie_count: int | None = None
+    if cached:
+        user_agent, cookies = cached
+        user_agent_present = bool(str(user_agent or "").strip())
+        cookie_count = len(cookies) if isinstance(cookies, dict) else None
+
+    return {
+        "configured_path": configured_path,
+        "env_override": os.environ.get("FRAGRANTICA_CLEARANCE_CACHE") or None,
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "user_agent_present": user_agent_present,
+        "cookie_count": cookie_count,
+    }
+
+
+def _fg_diag_session_state() -> dict[str, Any]:
+    import time as _time
+
+    session = getattr(engine, "_FRAGRANTICA_SESSION", None)
+    if session is None:
+        return {
+            "active": False,
+            "validated_now": None,
+            "validation_elapsed_ms": None,
+        }
+
+    started = _time.monotonic()
+    try:
+        validated = bool(engine._validate_fragrantica_session(session))
+    except Exception:
+        validated = False
+    return {
+        "active": True,
+        "validated_now": validated,
+        "validation_elapsed_ms": _bn_diag_elapsed_ms(started),
+    }
+
+
+def _fg_diag_direct_probe() -> dict[str, Any]:
+    import time as _time
+
+    url = "https://www.fragrantica.com/"
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "response_server_header": None,
+        "cf_ray_present": False,
+        "elapsed_ms": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        res = _bn_diag_default_scraper().get(url, timeout=10)
+        headers = _bn_diag_headers(res)
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "response_server_header": headers.get("Server"),
+                "cf_ray_present": _bn_diag_cf_ray_present(headers),
+                "elapsed_ms": _bn_diag_elapsed_ms(started),
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _fg_diag_search_probe(query: str) -> dict[str, Any]:
+    import time as _time
+    from urllib.parse import quote as _quote
+
+    url = engine.FragranticaEngine.SEARCH_URL.format(query=_quote(query))
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "elapsed_ms": None,
+        "fragrantica_perfume_anchor_count": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        deadline = engine.Deadline(10)
+        res = engine.Http.get(
+            scraper,
+            url,
+            timeout=10,
+            referer=engine.FragranticaEngine.BASE_URL,
+            deadline=deadline,
+            attempts=1,
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        if res is None:
+            return result
+
+        body = _bn_diag_response_text(res)
+        try:
+            soup = engine.BeautifulSoup(body, "html.parser")
+            anchor_count = sum(
+                1
+                for anchor in soup.find_all("a", href=True)
+                if "/perfume/" in str(anchor.get("href", ""))
+            )
+        except Exception:
+            anchor_count = None
+
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "fragrantica_perfume_anchor_count": anchor_count,
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
+    import concurrent.futures
+    import time as _time
+
+    result: dict[str, Any] = {
+        "ran": bool(mint),
+        "success": None,
+        "elapsed_ms": None,
+        "error": None,
+        "session_validated_after_mint": None,
+    }
+    if not mint:
+        return result
+
+    started = _time.monotonic()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(engine._mint_fragrantica_clearance)
+    try:
+        session = future.result(timeout=60)
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = session is not None
+        if session is not None:
+            try:
+                result["session_validated_after_mint"] = bool(
+                    engine._validate_fragrantica_session(session)
+                )
+            except Exception:
+                result["session_validated_after_mint"] = False
+    except concurrent.futures.TimeoutError:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = "TimeoutError: mint attempt exceeded 60 seconds"
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = _bn_diag_error(exc)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
+def _fg_diag_engine_search(query: str) -> dict[str, Any]:
+    import time as _time
+
+    result: dict[str, Any] = {
+        "row_count": 0,
+        "elapsed_ms": 0,
+        "sample_rows": [],
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        rows = engine.FragranticaEngine.extract_search_data(
+            scraper,
+            query,
+            deadline=engine.Deadline(10),
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["row_count"] = len(rows)
+        result["sample_rows"] = [
+            {
+                "name": getattr(row, "name", ""),
+                "brand": getattr(row, "brand", ""),
+                "frag_url": getattr(row, "frag_url", None),
+            }
+            for row in rows[:3]
+        ]
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+@app.get("/api/diagnostics/fragrantica")
+def fragrantica_diagnostics(
+    q: str = Query("dior sauvage", min_length=1),
+    mint: bool = Query(False),
+) -> dict[str, Any]:
+    query = q.strip()
+
+    return {
+        "query": query,
+        "imports": _bn_diag_imports(),
+        "chromium_binary": _bn_diag_chromium_binary(),
+        "clearance_cache": _fg_diag_clearance_cache(),
+        "session_state": _fg_diag_session_state(),
+        "direct_probe": _fg_diag_direct_probe(),
+        "search_probe": _fg_diag_search_probe(query),
+        "mint_attempt": _fg_diag_mint_attempt(mint),
+        "engine_search_for_q": _fg_diag_engine_search(query),
+        "last_mint_error": getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None),
+    }
+
+
 def _jsonable(value: Any) -> Any:
     """Best-effort coerce an argparse value into something JSON can carry."""
     if isinstance(value, (str, int, float, bool)) or value is None:
