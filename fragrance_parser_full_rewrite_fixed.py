@@ -2614,8 +2614,8 @@ def get_scraper():
         default = requests.Session()
     return RoutedScraper(
         default,
-        get_basenotes_scraper(default, mint_clearance=True),
-        get_fragrantica_scraper(default, mint_clearance=True),
+        get_basenotes_scraper(default),
+        get_fragrantica_scraper(default),
     )
 
 
