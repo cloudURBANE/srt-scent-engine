@@ -2072,6 +2072,7 @@ def basenotes_diagnostics(
         else {"skipped": "set probe=1 to spawn chromium directly (independent of mint)"}
     )
 
+    mint_info = _bn_diag_mint_attempt(mint)
     return {
         "query": query,
         "imports": _bn_diag_imports(),
@@ -2082,7 +2083,8 @@ def basenotes_diagnostics(
         "session_state": _bn_diag_session_state(),
         "direct_probe": _bn_diag_direct_probe(),
         "search_probe": _bn_diag_search_probe(query),
-        "mint_attempt": _bn_diag_mint_attempt(mint),
+        "mint_attempt": mint_info,
+        "raw_cdp_mint_result": getattr(engine, "_CLEARANCE_RAW_CDP_LAST_RESULT", None),
         "engine_search_for_q": _bn_diag_engine_search(query),
         "last_mint_error": getattr(engine, "_BASENOTES_LAST_MINT_ERROR", None),
     }

@@ -25,6 +25,7 @@ import requests
 
 _DRISSION_ORIGIN_PATCH_ACTIVE = False
 _DRISSION_LAST_WS_CONNECT: dict[str, Any] | None = None
+_CLEARANCE_RAW_CDP_LAST_RESULT: dict[str, Any] | None = None
 
 
 def _install_drission_websocket_origin_patch() -> None:
@@ -2354,18 +2355,39 @@ def _mint_clearance_with_raw_cdp(
     wait_seconds: int,
     headless: bool,
 ) -> tuple[str, dict[str, str]] | None:
+    global _CLEARANCE_RAW_CDP_LAST_RESULT
     import socket
     import subprocess
+
+    result: dict[str, Any] = {
+        "site_url": site_url,
+        "step": "start",
+        "ok": False,
+        "port": None,
+        "ws_url": None,
+        "cookie_count": 0,
+        "has_cf_clearance": False,
+        "title": None,
+        "current_url": None,
+        "error": None,
+    }
+    _CLEARANCE_RAW_CDP_LAST_RESULT = result
+
+    def fail(step: str, error: str | None = None) -> None:
+        result["step"] = step
+        result["error"] = error
 
     try:
         import websocket  # pyright: ignore[reportMissingImports]
     except Exception:
+        fail("import_websocket", "websocket-client unavailable")
         return None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
+        result["port"] = port
     finally:
         sock.close()
 
@@ -2401,8 +2423,10 @@ def _mint_clearance_with_raw_cdp(
         version_payload = None
         session = requests.Session()
         session.trust_env = False
+        result["step"] = "wait_json_version"
         while time.time() < deadline:
             if proc.poll() is not None:
+                fail("chromium_exited", f"exit_code={proc.returncode}")
                 return None
             try:
                 res = session.get(
@@ -2413,14 +2437,19 @@ def _mint_clearance_with_raw_cdp(
                 if res.ok:
                     version_payload = res.json()
                     break
-            except Exception:
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
                 time.sleep(0.2)
         if not version_payload:
+            fail("json_version_unavailable", result.get("error"))
             return None
 
         ws_url = version_payload.get("webSocketDebuggerUrl")
         if not ws_url:
+            fail("missing_websocket_url", str(version_payload)[:500])
             return None
+        result["ws_url"] = ws_url
+        result["step"] = "connect_ws"
         ws = websocket.create_connection(
             ws_url,
             timeout=10,
@@ -2445,25 +2474,33 @@ def _mint_clearance_with_raw_cdp(
                     return reply
             raise TimeoutError(f"CDP timeout waiting for {method}")
 
+        result["step"] = "browser_get_version"
         version = cdp("Browser.getVersion").get("result", {})
         user_agent = str(version.get("userAgent") or Http.DEFAULT_HEADERS["User-Agent"])
+        result["step"] = "create_target"
         target = cdp("Target.createTarget", {"url": "about:blank"}).get("result", {})
         target_id = target.get("targetId")
         if not target_id:
+            fail("missing_target_id", str(target)[:500])
             return None
+        result["step"] = "attach_target"
         attached = cdp(
             "Target.attachToTarget",
             {"targetId": target_id, "flatten": True},
         ).get("result", {})
         session_id = attached.get("sessionId")
         if not session_id:
+            fail("missing_session_id", str(attached)[:500])
             return None
 
+        result["step"] = "enable_domains"
         for method in ("Page.enable", "Runtime.enable", "Network.enable"):
             cdp(method, session_id=session_id)
+        result["step"] = "navigate"
         cdp("Page.navigate", {"url": site_url}, session_id=session_id)
 
         cookies: dict[str, str] = {}
+        result["step"] = "wait_cookies"
         for _ in range(max(1, wait_seconds)):
             try:
                 cookie_result = cdp("Network.getAllCookies", session_id=session_id).get("result", {})
@@ -2473,6 +2510,8 @@ def _mint_clearance_with_raw_cdp(
                     for c in cookie_list
                     if "name" in c and "value" in c
                 }
+                result["cookie_count"] = len(cookies)
+                result["has_cf_clearance"] = bool(cookies.get("cf_clearance"))
                 if cookies.get("cf_clearance"):
                     break
                 title_result = cdp(
@@ -2481,16 +2520,31 @@ def _mint_clearance_with_raw_cdp(
                     session_id=session_id,
                 ).get("result", {})
                 title = str(title_result.get("result", {}).get("value") or "")
+                result["title"] = title
+                url_result = cdp(
+                    "Runtime.evaluate",
+                    {"expression": "location.href", "returnByValue": True},
+                    session_id=session_id,
+                ).get("result", {})
+                result["current_url"] = str(url_result.get("result", {}).get("value") or "")
                 if cookies and not any(
                     marker in title.lower()
                     for marker in ("just a moment", "attention required")
                 ):
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
             time.sleep(1)
 
-        return (user_agent, cookies) if cookies else None
+        if cookies:
+            result["ok"] = True
+            result["step"] = "cookies_collected"
+            return user_agent, cookies
+        fail("no_cookies", result.get("error"))
+        return None
+    except Exception as exc:
+        fail(result.get("step") or "raw_cdp_exception", f"{type(exc).__name__}: {exc}")
+        return None
     finally:
         if ws is not None:
             try:
@@ -2646,6 +2700,11 @@ def _mint_basenotes_clearance():
             headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
         )
         if raw_minted is None:
+            raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
+            _BASENOTES_LAST_MINT_ERROR = (
+                f"{_BASENOTES_LAST_MINT_ERROR}; raw_cdp_step="
+                f"{raw_result.get('step')}; raw_cdp_error={raw_result.get('error')}"
+            )
             return None
         user_agent, cookies = raw_minted
     finally:
@@ -2836,6 +2895,11 @@ def _mint_fragrantica_clearance():
             ).lower() in {"1", "true", "yes"},
         )
         if raw_minted is None:
+            raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
+            _FRAGRANTICA_LAST_MINT_ERROR = (
+                f"{_FRAGRANTICA_LAST_MINT_ERROR}; raw_cdp_step="
+                f"{raw_result.get('step')}; raw_cdp_error={raw_result.get('error')}"
+            )
             return None
         user_agent, cookies = raw_minted
     finally:
