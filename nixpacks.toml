@@ -1,6 +1,12 @@
 [phases.setup]
-aptPkgs = ["chromium", "chromium-driver"]
+# Ubuntu 22.04's apt `chromium` / `chromium-browser` packages are snap-transition
+# shims (they print "requires the chromium snap to be installed" and exit). Snap
+# does not run inside Railway's container, so DrissionPage's ChromiumPage timed
+# out with BrowserConnectError on every mint. nixPkgs gives us a real Chromium
+# binary on PATH (Nix-managed, not snap), which DrissionPage can drive.
+nixPkgs = ["chromium"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
-BASENOTES_CHROMIUM_PATH = "/bin/chromium-browser"
+# BASENOTES_CHROMIUM_PATH intentionally unset: the engine's mint helpers fall
+# back to shutil.which("chromium") which resolves to the nixPkgs binary.
