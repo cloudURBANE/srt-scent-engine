@@ -57,6 +57,49 @@ return `503`. The existing bundled JSON detail cache keeps working unchanged.
   If you expect heavy concurrency, scale via Railway replicas or add
   `--workers N` to the start command.
 
+## Basenotes / Chromium requirement
+
+The Basenotes scraper passes Cloudflare clearance by driving a real Chromium
+process via `DrissionPage.ChromiumPage`. The default Nixpacks Python image does
+**not** ship a Chromium binary, so on Railway clearance silently fails and the
+search engine falls back to zero Basenotes rows.
+
+`search_engine/nixpacks.toml` installs the OS packages and sets the env vars the
+engine looks for:
+
+```toml
+[phases.setup]
+aptPkgs = ["chromium", "chromium-driver"]
+
+[variables]
+BASENOTES_CHROMIUM_HEADLESS = "1"
+BASENOTES_CHROMIUM_PATH = "/usr/bin/chromium"
+```
+
+`_mint_basenotes_clearance()` reads `BASENOTES_CHROMIUM_PATH` and, when set,
+passes it to `ChromiumOptions.set_browser_path()` so DrissionPage does not have
+to auto-discover the binary.
+
+### Post-deploy validation
+
+After Railway redeploys, run:
+
+```bash
+curl "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff"
+curl "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff&mint=1"
+curl "https://srt-scent-engine-production.up.railway.app/api/fragrances/search?q=xerjoff"
+```
+
+Expected:
+
+- `chromium_binary.which` is non-null.
+- `imports.DrissionPage.available` is `true`.
+- `mint_attempt.success` is `true` (or reports a concrete non-missing-binary
+  failure).
+- `engine_search_for_q.row_count` is non-zero for `xerjoff`.
+- `/api/fragrances/search?q=xerjoff` returns a populated `results` array from
+  the Python engine (not just the Express fallback catalog row).
+
 ## Local run
 
 ```bash

@@ -2275,6 +2275,12 @@ def _mint_basenotes_clearance():
     page = None
     try:
         options = ChromiumOptions()
+        chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        if chromium_path:
+            try:
+                options.set_browser_path(chromium_path)
+            except Exception:
+                pass
         options.set_argument("--window-position=-2000,-2000")
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")

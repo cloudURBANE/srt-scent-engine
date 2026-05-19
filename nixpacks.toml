@@ -1,0 +1,6 @@
+[phases.setup]
+aptPkgs = ["chromium", "chromium-driver"]
+
+[variables]
+BASENOTES_CHROMIUM_HEADLESS = "1"
+BASENOTES_CHROMIUM_PATH = "/usr/bin/chromium"
