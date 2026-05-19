@@ -33,7 +33,16 @@ def _install_drission_websocket_origin_patch() -> None:
     configured_origin = os.environ.get("DRISSION_FORCE_ORIGIN", "").strip()
     enabled = configured_origin.lower() in {"1", "true", "yes", "on"}
     explicit_origin = configured_origin.startswith(("http://", "https://"))
-    if not (enabled or explicit_origin):
+    railway_runtime = any(
+        os.environ.get(name)
+        for name in (
+            "RAILWAY_SERVICE_ID",
+            "RAILWAY_DEPLOYMENT_ID",
+            "RAILWAY_ENVIRONMENT_ID",
+            "RAILWAY_GIT_COMMIT_SHA",
+        )
+    )
+    if not (enabled or explicit_origin or railway_runtime):
         return
 
     try:
