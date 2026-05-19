@@ -2346,6 +2346,169 @@ def _kill_chromiums_for_user_data_dir(user_data_dir: str) -> None:
         pass
 
 
+def _mint_clearance_with_raw_cdp(
+    *,
+    chromium_path: str,
+    site_url: str,
+    user_data_dir: str,
+    wait_seconds: int,
+    headless: bool,
+) -> tuple[str, dict[str, str]] | None:
+    import socket
+    import subprocess
+
+    try:
+        import websocket  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return None
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    finally:
+        sock.close()
+
+    args = [
+        chromium_path,
+        "--window-position=-2000,-2000",
+        "--mute-audio",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-background-networking",
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={user_data_dir}",
+        "about:blank",
+    ]
+    if headless:
+        args.insert(1, "--headless=new")
+
+    proc: subprocess.Popen[bytes] | None = None
+    ws = None
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 12
+        version_payload = None
+        session = requests.Session()
+        session.trust_env = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return None
+            try:
+                res = session.get(
+                    f"http://127.0.0.1:{port}/json/version",
+                    timeout=2,
+                    headers={"Connection": "close"},
+                )
+                if res.ok:
+                    version_payload = res.json()
+                    break
+            except Exception:
+                time.sleep(0.2)
+        if not version_payload:
+            return None
+
+        ws_url = version_payload.get("webSocketDebuggerUrl")
+        if not ws_url:
+            return None
+        ws = websocket.create_connection(
+            ws_url,
+            timeout=10,
+            enable_multithread=True,
+            origin="http://127.0.0.1",
+        )
+        next_id = 0
+
+        def cdp(method: str, params: dict[str, Any] | None = None, session_id: str | None = None) -> dict[str, Any]:
+            nonlocal next_id
+            next_id += 1
+            message: dict[str, Any] = {"id": next_id, "method": method}
+            if params:
+                message["params"] = params
+            if session_id:
+                message["sessionId"] = session_id
+            ws.send(json.dumps(message))
+            end = time.time() + 10
+            while time.time() < end:
+                reply = json.loads(ws.recv())
+                if reply.get("id") == next_id:
+                    return reply
+            raise TimeoutError(f"CDP timeout waiting for {method}")
+
+        version = cdp("Browser.getVersion").get("result", {})
+        user_agent = str(version.get("userAgent") or Http.DEFAULT_HEADERS["User-Agent"])
+        target = cdp("Target.createTarget", {"url": "about:blank"}).get("result", {})
+        target_id = target.get("targetId")
+        if not target_id:
+            return None
+        attached = cdp(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+        ).get("result", {})
+        session_id = attached.get("sessionId")
+        if not session_id:
+            return None
+
+        for method in ("Page.enable", "Runtime.enable", "Network.enable"):
+            cdp(method, session_id=session_id)
+        cdp("Page.navigate", {"url": site_url}, session_id=session_id)
+
+        cookies: dict[str, str] = {}
+        for _ in range(max(1, wait_seconds)):
+            try:
+                cookie_result = cdp("Network.getAllCookies", session_id=session_id).get("result", {})
+                cookie_list = cookie_result.get("cookies") or []
+                cookies = {
+                    str(c["name"]): str(c["value"])
+                    for c in cookie_list
+                    if "name" in c and "value" in c
+                }
+                if cookies.get("cf_clearance"):
+                    break
+                title_result = cdp(
+                    "Runtime.evaluate",
+                    {"expression": "document.title", "returnByValue": True},
+                    session_id=session_id,
+                ).get("result", {})
+                title = str(title_result.get("result", {}).get("value") or "")
+                if cookies and not any(
+                    marker in title.lower()
+                    for marker in ("just a moment", "attention required")
+                ):
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        return (user_agent, cookies) if cookies else None
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
+
+
 def _response_has_challenge(res: Any) -> bool:
     if res is None:
         return True
@@ -2445,9 +2608,13 @@ def _mint_basenotes_clearance():
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument("--disable-extensions")
+        options.set_argument("--disable-component-extensions-with-background-pages")
+        options.set_argument("--disable-background-networking")
         options.set_argument("--remote-allow-origins=*")
         options.set_argument(f"--user-data-dir={user_data_dir}")
-        if os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
+        headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
+        if headless:
             options.set_argument("--headless=new")
         options.auto_port()
 
@@ -2470,7 +2637,17 @@ def _mint_basenotes_clearance():
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
     except Exception as exc:
         _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-        return None
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        raw_minted = _mint_clearance_with_raw_cdp(
+            chromium_path=chromium_path,
+            site_url="https://basenotes.com/",
+            user_data_dir=user_data_dir,
+            wait_seconds=int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20"),
+            headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
+        )
+        if raw_minted is None:
+            return None
+        user_agent, cookies = raw_minted
     finally:
         if page is not None:
             try:
@@ -2615,6 +2792,9 @@ def _mint_fragrantica_clearance():
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument("--disable-extensions")
+        options.set_argument("--disable-component-extensions-with-background-pages")
+        options.set_argument("--disable-background-networking")
         options.set_argument("--remote-allow-origins=*")
         options.set_argument(f"--user-data-dir={user_data_dir}")
         headless_env = (
@@ -2644,7 +2824,20 @@ def _mint_fragrantica_clearance():
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
     except Exception as exc:
         _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-        return None
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        raw_minted = _mint_clearance_with_raw_cdp(
+            chromium_path=chromium_path,
+            site_url="https://www.fragrantica.com/",
+            user_data_dir=user_data_dir,
+            wait_seconds=int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20"),
+            headless=(
+                os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+                or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+            ).lower() in {"1", "true", "yes"},
+        )
+        if raw_minted is None:
+            return None
+        user_agent, cookies = raw_minted
     finally:
         if page is not None:
             try:
