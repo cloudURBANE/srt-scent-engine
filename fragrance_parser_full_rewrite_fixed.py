@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -2210,6 +2211,7 @@ _BASENOTES_CHALLENGE_MARKERS = (
 )
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
+_BASENOTES_LAST_MINT_ERROR: str | None = None
 
 
 def _response_has_challenge(res: Any) -> bool:
@@ -2269,6 +2271,7 @@ def _validate_basenotes_session(session: Any) -> bool:
 
 
 def _mint_basenotes_clearance():
+    global _BASENOTES_LAST_MINT_ERROR
     if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
         return None
 
@@ -2276,11 +2279,28 @@ def _mint_basenotes_clearance():
     try:
         options = ChromiumOptions()
         chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        if not (
+            chromium_path
+            and os.path.isfile(chromium_path)
+            and os.access(chromium_path, os.X_OK)
+        ):
+            chromium_path = ""
+            for candidate in (
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "chrome",
+            ):
+                resolved = shutil.which(candidate)
+                if resolved:
+                    chromium_path = resolved
+                    break
         if chromium_path:
             try:
                 options.set_browser_path(chromium_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
         options.set_argument("--window-position=-2000,-2000")
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
@@ -2306,7 +2326,8 @@ def _mint_basenotes_clearance():
             else {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
         )
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
-    except Exception:
+    except Exception as exc:
+        _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
         return None
     finally:
         if page is not None:
@@ -2319,7 +2340,10 @@ def _mint_basenotes_clearance():
         return None
     _save_basenotes_cache(user_agent, cookies)
     session = _new_basenotes_http_session(user_agent, cookies)
-    return session if session is not None and _validate_basenotes_session(session) else None
+    if session is not None and _validate_basenotes_session(session):
+        _BASENOTES_LAST_MINT_ERROR = None
+        return session
+    return None
 
 
 def get_basenotes_scraper(fallback: Any = None):
