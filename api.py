@@ -1675,8 +1675,10 @@ def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
 
             if ws_url:
                 result["ws_url_attempted"] = ws_url
+                import websocket  # type: ignore[import-not-found]
+
+                # Variant A: default headers (websocket-client auto-generates Origin)
                 try:
-                    import websocket  # type: ignore[import-not-found]
                     ws = websocket.create_connection(ws_url, timeout=5)
                     ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
                     reply = ws.recv()
@@ -1687,6 +1689,41 @@ def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
                 except Exception as exc:
                     result["ws_upgrade_ok"] = False
                     result["ws_upgrade_error"] = f"{type(exc).__name__}: {exc}"
+
+                # Variant B: suppress_origin=True (exactly what DrissionPage does
+                # at _base/driver.py:159). This tests the hypothesis that the WS
+                # 404 from DrissionPage is because Chromium rejects the upgrade
+                # when no Origin header is sent.
+                try:
+                    ws = websocket.create_connection(
+                        ws_url, timeout=5, suppress_origin=True
+                    )
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_suppress_origin_ok"] = True
+                    result["ws_suppress_origin_error"] = None
+                except Exception as exc:
+                    result["ws_suppress_origin_ok"] = False
+                    result["ws_suppress_origin_error"] = f"{type(exc).__name__}: {exc}"
+
+                # Variant C: explicit Origin header matching localhost. Tests
+                # whether passing a "valid" origin makes Chromium happy even
+                # when --remote-allow-origins=* is in effect.
+                try:
+                    ws = websocket.create_connection(
+                        ws_url,
+                        timeout=5,
+                        origin=f"http://127.0.0.1:{port}",
+                    )
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_explicit_origin_ok"] = True
+                    result["ws_explicit_origin_error"] = None
+                except Exception as exc:
+                    result["ws_explicit_origin_ok"] = False
+                    result["ws_explicit_origin_error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         result["spawn_error"] = f"{type(exc).__name__}: {exc}"
     finally:
