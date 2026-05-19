@@ -2441,6 +2441,7 @@ def _mint_clearance_with_raw_cdp(
                 )
                 if res.ok:
                     version_payload = res.json()
+                    result["error"] = None
                     break
             except Exception as exc:
                 result["error"] = f"{type(exc).__name__}: {exc}"
@@ -2518,9 +2519,29 @@ def _mint_clearance_with_raw_cdp(
             },
             session_id=session_id,
         )
+        cdp("Emulation.setAutomationOverride", {"enabled": False}, session_id=session_id)
         cdp(
-            "Emulation.setAutomationOverride",
-            {"enabled": False},
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+(() => {
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    window.chrome = window.chrome || { runtime: {} };
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters)
+      );
+    }
+  } catch (e) {}
+})();
+""",
+            },
             session_id=session_id,
         )
         result["step"] = "navigate"
@@ -2723,7 +2744,7 @@ def _mint_basenotes_clearance():
             chromium_path=chromium_path,
             site_url="https://basenotes.com/",
             user_data_dir=user_data_dir,
-            wait_seconds=int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20"),
+            wait_seconds=max(35, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
             headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
         )
         if raw_minted is None:
@@ -2915,7 +2936,7 @@ def _mint_fragrantica_clearance():
             chromium_path=chromium_path,
             site_url="https://www.fragrantica.com/",
             user_data_dir=user_data_dir,
-            wait_seconds=int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20"),
+            wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
             headless=(
                 os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
                 or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
