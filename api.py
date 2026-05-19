@@ -1663,7 +1663,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine._mint_basenotes_clearance)
     try:
-        session = future.result(timeout=30)
+        session = future.result(timeout=60)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = session is not None
         if session is not None:
@@ -1676,7 +1676,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     except concurrent.futures.TimeoutError:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 30 seconds"
+        result["error"] = "TimeoutError: mint attempt exceeded 60 seconds"
     except Exception as exc:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
@@ -1751,6 +1751,7 @@ def basenotes_diagnostics(
         "search_probe": _bn_diag_search_probe(query),
         "mint_attempt": _bn_diag_mint_attempt(mint),
         "engine_search_for_q": _bn_diag_engine_search(query),
+        "last_mint_error": getattr(engine, "_BASENOTES_LAST_MINT_ERROR", None),
     }
 
 

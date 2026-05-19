@@ -73,7 +73,7 @@ aptPkgs = ["chromium", "chromium-driver"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
-BASENOTES_CHROMIUM_PATH = "/usr/bin/chromium"
+BASENOTES_CHROMIUM_PATH = "/bin/chromium-browser"
 ```
 
 `_mint_basenotes_clearance()` reads `BASENOTES_CHROMIUM_PATH` and, when set,

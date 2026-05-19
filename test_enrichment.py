@@ -27,15 +27,18 @@ from __future__ import annotations
 
 import os
 import sys
+from http.cookies import SimpleCookie
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 import requests
 
 import api
 import db
+import mobile
 import scripts.enrichment_worker as enrichment_worker
 
 _FAILURES: list[str] = []
@@ -159,6 +162,80 @@ def test_no_db_contract() -> None:
     )
 
 
+def test_mobile_new_device_session_binding() -> None:
+    print("Mobile auth checks (no DATABASE_URL required):")
+    saved = {
+        "enabled": db.ENABLED,
+        "consume_magic_link": db.consume_magic_link,
+        "get_worker_account": db.get_worker_account,
+        "reset_pin_strikes": db.reset_pin_strikes,
+        "create_session": db.create_session,
+        "verify_pin": mobile.verify_pin,
+    }
+    created: dict[str, str] = {}
+    token = "test-magic-token"
+
+    def fake_create_session(
+        *, account_id: str, device_fingerprint: str, ttl_days: int
+    ) -> str:
+        created["account_id"] = account_id
+        created["device"] = device_fingerprint
+        created["ttl_days"] = str(ttl_days)
+        return "session-1"
+
+    try:
+        db.ENABLED = True
+        db.consume_magic_link = lambda token_hash: (
+            {"account_id": "account-1"}
+            if token_hash == mobile._hash_token(token)
+            else None
+        )
+        db.get_worker_account = lambda account_id: {
+            "id": account_id,
+            "email": "worker@example.test",
+            "pin_hash": "stored",
+            "disabled": False,
+            "locked_until": None,
+        }
+        db.reset_pin_strikes = lambda account_id: None
+        db.create_session = fake_create_session
+        mobile.verify_pin = lambda pin, stored: pin == "123456"
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/m/verify",
+                "headers": [],
+                "query_string": b"",
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 443),
+                "scheme": "https",
+            }
+        )
+        response = mobile.m_verify(request, token=token, pin="123456")
+
+        cookie = SimpleCookie()
+        for header, value in response.raw_headers:
+            if header.lower() == b"set-cookie":
+                cookie.load(value.decode("latin-1"))
+
+        check("mobile verify redirects after valid token and PIN", response.status_code == 302)
+        check("mobile verify emits a device cookie", mobile.DEVICE_COOKIE in cookie)
+        check("mobile verify emits a session cookie", mobile.SESSION_COOKIE in cookie)
+        check(
+            "new mobile session is bound to the emitted device cookie",
+            created.get("device") == cookie[mobile.DEVICE_COOKIE].value,
+        )
+    finally:
+        db.ENABLED = saved["enabled"]
+        db.consume_magic_link = saved["consume_magic_link"]
+        db.get_worker_account = saved["get_worker_account"]
+        db.reset_pin_strikes = saved["reset_pin_strikes"]
+        db.create_session = saved["create_session"]
+        mobile.verify_pin = saved["verify_pin"]
+
+
 # ---------------------------------------------------------------------------
 # DB-backed checks (only when DATABASE_URL is set)
 # ---------------------------------------------------------------------------
@@ -277,6 +354,7 @@ def test_db_lifecycle() -> None:
 
 def main() -> int:
     test_no_db_contract()
+    test_mobile_new_device_session_binding()
     if db.ENABLED:
         test_db_lifecycle()
     else:

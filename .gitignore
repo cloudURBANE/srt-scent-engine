@@ -6,3 +6,8 @@ venv/
 desktop.ini
 .cache/
 .black_sun_cache.json
+.claude/
+debug-*.log
+ipc_out.txt
+c*tmp*.json
+import rssandom.py

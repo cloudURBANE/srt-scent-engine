@@ -2296,6 +2296,11 @@ def _mint_basenotes_clearance():
                 if resolved:
                     chromium_path = resolved
                     break
+
+        if not chromium_path:
+            _BASENOTES_LAST_MINT_ERROR = "No Chromium binary discovered (env BASENOTES_CHROMIUM_PATH or common names in PATH)."
+            return None
+
         if chromium_path:
             try:
                 options.set_browser_path(chromium_path)
@@ -2305,6 +2310,7 @@ def _mint_basenotes_clearance():
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-blink-features=AutomationControlled")
         if os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
             options.set_argument("--headless=new")
         options.auto_port()
