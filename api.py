@@ -1475,6 +1475,7 @@ def _bn_diag_default_scraper() -> Any:
 
 def _bn_diag_chromium_binary() -> dict[str, Any]:
     import shutil
+    import subprocess
 
     names = [
         "chromium",
@@ -1488,7 +1489,68 @@ def _bn_diag_chromium_binary() -> dict[str, Any]:
         found = shutil.which(name)
         if found:
             break
-    return {"which": found, "tried": names}
+
+    env_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip() or None
+    binary = env_path or found
+
+    version_out: str | None = None
+    version_err: str | None = None
+    version_returncode: int | None = None
+    headless_out: str | None = None
+    headless_err: str | None = None
+    headless_returncode: int | None = None
+    spawn_error: str | None = None
+
+    if binary:
+        try:
+            proc = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            version_out = (proc.stdout or "").strip()[:500]
+            version_err = (proc.stderr or "").strip()[:500]
+            version_returncode = proc.returncode
+        except Exception as exc:
+            spawn_error = f"{type(exc).__name__}: {exc}"
+
+        try:
+            proc = subprocess.run(
+                [
+                    binary,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--user-data-dir=/tmp/chromium-diag",
+                    "--dump-dom",
+                    "about:blank",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            headless_out = (proc.stdout or "")[:500]
+            headless_err = (proc.stderr or "")[:1500]
+            headless_returncode = proc.returncode
+        except Exception as exc:
+            if spawn_error is None:
+                spawn_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "which": found,
+        "env_path": env_path,
+        "binary_used_for_probe": binary,
+        "tried": names,
+        "version_returncode": version_returncode,
+        "version_stdout": version_out,
+        "version_stderr": version_err,
+        "headless_dump_returncode": headless_returncode,
+        "headless_dump_stdout_first_500": headless_out,
+        "headless_dump_stderr_first_1500": headless_err,
+        "spawn_error": spawn_error,
+    }
 
 
 def _bn_diag_clearance_cache() -> dict[str, Any]:
