@@ -70,6 +70,10 @@ class UnifiedDetails:
     pros_cons: list[str] = field(default_factory=list)
     reviews: list[Review] = field(default_factory=list)
     derived_metrics: dict[str, Any] | None = None
+    # Diagnostic: per-source fetch errors keyed by short tag ("fg", "bn").
+    # Populated only when an HTTP fetch fails; worker uses these to
+    # distinguish bucket B (HTTP) from bucket C (parser) failures.
+    fetch_errors: dict[str, str] = field(default_factory=dict)
 
 @dataclass
 class UnifiedFragrance:
@@ -2164,7 +2168,26 @@ class Http:
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
     }
-    
+
+    # Thread-local diagnostic: the reason the last get() call returned None,
+    # so callers can surface "HTTP 403" / "Timeout" without re-fetching.
+    _LAST_ERROR = threading.local()
+
+    @staticmethod
+    def _record_error(exc: Exception | None) -> None:
+        if exc is None:
+            Http._LAST_ERROR.value = None
+            return
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status:
+            Http._LAST_ERROR.value = f"HTTP {status}"
+        else:
+            Http._LAST_ERROR.value = f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def last_error() -> str | None:
+        return getattr(Http._LAST_ERROR, "value", None)
+
     @staticmethod
     def get(
         scraper,
@@ -2181,11 +2204,13 @@ class Http:
         last_error: Exception | None = None
         for attempt in range(max(1, attempts)):
             if deadline and deadline.expired():
+                last_error = last_error or TimeoutError("deadline expired before attempt")
                 break
             try:
                 request_timeout = deadline.timeout(timeout) if deadline else timeout
                 res = scraper.get(url, timeout=request_timeout, headers=headers)
                 res.raise_for_status()
+                Http._record_error(None)
                 return res
             except Exception as exc:  # network parser must degrade cleanly
                 last_error = exc
@@ -2194,6 +2219,7 @@ class Http:
                 if deadline and deadline.remaining(0) is not None and deadline.remaining(0) <= sleep_seconds:
                     break
                 time.sleep(sleep_seconds)
+        Http._record_error(last_error)
         return None
 
 _BASENOTES_CACHE_FILE = Path(
@@ -2212,6 +2238,16 @@ _BASENOTES_CHALLENGE_MARKERS = (
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
 _BASENOTES_LAST_MINT_ERROR: str | None = None
+
+_FRAGRANTICA_CACHE_FILE = Path(
+    os.environ.get(
+        "FRAGRANTICA_CLEARANCE_CACHE",
+        str(Path(__file__).with_name(".fragrantica_clearance_cache.json")),
+    )
+)
+_FRAGRANTICA_SESSION_LOCK = threading.Lock()
+_FRAGRANTICA_SESSION = None
+_FRAGRANTICA_LAST_MINT_ERROR: str | None = None
 
 
 def _response_has_challenge(res: Any) -> bool:
@@ -2385,13 +2421,178 @@ def reset_basenotes_scraper(clear_cache: bool = False) -> None:
                 pass
 
 
+def _new_fragrantica_http_session(user_agent: str, cookies: dict[str, str]):
+    if curl_requests is None:
+        return None
+    session = curl_requests.Session(
+        impersonate=os.environ.get("FRAGRANTICA_CURL_IMPERSONATE", "chrome120")
+    )
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept": Http.DEFAULT_HEADERS["Accept"],
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": FragranticaEngine.BASE_URL if "FragranticaEngine" in globals() else "https://www.fragrantica.com/",
+    })
+    session.cookies.update(cookies)
+    return session
+
+
+def _load_fragrantica_cache() -> tuple[str, dict[str, str]] | None:
+    try:
+        with _FRAGRANTICA_CACHE_FILE.open("r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+        user_agent = str(cache.get("ua") or "").strip()
+        cookies = cache.get("cookies") or {}
+        if not user_agent or not isinstance(cookies, dict):
+            return None
+        return user_agent, {str(k): str(v) for k, v in cookies.items()}
+    except Exception:
+        return None
+
+
+def _save_fragrantica_cache(user_agent: str, cookies: dict[str, str]) -> None:
+    try:
+        _FRAGRANTICA_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _FRAGRANTICA_CACHE_FILE.open("w", encoding="utf-8") as handle:
+            json.dump({"ua": user_agent, "cookies": cookies}, handle)
+    except Exception:
+        pass
+
+
+def _validate_fragrantica_session(session: Any) -> bool:
+    try:
+        res = session.get("https://www.fragrantica.com/", timeout=5)
+        return int(getattr(res, "status_code", 0) or 0) == 200 and not _response_has_challenge(res)
+    except Exception:
+        return False
+
+
+def _mint_fragrantica_clearance():
+    global _FRAGRANTICA_LAST_MINT_ERROR
+    if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
+        return None
+
+    page = None
+    try:
+        options = ChromiumOptions()
+        chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        if not (
+            chromium_path
+            and os.path.isfile(chromium_path)
+            and os.access(chromium_path, os.X_OK)
+        ):
+            chromium_path = ""
+            for candidate in (
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "chrome",
+            ):
+                resolved = shutil.which(candidate)
+                if resolved:
+                    chromium_path = resolved
+                    break
+
+        if not chromium_path:
+            _FRAGRANTICA_LAST_MINT_ERROR = "No Chromium binary discovered (env BASENOTES_CHROMIUM_PATH or common names in PATH)."
+            return None
+
+        if chromium_path:
+            try:
+                options.set_browser_path(chromium_path)
+            except Exception as exc:
+                _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+        options.set_argument("--window-position=-2000,-2000")
+        options.set_argument("--mute-audio")
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-blink-features=AutomationControlled")
+        if os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
+            options.set_argument("--headless=new")
+        options.auto_port()
+
+        page = ChromiumPage(options)
+        page.get("https://www.fragrantica.com/")
+
+        wait_seconds = int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")
+        for _ in range(max(1, wait_seconds)):
+            title = str(getattr(page, "title", "") or "")
+            if not any(marker in title.lower() for marker in ("just a moment", "attention required")):
+                break
+            time.sleep(1)
+
+        cookie_data = page.cookies()
+        cookies = (
+            {str(c["name"]): str(c["value"]) for c in cookie_data if "name" in c and "value" in c}
+            if isinstance(cookie_data, list)
+            else {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
+        )
+        user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
+    except Exception as exc:
+        _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+        return None
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:
+                pass
+
+    if not cookies:
+        return None
+    _save_fragrantica_cache(user_agent, cookies)
+    session = _new_fragrantica_http_session(user_agent, cookies)
+    if session is not None and _validate_fragrantica_session(session):
+        _FRAGRANTICA_LAST_MINT_ERROR = None
+        return session
+    return None
+
+
+def get_fragrantica_scraper(fallback: Any = None, *, mint_clearance: bool = False):
+    global _FRAGRANTICA_SESSION
+    with _FRAGRANTICA_SESSION_LOCK:
+        if _FRAGRANTICA_SESSION is not None:
+            return _FRAGRANTICA_SESSION
+
+        cached = _load_fragrantica_cache()
+        if cached:
+            session = _new_fragrantica_http_session(*cached)
+            if session is not None and _validate_fragrantica_session(session):
+                _FRAGRANTICA_SESSION = session
+                return _FRAGRANTICA_SESSION
+
+        if mint_clearance:
+            minted = _mint_fragrantica_clearance()
+            if minted is not None:
+                _FRAGRANTICA_SESSION = minted
+                return _FRAGRANTICA_SESSION
+
+    return fallback
+
+
+def reset_fragrantica_scraper(clear_cache: bool = False) -> None:
+    global _FRAGRANTICA_SESSION
+    with _FRAGRANTICA_SESSION_LOCK:
+        _FRAGRANTICA_SESSION = None
+        if clear_cache:
+            try:
+                _FRAGRANTICA_CACHE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 class RoutedScraper:
-    def __init__(self, default_scraper: Any, basenotes_scraper: Any = None):
+    def __init__(self, default_scraper: Any, basenotes_scraper: Any = None, fragrantica_scraper: Any = None):
         self.default_scraper = default_scraper
         self._basenotes_scraper = basenotes_scraper
+        self._fragrantica_scraper = fragrantica_scraper
 
     def _for_url(self, url: str):
         host = (urlparse(url).netloc or "").lower()
+        if host.endswith("fragrantica.com"):
+            self._fragrantica_scraper = get_fragrantica_scraper(self._fragrantica_scraper or self.default_scraper)
+            return self._fragrantica_scraper or self.default_scraper
         if host.endswith("basenotes.com"):
             self._basenotes_scraper = get_basenotes_scraper(self._basenotes_scraper or self.default_scraper)
             return self._basenotes_scraper or self.default_scraper
@@ -2411,7 +2612,11 @@ def get_scraper():
         )
     else:
         default = requests.Session()
-    return RoutedScraper(default, get_basenotes_scraper(default))
+    return RoutedScraper(
+        default,
+        get_basenotes_scraper(default, mint_clearance=True),
+        get_fragrantica_scraper(default, mint_clearance=True),
+    )
 
 
 def draw_bar(pct: float | int | None, width: int = 20, color: str = G, empty_label: str = "No Data") -> str:
@@ -4267,6 +4472,9 @@ class FragranticaEngine:
             return
         res = Http.get(scraper, url, timeout=5.0, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
         if not res:
+            err = Http.last_error()
+            if err:
+                unified_details.fetch_errors["fg"] = err
             return
         soup = BeautifulSoup(res.content, "html.parser", from_encoding="utf-8")
 
@@ -4284,6 +4492,12 @@ class FragranticaEngine:
         for card_name, metrics in status_metric_cards.items():
             if metrics:
                 unified_details.frag_cards[card_name] = metrics
+
+        performance_card_names = set(FragranticaEngine.PERFORMANCE_CARD_NAMES.values())
+        status_performance_cards = {
+            name: rows for name, rows in status_metric_cards.items()
+            if name in performance_card_names and rows
+        }
 
 
         
