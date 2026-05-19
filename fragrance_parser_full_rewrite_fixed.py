@@ -26,6 +26,7 @@ import requests
 _DRISSION_ORIGIN_PATCH_ACTIVE = False
 _DRISSION_LAST_WS_CONNECT: dict[str, Any] | None = None
 _CLEARANCE_RAW_CDP_LAST_RESULT: dict[str, Any] | None = None
+_CHROMIUM_UA_RE = re.compile(r"(HeadlessChrome|Chrome)/([0-9.]+)")
 
 
 def _install_drission_websocket_origin_patch() -> None:
@@ -2402,9 +2403,13 @@ def _mint_clearance_with_raw_cdp(
         "--disable-extensions",
         "--disable-component-extensions-with-background-pages",
         "--disable-background-networking",
+        "--disable-infobars",
         "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
+        "--lang=en-US,en",
+        "--password-store=basic",
+        "--use-mock-keychain",
         f"--user-data-dir={user_data_dir}",
         "about:blank",
     ]
@@ -2476,7 +2481,13 @@ def _mint_clearance_with_raw_cdp(
 
         result["step"] = "browser_get_version"
         version = cdp("Browser.getVersion").get("result", {})
-        user_agent = str(version.get("userAgent") or Http.DEFAULT_HEADERS["User-Agent"])
+        reported_user_agent = str(version.get("userAgent") or "")
+        match = _CHROMIUM_UA_RE.search(reported_user_agent)
+        chrome_version = match.group(2) if match else "122.0.6261.69"
+        user_agent = (
+            f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
+        )
         result["step"] = "create_target"
         target = cdp("Target.createTarget", {"url": "about:blank"}).get("result", {})
         target_id = target.get("targetId")
@@ -2494,8 +2505,24 @@ def _mint_clearance_with_raw_cdp(
             return None
 
         result["step"] = "enable_domains"
-        for method in ("Page.enable", "Runtime.enable", "Network.enable"):
-            cdp(method, session_id=session_id)
+        cdp("Page.enable", session_id=session_id)
+        cdp("Runtime.enable", session_id=session_id)
+        cdp("Network.enable", session_id=session_id)
+        result["step"] = "set_user_agent"
+        cdp(
+            "Network.setUserAgentOverride",
+            {
+                "userAgent": user_agent,
+                "acceptLanguage": "en-US,en;q=0.9",
+                "platform": "Linux x86_64",
+            },
+            session_id=session_id,
+        )
+        cdp(
+            "Emulation.setAutomationOverride",
+            {"enabled": False},
+            session_id=session_id,
+        )
         result["step"] = "navigate"
         cdp("Page.navigate", {"url": site_url}, session_id=session_id)
 
