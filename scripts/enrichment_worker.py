@@ -291,6 +291,9 @@ def _canonical_fg_url(url: str) -> str:
     text = (url or "").strip()
     if not text:
         return ""
+    canonical = engine.FragranticaEngine.canonical_url(text)
+    if engine.FragranticaEngine.is_perfume_url(canonical):
+        return canonical.rstrip("/")
     if "://" in text:
         scheme, rest = text.split("://", 1)
         if "/" in rest:
@@ -451,7 +454,7 @@ def resolve_candidate(
     *,
     debug: bool = False,
 ) -> engine.UnifiedFragrance:
-    fg_url = str(job.get("fg_url") or "").strip()
+    fg_url = engine.FragranticaEngine.canonical_url(str(job.get("fg_url") or "").strip())
     if fg_url:
         return engine.UnifiedFragrance(
             name=str(job.get("name") or ""),
@@ -495,6 +498,7 @@ def fetch_payload(
 ) -> dict[str, Any]:
     if not candidate.frag_url:
         raise WorkerError("fg_url_missing_after_resolution", retryable=False)
+    candidate.frag_url = engine.FragranticaEngine.canonical_url(candidate.frag_url)
     try:
         details = _run_engine_call(
             lambda: engine.fetch_selected_details(scraper, candidate, detail_timeout),
@@ -507,6 +511,10 @@ def fetch_payload(
     if not isinstance(frag_cards, dict) or not frag_cards:
         retryable = bool(engine.FragranticaEngine.is_perfume_url(candidate.frag_url))
         fetch_errors = getattr(details, "fetch_errors", {}) or {}
+        parse_diagnostics = getattr(details, "parse_diagnostics", {}) or {}
+        fg_diag = parse_diagnostics.get("fg") if isinstance(parse_diagnostics, dict) else {}
+        if not isinstance(fg_diag, dict):
+            fg_diag = {}
         fg_err = fetch_errors.get("fg")
         url_shape_ok = engine.FragranticaEngine.is_perfume_url(candidate.frag_url)
         parts = [f"url_shape_ok={url_shape_ok}"]
@@ -514,6 +522,27 @@ def fetch_payload(
             parts.append(f"fg_fetch_error={fg_err}")
         else:
             parts.append("fg_fetch_error=none (parser produced no cards from fetched HTML)")
+        for key in (
+            "html_bytes",
+            "has_status_payload",
+            "status_decode_ok",
+            "challenge_detected",
+        ):
+            if key in fg_diag:
+                parts.append(f"{key}={fg_diag.get(key)}")
+        notes = getattr(details, "notes", None)
+        notes_count = fg_diag.get("notes_count")
+        if notes_count is None and notes is not None:
+            notes_count = (
+                len(getattr(notes, "top", []) or [])
+                + len(getattr(notes, "heart", []) or [])
+                + len(getattr(notes, "base", []) or [])
+                + len(getattr(notes, "flat", []) or [])
+            )
+        if notes_count is not None:
+            parts.append(f"notes_count={notes_count}")
+        if fg_diag.get("status_decode_error"):
+            parts.append(f"status_decode_error={fg_diag.get('status_decode_error')}")
         print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
         raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
@@ -606,7 +635,11 @@ def process_job(
         return False
     except WorkerError as exc:
         print(f"{index_label} Failed {label}: {exc.code}")
-        if config.debug and str(exc) != exc.code:
+        if exc.code == "api_unavailable" and str(exc) != exc.code:
+            detail = str(exc).split(":", 1)[-1].strip()
+            if detail:
+                print(f"{index_label} Server: {detail[:200]}")
+        elif config.debug and str(exc) != exc.code:
             print(f"{index_label} {exc}")
         if config.dry_run:
             print(f"{index_label} Dry run: would mark retryable={exc.retryable}")

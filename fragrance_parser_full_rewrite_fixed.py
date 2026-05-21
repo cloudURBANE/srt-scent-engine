@@ -142,6 +142,9 @@ class UnifiedDetails:
     # Populated only when an HTTP fetch fails; worker uses these to
     # distinguish bucket B (HTTP) from bucket C (parser) failures.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # Per-source parse/fetch diagnostics used by the worker when a fetched
+    # page yields no cards.
+    parse_diagnostics: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class UnifiedFragrance:
@@ -3634,13 +3637,16 @@ def bounded_parallel(
     jobs: dict[str, Callable[[], Any]],
     seconds: float,
     max_workers: int | None = None,
+    raise_on: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Run independent jobs under one shared wall-clock deadline."""
     results: dict[str, Any] = {}
+    raise_names = set(raise_on or [])
     executor = ThreadPoolExecutor(max_workers=max_workers or max(1, len(jobs)))
     future_to_name = {executor.submit(fn): name for name, fn in jobs.items()}
     deadline = time.monotonic() + max(0.0, seconds)
     pending = set(future_to_name)
+    raised: BaseException | None = None
     while pending:
         remaining = max(0.0, deadline - time.monotonic())
         if remaining <= 0:
@@ -3650,12 +3656,20 @@ def bounded_parallel(
             name = future_to_name[future]
             try:
                 results[name] = future.result(timeout=0)
-            except Exception:
+            except Exception as exc:
+                if name in raise_names:
+                    raised = exc
+                    pending.add(future)
+                    break
                 results[name] = None
+        if raised is not None:
+            break
     for future in pending:
         future.cancel()
         results.setdefault(future_to_name[future], None)
     executor.shutdown(wait=False, cancel_futures=True)
+    if raised is not None:
+        raise raised
     return results
 
 def run_budgeted_items(
@@ -4949,16 +4963,26 @@ class FragranticaEngine:
         href = html.unescape(href or "").strip()
         if not href:
             return ""
+        known_hosts = ("fragrantica.com", "www.fragrantica.com", "beta.fragrantica.com")
+        lower = href.lower()
+        if "://" not in href and any(
+            lower == host or lower.startswith(host + "/")
+            for host in known_hosts
+        ):
+            href = "https://" + href
         url = urljoin(FragranticaEngine.BASE_URL, href)
-        url = url.split("#", 1)[0].split("?", 1)[0]
-        url = url.replace("http://www.fragrantica.com", "https://www.fragrantica.com")
-        url = url.replace("http://fragrantica.com", "https://www.fragrantica.com")
-        url = url.replace("https://fragrantica.com", "https://www.fragrantica.com")
-        return url
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if host == "fragrantica.com" or host.endswith(".fragrantica.com"):
+            host = "www.fragrantica.com"
+        scheme = "https" if host.endswith("fragrantica.com") else (parsed.scheme or "https")
+        path = parsed.path or ""
+        return f"{scheme}://{host}{path}"
         
     @staticmethod
     def is_perfume_url(url: str) -> bool:
-        return bool(FragranticaEngine.PERFUME_URL_RE.match(url or ""))
+        canonical = FragranticaEngine.canonical_url(url)
+        return bool(FragranticaEngine.PERFUME_URL_RE.match(canonical or ""))
         
     @staticmethod
     def dedupe_key(url: str) -> str:
@@ -5020,23 +5044,40 @@ class FragranticaEngine:
     ) -> None:
         if not url:
             return
+        url = FragranticaEngine.canonical_url(url)
+        diag = unified_details.parse_diagnostics.setdefault("fg", {})
+        diag["url"] = url
         timeout = deadline.timeout(15.0) if deadline else 15.0
         res = Http.get(scraper, url, timeout=timeout, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
         if not res:
             err = Http.last_error()
             if err:
                 unified_details.fetch_errors["fg"] = err
+                diag["fetch_error"] = err
+            return
+        diag["http_status"] = int(getattr(res, "status_code", 0) or 0)
+        diag["html_bytes"] = len(getattr(res, "content", b"") or b"")
+        challenge_detected = _response_has_challenge(res)
+        diag["challenge_detected"] = bool(challenge_detected)
+        if challenge_detected:
+            unified_details.fetch_errors["fg"] = "challenge_page"
+            diag["fetch_error"] = "challenge_page"
             return
         soup = BeautifulSoup(res.content, "html.parser", from_encoding="utf-8")
 
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
+        diag["has_status_payload"] = bool(status_payload)
+        diag["status_decode_ok"] = False
 
         if status_payload:
-            
-            decoded_status = FragranticaEngine.decode_fragrantica_status_payload(status_payload, url)
-                
-            
+            try:
+                decoded_status = FragranticaEngine.decode_fragrantica_status_payload(status_payload, url)
+                diag["status_decode_ok"] = isinstance(decoded_status, dict)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                diag["status_decode_error"] = message
+                unified_details.fetch_errors["fg"] = f"status_decode_failed: {message}"
 
         status_metric_cards = FragranticaEngine.extract_status_metric_cards(decoded_status)
 
@@ -5154,6 +5195,13 @@ class FragranticaEngine:
 
         unified_details.pros_cons.extend(FragranticaEngine.extract_people_say(soup, unified_details.pros_cons))
         unified_details.reviews.extend(FragranticaEngine.extract_reviews(soup))
+        diag["frag_card_count"] = len(unified_details.frag_cards or {})
+        diag["notes_count"] = (
+            len(unified_details.notes.top)
+            + len(unified_details.notes.heart)
+            + len(unified_details.notes.base)
+            + len(unified_details.notes.flat)
+        )
 
     @staticmethod
     def extract_main_accords(soup: BeautifulSoup) -> list[dict[str, Any]]:
@@ -7160,7 +7208,7 @@ def fetch_selected_details(scraper, selected: UnifiedFragrance, detail_timeout: 
     }
     if selected.bn_url:
         jobs["bn"] = lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline)
-    bounded_parallel(jobs, seconds=detail_timeout, max_workers=len(jobs))
+    bounded_parallel(jobs, seconds=detail_timeout, max_workers=len(jobs), raise_on={"fg"})
     normalize_notes(details.notes)
     details.reviews = dedupe_reviews(details.reviews)
     # FG + BN detail synchronization is complete; attach the normalized,
