@@ -430,9 +430,12 @@ def _run_engine_call(fn, *, debug: bool):
     if debug:
         return fn()
     captured = io.StringIO()
-    with contextlib.redirect_stdout(captured):
-        result = fn()
-    return result
+    try:
+        with contextlib.redirect_stdout(captured):
+            return fn()
+    except Exception:
+        _print_engine_lines(captured.getvalue())
+        raise
 
 
 def _print_engine_lines(captured_text: str) -> None:
@@ -511,8 +514,7 @@ def fetch_payload(
             parts.append(f"fg_fetch_error={fg_err}")
         else:
             parts.append("fg_fetch_error=none (parser produced no cards from fetched HTML)")
-        if debug:
-            print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
+        print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
         raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
     identity = _specific_identity(candidate)
@@ -610,7 +612,7 @@ def process_job(
             print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
             return False
         try:
-            client.fail_job(job_id, exc.code, exc.retryable)
+            client.fail_job(job_id, str(exc), exc.retryable)
             print(f"{index_label} Marked {'retryable' if exc.retryable else 'non-retryable'} failure")
         except WorkerError as fail_exc:
             print(f"{index_label} Could not report failure: {fail_exc.code}")
@@ -674,6 +676,9 @@ def process_pending(
         return 0
 
     scraper = engine.get_scraper()
+    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    if not engine._validate_fragrantica_session(fg_scraper):
+        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
     engine_args = _build_engine_args()
     completed = 0
     total = len(jobs)
@@ -748,6 +753,9 @@ def warm_list(client: ApiClient, config: WorkerConfig, path: str, stop: StopCont
         raise SystemExit(f"No queries found in {path!r}.")
 
     scraper = engine.get_scraper()
+    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    if not engine._validate_fragrantica_session(fg_scraper):
+        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
     engine_args = _build_engine_args()
     completed = 0
     print(f"Warm list: {len(queries)} queries from {path}")

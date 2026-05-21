@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+import requests
 import argparse
 import html
 import base64
@@ -2266,6 +2267,8 @@ class Http:
         sleep_seconds: float = 0.25,
     ):
         headers = dict(Http.DEFAULT_HEADERS)
+        if type(scraper).__name__ == "Session" or getattr(scraper, "headers", {}).get("User-Agent"):
+            headers = {}
         if referer:
             headers["Referer"] = referer
         last_error: Exception | None = None
@@ -5017,7 +5020,8 @@ class FragranticaEngine:
     ) -> None:
         if not url:
             return
-        res = Http.get(scraper, url, timeout=5.0, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
+        timeout = deadline.timeout(15.0) if deadline else 15.0
+        res = Http.get(scraper, url, timeout=timeout, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
         if not res:
             err = Http.last_error()
             if err:
@@ -7151,10 +7155,12 @@ def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
 def fetch_selected_details(scraper, selected: UnifiedFragrance, detail_timeout: float) -> UnifiedDetails:
     details = UnifiedDetails(notes=NotesList())
     deadline = Deadline(detail_timeout)
-    bounded_parallel({
-        "bn": lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline),
+    jobs = {
         "fg": lambda: FragranticaEngine.fetch_details(scraper, selected.frag_url, details, deadline=deadline),
-    }, seconds=detail_timeout, max_workers=2)
+    }
+    if selected.bn_url:
+        jobs["bn"] = lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline)
+    bounded_parallel(jobs, seconds=detail_timeout, max_workers=len(jobs))
     normalize_notes(details.notes)
     details.reviews = dedupe_reviews(details.reviews)
     # FG + BN detail synchronization is complete; attach the normalized,
