@@ -11,3 +11,7 @@ debug-*.log
 ipc_out.txt
 c*tmp*.json
 import rssandom.py
+.fragrantica_clearance_cache.json
+out/
+side_effect_probe.html
+test_fg_status_decode.py
