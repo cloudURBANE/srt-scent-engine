@@ -41,6 +41,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -116,6 +117,25 @@ _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
 # offline worker only -- it is never sent to the frontend and is never logged.
 # Unset => the worker endpoints are unconfigured and return 503.
 _ENRICHMENT_WORKER_TOKEN = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
+
+
+def _require_clearance_token(authorization: str | None = Header(default=None)) -> None:
+    if not _ENRICHMENT_WORKER_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Clearance endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset).",
+        )
+    expected = f"Bearer {_ENRICHMENT_WORKER_TOKEN}"
+    if not hmac.compare_digest(authorization or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
+
+
+class ClearanceCookieRequest(BaseModel):
+    user_agent: str
+    cookie_header: str | None = None
+    cookies: dict[str, str] | None = None
+    validate_session: bool = True
+
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
@@ -1587,11 +1607,16 @@ def _bn_diag_imports() -> dict[str, dict[str, Any]]:
         and getattr(engine, "ChromiumPage", None) is not None
     )
     drission_module = None
+    drission_driver_module = None
     if drission_available:
         try:
             drission_module = __import__("DrissionPage")
         except Exception:
             drission_module = None
+        try:
+            import DrissionPage._base.driver as drission_driver_module  # type: ignore[import-not-found]
+        except Exception:
+            drission_driver_module = None
 
     return {
         "cloudscraper": {
@@ -1605,6 +1630,19 @@ def _bn_diag_imports() -> dict[str, dict[str, Any]]:
         "DrissionPage": {
             "available": drission_available,
             "version": _bn_diag_package_version("DrissionPage", drission_module),
+            "force_origin_env": os.environ.get("DRISSION_FORCE_ORIGIN") or None,
+            "origin_patch_active": bool(
+                getattr(engine, "_DRISSION_ORIGIN_PATCH_ACTIVE", False)
+            ),
+            "driver_create_connection_patched": bool(
+                drission_driver_module is not None
+                and getattr(
+                    getattr(drission_driver_module, "create_connection", None),
+                    "_srt_forces_origin",
+                    False,
+                )
+            ),
+            "last_ws_connect": getattr(engine, "_DRISSION_LAST_WS_CONNECT", None),
         },
     }
 
@@ -1619,6 +1657,7 @@ def _bn_diag_default_scraper() -> Any:
 
 def _bn_diag_chromium_binary() -> dict[str, Any]:
     import shutil
+    import subprocess
 
     names = [
         "chromium",
@@ -1632,7 +1671,302 @@ def _bn_diag_chromium_binary() -> dict[str, Any]:
         found = shutil.which(name)
         if found:
             break
-    return {"which": found, "tried": names}
+
+    env_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip() or None
+    binary = env_path or found
+
+    version_out: str | None = None
+    version_err: str | None = None
+    version_returncode: int | None = None
+    headless_out: str | None = None
+    headless_err: str | None = None
+    headless_returncode: int | None = None
+    spawn_error: str | None = None
+
+    if binary:
+        try:
+            proc = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            version_out = (proc.stdout or "").strip()[:500]
+            version_err = (proc.stderr or "").strip()[:500]
+            version_returncode = proc.returncode
+        except Exception as exc:
+            spawn_error = f"{type(exc).__name__}: {exc}"
+
+        try:
+            proc = subprocess.run(
+                [
+                    binary,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--user-data-dir=/tmp/chromium-diag",
+                    "--dump-dom",
+                    "about:blank",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            headless_out = (proc.stdout or "")[:500]
+            headless_err = (proc.stderr or "")[:1500]
+            headless_returncode = proc.returncode
+        except Exception as exc:
+            if spawn_error is None:
+                spawn_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "which": found,
+        "env_path": env_path,
+        "binary_used_for_probe": binary,
+        "tried": names,
+        "version_returncode": version_returncode,
+        "version_stdout": version_out,
+        "version_stderr": version_err,
+        "headless_dump_returncode": headless_returncode,
+        "headless_dump_stdout_first_500": headless_out,
+        "headless_dump_stderr_first_1500": headless_err,
+        "spawn_error": spawn_error,
+    }
+
+
+def _bn_diag_kill_orphan_chromiums() -> dict[str, Any]:
+    """Kill any leftover chromium processes from previous failed mint attempts.
+
+    DrissionPage's mint raises during ChromiumPage(options) construction when
+    the WS handshake fails, which leaves the spawned chromium process orphaned
+    (the mint's finally only calls page.quit() if `page` was bound, but the
+    exception happens before assignment). On Railway these orphans accumulate
+    across mint=1 calls and wedge subsequent chromium spawns. Delete this block
+    once the clearance gap is resolved.
+    """
+    import subprocess
+
+    info: dict[str, Any] = {"ran": True, "killed_pids": [], "error": None}
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        pids = [int(p) for p in proc.stdout.split() if p.strip().isdigit()]
+        my_pid = os.getpid()
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, 9)
+                info["killed_pids"].append(pid)
+            except Exception as exc:
+                info["error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
+    """Spawn chromium with --remote-debugging-port=N directly and probe CDP.
+
+    Bypasses DrissionPage entirely so we can tell whether the WS 404 we get from
+    /api/diagnostics/basenotes?mint=1 is a DrissionPage URL-construction bug or
+    a chromium-side problem (port closed, /json/version returns garbage, WS
+    upgrade actually 404s, etc.). Delete this block once the clearance gap is
+    resolved.
+    """
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+    import time
+
+    import requests  # transitive dep via engine
+
+    result: dict[str, Any] = {
+        "ran": False,
+        "binary": None,
+        "port": None,
+        "spawn_pid": None,
+        "spawn_exit_code": None,
+        "port_open_after_wait": None,
+        "wait_elapsed_ms": None,
+        "json_version_status": None,
+        "json_version_body_first_500": None,
+        "json_list_status": None,
+        "json_list_body_first_500": None,
+        "ws_url_attempted": None,
+        "ws_upgrade_ok": None,
+        "ws_upgrade_error": None,
+        "stderr_tail": None,
+    }
+
+    binary = (
+        os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+    )
+    result["binary"] = binary
+    if not binary:
+        return result
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    finally:
+        sock.close()
+    result["port"] = port
+
+    user_data_dir = tempfile.mkdtemp(prefix="bn-rawcdp-")
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        result["ran"] = True
+        proc = subprocess.Popen(
+            [
+                binary,
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--mute-audio",
+                f"--user-data-dir={user_data_dir}",
+                f"--remote-debugging-port={port}",
+                "--remote-allow-origins=*",
+                "about:blank",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        result["spawn_pid"] = proc.pid
+
+        start = time.time()
+        port_open = False
+        deadline = start + 10.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    port_open = True
+                    break
+            except OSError:
+                time.sleep(0.2)
+        result["port_open_after_wait"] = port_open
+        result["wait_elapsed_ms"] = int((time.time() - start) * 1000)
+
+        if port_open:
+            import json as _json
+            try:
+                r = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=5)
+                result["json_version_status"] = r.status_code
+                result["json_version_body_first_500"] = r.text[:500]
+                ws_url = None
+                try:
+                    payload = r.json()
+                    ws_url = payload.get("webSocketDebuggerUrl")
+                except Exception:
+                    ws_url = None
+            except Exception as exc:
+                result["json_version_status"] = f"ERR: {type(exc).__name__}: {exc}"
+                ws_url = None
+
+            try:
+                r2 = requests.get(f"http://127.0.0.1:{port}/json", timeout=5)
+                result["json_list_status"] = r2.status_code
+                result["json_list_body_first_500"] = r2.text[:500]
+                if not ws_url:
+                    try:
+                        lst = r2.json()
+                        if isinstance(lst, list) and lst:
+                            ws_url = lst[0].get("webSocketDebuggerUrl")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                result["json_list_status"] = f"ERR: {type(exc).__name__}: {exc}"
+
+            if ws_url:
+                result["ws_url_attempted"] = ws_url
+                import websocket  # type: ignore[import-not-found]
+
+                # Variant A: default headers (websocket-client auto-generates Origin)
+                try:
+                    ws = websocket.create_connection(ws_url, timeout=5)
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_upgrade_ok"] = True
+                    result["ws_upgrade_error"] = None
+                    result["ws_first_reply_first_500"] = str(reply)[:500]
+                except Exception as exc:
+                    result["ws_upgrade_ok"] = False
+                    result["ws_upgrade_error"] = f"{type(exc).__name__}: {exc}"
+
+                # Variant B: suppress_origin=True (exactly what DrissionPage does
+                # at _base/driver.py:159). This tests the hypothesis that the WS
+                # 404 from DrissionPage is because Chromium rejects the upgrade
+                # when no Origin header is sent.
+                try:
+                    ws = websocket.create_connection(
+                        ws_url, timeout=5, suppress_origin=True
+                    )
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_suppress_origin_ok"] = True
+                    result["ws_suppress_origin_error"] = None
+                except Exception as exc:
+                    result["ws_suppress_origin_ok"] = False
+                    result["ws_suppress_origin_error"] = f"{type(exc).__name__}: {exc}"
+
+                # Variant C: explicit Origin header matching localhost. Tests
+                # whether passing a "valid" origin makes Chromium happy even
+                # when --remote-allow-origins=* is in effect.
+                try:
+                    ws = websocket.create_connection(
+                        ws_url,
+                        timeout=5,
+                        origin=f"http://127.0.0.1:{port}",
+                    )
+                    ws.send(_json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    reply = ws.recv()
+                    ws.close()
+                    result["ws_explicit_origin_ok"] = True
+                    result["ws_explicit_origin_error"] = None
+                except Exception as exc:
+                    result["ws_explicit_origin_ok"] = False
+                    result["ws_explicit_origin_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        result["spawn_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
+            result["spawn_exit_code"] = proc.returncode
+            try:
+                err = proc.stderr.read() if proc.stderr else b""
+                result["stderr_tail"] = err.decode("utf-8", errors="replace")[-1500:]
+            except Exception:
+                pass
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return result
 
 
 def _bn_diag_clearance_cache() -> dict[str, Any]:
@@ -1663,6 +1997,9 @@ def _bn_diag_clearance_cache() -> dict[str, Any]:
     return {
         "configured_path": configured_path,
         "env_override": os.environ.get("BASENOTES_CLEARANCE_CACHE") or None,
+        "env_user_agent_present": bool(os.environ.get("BASENOTES_CLEARANCE_UA")),
+        "env_cookie_header_present": bool(os.environ.get("BASENOTES_CLEARANCE_COOKIE_HEADER")),
+        "env_cookies_json_present": bool(os.environ.get("BASENOTES_CLEARANCE_COOKIES_JSON")),
         "exists": exists,
         "size_bytes": size_bytes,
         "user_agent_present": user_agent_present,
@@ -1807,7 +2144,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine._mint_basenotes_clearance)
     try:
-        session = future.result(timeout=60)
+        session = future.result(timeout=90)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = session is not None
         if session is not None:
@@ -1820,7 +2157,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
     except concurrent.futures.TimeoutError:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 60 seconds"
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
     except Exception as exc:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
@@ -1864,6 +2201,61 @@ def _bn_diag_engine_search(query: str) -> dict[str, Any]:
     return result
 
 
+def _coerce_clearance_payload(payload: ClearanceCookieRequest) -> tuple[str, dict[str, str]]:
+    user_agent = str(payload.user_agent or "").strip()
+    cookies = {
+        str(k).strip(): str(v)
+        for k, v in (payload.cookies or {}).items()
+        if str(k).strip()
+    }
+    if not cookies and payload.cookie_header:
+        cookies = engine._parse_cookie_header(payload.cookie_header)
+    if not user_agent:
+        raise HTTPException(status_code=400, detail="user_agent is required.")
+    if not cookies:
+        raise HTTPException(status_code=400, detail="cookies or cookie_header is required.")
+    return user_agent, cookies
+
+
+def _install_manual_clearance(source: str, payload: ClearanceCookieRequest) -> dict[str, Any]:
+    user_agent, cookies = _coerce_clearance_payload(payload)
+    if source == "basenotes":
+        engine.reset_basenotes_scraper(clear_cache=True)
+        engine._save_basenotes_cache(user_agent, cookies)
+        session = engine._new_basenotes_http_session(user_agent, cookies)
+        validated = (
+            bool(engine._validate_basenotes_session(session))
+            if payload.validate_session and session is not None
+            else None
+        )
+        if validated:
+            engine._BASENOTES_SESSION = session
+            engine._BASENOTES_LAST_MINT_ERROR = None
+    elif source == "fragrantica":
+        engine.reset_fragrantica_scraper(clear_cache=True)
+        engine._save_fragrantica_cache(user_agent, cookies)
+        session = engine._new_fragrantica_http_session(user_agent, cookies)
+        validated = (
+            bool(engine._validate_fragrantica_session(session))
+            if payload.validate_session and session is not None
+            else None
+        )
+        if validated:
+            engine._FRAGRANTICA_SESSION = session
+            engine._FRAGRANTICA_LAST_MINT_ERROR = None
+    else:
+        raise HTTPException(status_code=400, detail="source must be basenotes or fragrantica.")
+
+    return {
+        "source": source,
+        "saved": True,
+        "validated": validated,
+        "cookie_count": len(cookies),
+        "has_cf_clearance": "cf_clearance" in cookies,
+        "user_agent_present": bool(user_agent),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Basenotes diagnostics (TEMPORARY -- remove after Basenotes/Railway clearance
 # gap is resolved).
@@ -1882,6 +2274,292 @@ def _bn_diag_engine_search(query: str) -> dict[str, Any]:
 def basenotes_diagnostics(
     q: str = Query("xerjoff", min_length=1),
     mint: bool = Query(False),
+    probe: bool = Query(False),
+    kill_orphans: bool = Query(False),
+) -> dict[str, Any]:
+    query = q.strip()
+
+    # Run orphan-kill BEFORE either probe/mint so the container starts each call
+    # from a clean process table. Without this, a failed mint leaves chromium
+    # zombies that wedge subsequent spawns.
+    orphan_info: dict[str, Any] = (
+        _bn_diag_kill_orphan_chromiums()
+        if (kill_orphans or probe or mint)
+        else {"skipped": "set kill_orphans=1, probe=1, or mint=1 to run"}
+    )
+
+    raw_info: dict[str, Any] = (
+        _bn_diag_raw_cdp_probe()
+        if probe
+        else {"skipped": "set probe=1 to spawn chromium directly (independent of mint)"}
+    )
+
+    mint_info = _bn_diag_mint_attempt(mint)
+    return {
+        "query": query,
+        "imports": _bn_diag_imports(),
+        "chromium_binary": _bn_diag_chromium_binary(),
+        "orphan_chromium_cleanup": orphan_info,
+        "raw_cdp_probe": raw_info,
+        "clearance_cache": _bn_diag_clearance_cache(),
+        "session_state": _bn_diag_session_state(),
+        "direct_probe": _bn_diag_direct_probe(),
+        "search_probe": _bn_diag_search_probe(query),
+        "mint_attempt": mint_info,
+        "raw_cdp_mint_result": getattr(engine, "_CLEARANCE_RAW_CDP_LAST_RESULT", None),
+        "engine_search_for_q": _bn_diag_engine_search(query),
+        "last_mint_error": getattr(engine, "_BASENOTES_LAST_MINT_ERROR", None),
+    }
+
+
+@app.post(
+    "/api/diagnostics/basenotes/clearance",
+    dependencies=[Depends(_require_clearance_token)],
+)
+def install_basenotes_clearance(payload: ClearanceCookieRequest) -> dict[str, Any]:
+    return _install_manual_clearance("basenotes", payload)
+
+
+# ---------------------------------------------------------------------------
+# Fragrantica diagnostics. Mirrors /api/diagnostics/basenotes for the FG-side
+# clearance pipeline. Cloudflare blocks Railway's datacenter IP on
+# fragrantica.com the same way it blocks basenotes.com; the engine now has a
+# parallel _mint_fragrantica_clearance / _FRAGRANTICA_SESSION path, and this
+# endpoint is the one-shot trigger to mint clearance on the Railway box (cache
+# file is written to disk; subsequent normal requests reuse it). Like the BN
+# diagnostic, mint=1 is what actually runs Chromium -- without it the endpoint
+# is strictly read-only.
+# ---------------------------------------------------------------------------
+
+
+def _fg_diag_clearance_cache() -> dict[str, Any]:
+    cache_file = getattr(engine, "_FRAGRANTICA_CACHE_FILE", None)
+    configured_path = str(cache_file) if cache_file is not None else ""
+    exists = False
+    size_bytes: int | None = None
+    try:
+        exists = bool(cache_file is not None and cache_file.exists())
+        size_bytes = int(cache_file.stat().st_size) if exists else None
+    except Exception:
+        exists = False
+        size_bytes = None
+
+    cached = None
+    try:
+        cached = engine._load_fragrantica_cache()
+    except Exception:
+        cached = None
+
+    user_agent_present = False
+    cookie_count: int | None = None
+    if cached:
+        user_agent, cookies = cached
+        user_agent_present = bool(str(user_agent or "").strip())
+        cookie_count = len(cookies) if isinstance(cookies, dict) else None
+
+    return {
+        "configured_path": configured_path,
+        "env_override": os.environ.get("FRAGRANTICA_CLEARANCE_CACHE") or None,
+        "env_user_agent_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_UA")),
+        "env_cookie_header_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_COOKIE_HEADER")),
+        "env_cookies_json_present": bool(os.environ.get("FRAGRANTICA_CLEARANCE_COOKIES_JSON")),
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "user_agent_present": user_agent_present,
+        "cookie_count": cookie_count,
+    }
+
+
+def _fg_diag_session_state() -> dict[str, Any]:
+    import time as _time
+
+    session = getattr(engine, "_FRAGRANTICA_SESSION", None)
+    if session is None:
+        return {
+            "active": False,
+            "validated_now": None,
+            "validation_elapsed_ms": None,
+        }
+
+    started = _time.monotonic()
+    try:
+        validated = bool(engine._validate_fragrantica_session(session))
+    except Exception:
+        validated = False
+    return {
+        "active": True,
+        "validated_now": validated,
+        "validation_elapsed_ms": _bn_diag_elapsed_ms(started),
+    }
+
+
+def _fg_diag_direct_probe() -> dict[str, Any]:
+    import time as _time
+
+    url = "https://www.fragrantica.com/"
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "response_server_header": None,
+        "cf_ray_present": False,
+        "elapsed_ms": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        res = _bn_diag_default_scraper().get(url, timeout=10)
+        headers = _bn_diag_headers(res)
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "response_server_header": headers.get("Server"),
+                "cf_ray_present": _bn_diag_cf_ray_present(headers),
+                "elapsed_ms": _bn_diag_elapsed_ms(started),
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _fg_diag_search_probe(query: str) -> dict[str, Any]:
+    import time as _time
+    from urllib.parse import quote as _quote
+
+    url = engine.FragranticaEngine.SEARCH_URL.format(query=_quote(query))
+    result: dict[str, Any] = {
+        "url": url,
+        "status_code": None,
+        "body_length": None,
+        "challenge_detected": None,
+        "elapsed_ms": None,
+        "fragrantica_perfume_anchor_count": None,
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        deadline = engine.Deadline(10)
+        res = engine.Http.get(
+            scraper,
+            url,
+            timeout=10,
+            referer=engine.FragranticaEngine.BASE_URL,
+            deadline=deadline,
+            attempts=1,
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        if res is None:
+            return result
+
+        body = _bn_diag_response_text(res)
+        try:
+            soup = engine.BeautifulSoup(body, "html.parser")
+            anchor_count = sum(
+                1
+                for anchor in soup.find_all("a", href=True)
+                if "/perfume/" in str(anchor.get("href", ""))
+            )
+        except Exception:
+            anchor_count = None
+
+        result.update(
+            {
+                "status_code": int(getattr(res, "status_code", 0) or 0),
+                "body_length": _bn_diag_response_length(res),
+                "challenge_detected": bool(engine._response_has_challenge(res)),
+                "fragrantica_perfume_anchor_count": anchor_count,
+            }
+        )
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
+    import concurrent.futures
+    import time as _time
+
+    result: dict[str, Any] = {
+        "ran": bool(mint),
+        "success": None,
+        "elapsed_ms": None,
+        "error": None,
+        "session_validated_after_mint": None,
+    }
+    if not mint:
+        return result
+
+    started = _time.monotonic()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(engine._mint_fragrantica_clearance)
+    try:
+        session = future.result(timeout=90)
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = session is not None
+        if session is not None:
+            try:
+                result["session_validated_after_mint"] = bool(
+                    engine._validate_fragrantica_session(session)
+                )
+            except Exception:
+                result["session_validated_after_mint"] = False
+    except concurrent.futures.TimeoutError:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["success"] = False
+        result["error"] = _bn_diag_error(exc)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
+def _fg_diag_engine_search(query: str) -> dict[str, Any]:
+    import time as _time
+
+    result: dict[str, Any] = {
+        "row_count": 0,
+        "elapsed_ms": 0,
+        "sample_rows": [],
+        "error": None,
+    }
+    started = _time.monotonic()
+    try:
+        scraper = engine.get_scraper()
+        rows = engine.FragranticaEngine.extract_search_data(
+            scraper,
+            query,
+            deadline=engine.Deadline(10),
+        )
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["row_count"] = len(rows)
+        result["sample_rows"] = [
+            {
+                "name": getattr(row, "name", ""),
+                "brand": getattr(row, "brand", ""),
+                "frag_url": getattr(row, "frag_url", None),
+            }
+            for row in rows[:3]
+        ]
+    except Exception as exc:
+        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+        result["error"] = _bn_diag_error(exc)
+    return result
+
+
+@app.get("/api/diagnostics/fragrantica")
+def fragrantica_diagnostics(
+    q: str = Query("dior sauvage", min_length=1),
+    mint: bool = Query(False),
 ) -> dict[str, Any]:
     query = q.strip()
 
@@ -1889,14 +2567,22 @@ def basenotes_diagnostics(
         "query": query,
         "imports": _bn_diag_imports(),
         "chromium_binary": _bn_diag_chromium_binary(),
-        "clearance_cache": _bn_diag_clearance_cache(),
-        "session_state": _bn_diag_session_state(),
-        "direct_probe": _bn_diag_direct_probe(),
-        "search_probe": _bn_diag_search_probe(query),
-        "mint_attempt": _bn_diag_mint_attempt(mint),
-        "engine_search_for_q": _bn_diag_engine_search(query),
-        "last_mint_error": getattr(engine, "_BASENOTES_LAST_MINT_ERROR", None),
+        "clearance_cache": _fg_diag_clearance_cache(),
+        "session_state": _fg_diag_session_state(),
+        "direct_probe": _fg_diag_direct_probe(),
+        "search_probe": _fg_diag_search_probe(query),
+        "mint_attempt": _fg_diag_mint_attempt(mint),
+        "engine_search_for_q": _fg_diag_engine_search(query),
+        "last_mint_error": getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None),
     }
+
+
+@app.post(
+    "/api/diagnostics/fragrantica/clearance",
+    dependencies=[Depends(_require_clearance_token)],
+)
+def install_fragrantica_clearance(payload: ClearanceCookieRequest) -> dict[str, Any]:
+    return _install_manual_clearance("fragrantica", payload)
 
 
 def _jsonable(value: Any) -> Any:
@@ -2456,15 +3142,69 @@ def _apply_fg_detail_cache(
     return _hydrate_details_from_entry(details, entry)
 
 
+def _candidate_from_source_url(source_url: str) -> engine.UnifiedFragrance:
+    url = (source_url or "").strip()
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'id' or 'source_url' is required.",
+        )
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        raise HTTPException(
+            status_code=400,
+            detail="source_url must be an http(s) Basenotes or Fragrantica URL.",
+        )
+    is_basenotes = host == "basenotes.com" or host.endswith(".basenotes.com")
+    is_fragrantica = host == "fragrantica.com" or host.endswith(".fragrantica.com")
+    if not (is_basenotes or is_fragrantica):
+        raise HTTPException(
+            status_code=400,
+            detail="source_url must identify a Basenotes or Fragrantica fragrance page.",
+        )
+    bn_url = url if is_basenotes else ""
+    frag_url = url if is_fragrantica else ""
+    selected = engine.UnifiedFragrance(
+        name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
+    )
+    if frag_url:
+        entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
+        if entry and entry.get("quality_status") == "complete":
+            _fill_selected_identity(selected, entry)
+        elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
+            json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
+            if json_entry:
+                _fill_selected_identity(selected, json_entry)
+        if not selected.name:
+            selected.name = engine.FragranticaEngine.name_from_url(frag_url)
+        if not selected.brand:
+            selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+    return selected
+
+
 def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
     """Reconstruct the engine candidate from the detail request.
 
     Prefers the opaque `id` token (carries both source URLs). Falls back to a
     bare `source_url`, routed to bn_url/frag_url by domain.
     """
-    if req.id:
+    id_text = (req.id or "").strip()
+    if id_text.startswith("source:"):
+        selected = _candidate_from_source_url(id_text[len("source:") :])
+    elif id_text.startswith(("catalog:", "dataset:", "local:")):
+        prefix = id_text.split(":", 1)[0]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"id '{prefix}:...' routes to the local Express API at "
+                "/api/fragrances/details on the api-server, not to this "
+                "engine; send a source_url or call the app details endpoint."
+            ),
+        )
+    elif id_text:
         try:
-            data = _decode_id(req.id)
+            data = _decode_id(id_text)
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"Invalid 'id' token: {exc}"
@@ -2477,30 +3217,7 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
             frag_url=data.get("fg", ""),
         )
     else:
-        url = (req.source_url or "").strip()
-        if not url:
-            raise HTTPException(
-                status_code=400,
-                detail="Either 'id' or 'source_url' is required.",
-            )
-        lowered = url.lower()
-        bn_url = url if "basenotes" in lowered else ""
-        frag_url = url if "fragrantica" in lowered or not bn_url else ""
-        selected = engine.UnifiedFragrance(
-            name="", brand="", year="", bn_url=bn_url, frag_url=frag_url
-        )
-        if frag_url:
-            entry = db.lookup_detail_cache(_canonical_fg_url(frag_url))
-            if entry and entry.get("quality_status") == "complete":
-                _fill_selected_identity(selected, entry)
-            elif _ALLOW_BUNDLED_FG_DETAIL_CACHE:
-                json_entry = _load_fg_detail_cache().get(_canonical_fg_url(frag_url))
-                if json_entry:
-                    _fill_selected_identity(selected, json_entry)
-            if not selected.name:
-                selected.name = engine.FragranticaEngine.name_from_url(frag_url)
-            if not selected.brand:
-                selected.brand = engine.FragranticaEngine.brand_from_url(frag_url)
+        selected = _candidate_from_source_url(req.source_url or "")
 
     identity = _recover_candidate_identity(selected)
     if _identity_needs_recovery(selected.name) and identity["name"]:

@@ -250,6 +250,9 @@ def _cleanup() -> None:
         conn.execute(
             "DELETE FROM fg_detail_cache WHERE canonical_fg_url = %s", (_TEST_JOB_KEY,)
         )
+        conn.execute(
+            "DELETE FROM fragrance_records WHERE canonical_fg_url = %s", (_TEST_JOB_KEY,)
+        )
     finally:
         ctx.__exit__(None, None, None)
 
@@ -347,6 +350,36 @@ def test_db_lifecycle() -> None:
         check(
             "complete_job overwrites cached image_url",
             bool(cached and cached.get("image_url") == "https://img.example.test/fresh.jpg"),
+        )
+
+        requeued = db.requeue_job(job["id"], priority=30)
+        check("requeue_job resurrects refreshed jobs", requeued and requeued["status"] == "pending")
+        original_aggregate_writer = db._upsert_completed_fragrance_record
+        try:
+            db._upsert_completed_fragrance_record = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated aggregate failure")
+            )
+            recovered = db.complete_job(
+                job["id"],
+                {
+                    **cache_row,
+                    "name": "Enrichment Selftest Recovered",
+                    "house": "_recovered_",
+                    "image_url": "https://img.example.test/recovered.jpg",
+                    "frag_cards": {"Community Interest": [{"label": "Have", "count": "3"}]},
+                },
+            )
+        finally:
+            db._upsert_completed_fragrance_record = original_aggregate_writer
+
+        check(
+            "complete_job tolerates aggregate fragrance_records failures",
+            recovered and recovered["status"] == "completed",
+        )
+        cached = db.lookup_detail_cache(_TEST_JOB_KEY)
+        check(
+            "aggregate failure still leaves fg_detail_cache updated",
+            bool(cached and cached.get("name") == "Enrichment Selftest Recovered"),
         )
     finally:
         _cleanup()

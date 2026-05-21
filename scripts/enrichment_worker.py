@@ -57,6 +57,9 @@ DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
 DEFAULT_JITTER = 15.0
 DEFAULT_LIMIT = 10
+# Per-page fetch deadline (FG+BN). Previously 8s, which left FG without
+# headroom on slow responses and surfaced as parser_empty_frag_cards.
+DEFAULT_DETAIL_TIMEOUT = 15.0
 SCHEMA_VERSION = 1
 MAX_LIST_LIMIT = 100
 HTTP_TIMEOUT = 30.0
@@ -192,6 +195,13 @@ class ApiClient:
             json={"error": error, "retryable": bool(retryable)},
         )
 
+    def requeue_job(self, job_id: str, *, priority: int = 10) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/enrichment/jobs/{job_id}/requeue",
+            json={"priority": int(priority)},
+        )
+
     def ignore_job(self, job_id: str, note: str | None = None) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -281,6 +291,9 @@ def _canonical_fg_url(url: str) -> str:
     text = (url or "").strip()
     if not text:
         return ""
+    canonical = engine.FragranticaEngine.canonical_url(text)
+    if engine.FragranticaEngine.is_perfume_url(canonical):
+        return canonical.rstrip("/")
     if "://" in text:
         scheme, rest = text.split("://", 1)
         if "/" in rest:
@@ -420,9 +433,12 @@ def _run_engine_call(fn, *, debug: bool):
     if debug:
         return fn()
     captured = io.StringIO()
-    with contextlib.redirect_stdout(captured):
-        result = fn()
-    return result
+    try:
+        with contextlib.redirect_stdout(captured):
+            return fn()
+    except Exception:
+        _print_engine_lines(captured.getvalue())
+        raise
 
 
 def _print_engine_lines(captured_text: str) -> None:
@@ -438,7 +454,7 @@ def resolve_candidate(
     *,
     debug: bool = False,
 ) -> engine.UnifiedFragrance:
-    fg_url = str(job.get("fg_url") or "").strip()
+    fg_url = engine.FragranticaEngine.canonical_url(str(job.get("fg_url") or "").strip())
     if fg_url:
         return engine.UnifiedFragrance(
             name=str(job.get("name") or ""),
@@ -482,6 +498,7 @@ def fetch_payload(
 ) -> dict[str, Any]:
     if not candidate.frag_url:
         raise WorkerError("fg_url_missing_after_resolution", retryable=False)
+    candidate.frag_url = engine.FragranticaEngine.canonical_url(candidate.frag_url)
     try:
         details = _run_engine_call(
             lambda: engine.fetch_selected_details(scraper, candidate, detail_timeout),
@@ -493,7 +510,41 @@ def fetch_payload(
     frag_cards = details.frag_cards or {}
     if not isinstance(frag_cards, dict) or not frag_cards:
         retryable = bool(engine.FragranticaEngine.is_perfume_url(candidate.frag_url))
-        raise WorkerError("parser_empty_frag_cards", retryable=retryable)
+        fetch_errors = getattr(details, "fetch_errors", {}) or {}
+        parse_diagnostics = getattr(details, "parse_diagnostics", {}) or {}
+        fg_diag = parse_diagnostics.get("fg") if isinstance(parse_diagnostics, dict) else {}
+        if not isinstance(fg_diag, dict):
+            fg_diag = {}
+        fg_err = fetch_errors.get("fg")
+        url_shape_ok = engine.FragranticaEngine.is_perfume_url(candidate.frag_url)
+        parts = [f"url_shape_ok={url_shape_ok}"]
+        if fg_err:
+            parts.append(f"fg_fetch_error={fg_err}")
+        else:
+            parts.append("fg_fetch_error=none (parser produced no cards from fetched HTML)")
+        for key in (
+            "html_bytes",
+            "has_status_payload",
+            "status_decode_ok",
+            "challenge_detected",
+        ):
+            if key in fg_diag:
+                parts.append(f"{key}={fg_diag.get(key)}")
+        notes = getattr(details, "notes", None)
+        notes_count = fg_diag.get("notes_count")
+        if notes_count is None and notes is not None:
+            notes_count = (
+                len(getattr(notes, "top", []) or [])
+                + len(getattr(notes, "heart", []) or [])
+                + len(getattr(notes, "base", []) or [])
+                + len(getattr(notes, "flat", []) or [])
+            )
+        if notes_count is not None:
+            parts.append(f"notes_count={notes_count}")
+        if fg_diag.get("status_decode_error"):
+            parts.append(f"status_decode_error={fg_diag.get('status_decode_error')}")
+        print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
+        raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
     identity = _specific_identity(candidate)
     image_url = _extract_image_url(scraper, candidate.frag_url, debug=debug)
@@ -584,13 +635,17 @@ def process_job(
         return False
     except WorkerError as exc:
         print(f"{index_label} Failed {label}: {exc.code}")
-        if config.debug and str(exc) != exc.code:
+        if exc.code == "api_unavailable" and str(exc) != exc.code:
+            detail = str(exc).split(":", 1)[-1].strip()
+            if detail:
+                print(f"{index_label} Server: {detail[:200]}")
+        elif config.debug and str(exc) != exc.code:
             print(f"{index_label} {exc}")
         if config.dry_run:
             print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
             return False
         try:
-            client.fail_job(job_id, exc.code, exc.retryable)
+            client.fail_job(job_id, str(exc), exc.retryable)
             print(f"{index_label} Marked {'retryable' if exc.retryable else 'non-retryable'} failure")
         except WorkerError as fail_exc:
             print(f"{index_label} Could not report failure: {fail_exc.code}")
@@ -606,6 +661,30 @@ def process_job(
         return False
 
 
+def requeue_terminal_failed_jobs(
+    client: ApiClient,
+    config: WorkerConfig,
+    *,
+    limit: int,
+) -> int:
+    """Move terminal `failed` rows back to `pending` so the worker can process them."""
+    failed_jobs = client.list_jobs("failed", limit=max(limit, MAX_LIST_LIMIT))
+    requeued = 0
+    for job in failed_jobs[:limit]:
+        job_id = str(job.get("id") or "").strip()
+        if not job_id:
+            continue
+        if config.dry_run:
+            print(f"Dry run: would requeue failed job {job_id}")
+            requeued += 1
+            continue
+        client.requeue_job(job_id, priority=max(10, int(job.get("priority") or 0) + 1))
+        requeued += 1
+    if requeued:
+        print(f"Requeued {requeued} terminal failed job(s) to pending.")
+    return requeued
+
+
 def process_pending(
     client: ApiClient,
     config: WorkerConfig,
@@ -616,7 +695,12 @@ def process_pending(
     if not config.auth_configured:
         raise SystemExit("ENRICHMENT_WORKER_TOKEN is required for worker operations.")
 
-    jobs = client.list_jobs("pending", limit=max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit))
+    if only_retries:
+        requeue_terminal_failed_jobs(client, config, limit=config.limit)
+
+    list_limit = max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit)
+    pending_all = client.list_jobs("pending", limit=list_limit)
+    jobs = pending_all
     if only_retries:
         jobs = [j for j in jobs if int(j.get("failure_count") or 0) > 0]
     jobs = jobs[: config.limit]
@@ -625,6 +709,9 @@ def process_pending(
         return 0
 
     scraper = engine.get_scraper()
+    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    if not engine._validate_fragrantica_session(fg_scraper):
+        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
     engine_args = _build_engine_args()
     completed = 0
     total = len(jobs)
@@ -699,6 +786,9 @@ def warm_list(client: ApiClient, config: WorkerConfig, path: str, stop: StopCont
         raise SystemExit(f"No queries found in {path!r}.")
 
     scraper = engine.get_scraper()
+    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    if not engine._validate_fragrantica_session(fg_scraper):
+        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
     engine_args = _build_engine_args()
     completed = 0
     print(f"Warm list: {len(queries)} queries from {path}")
@@ -951,15 +1041,11 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
     if snapshot["error"]:
         return snapshot
     try:
-        # Count pending jobs with prior failures — these are the ones the
-        # [5] Retry-failed action actually picks up. (Jobs that end up in
-        # status='failed' are non-retryable by definition per db.fail_job,
-        # so counting those would dangle the operator a number they can
-        # never action from the dashboard.)
+        # Pending with prior failures plus terminal failed rows (requeued on retry).
         pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
-        snapshot["retryable_failures"] = sum(
-            1 for j in pending if int(j.get("failure_count") or 0) > 0
-        )
+        pending_retries = sum(1 for j in pending if int(j.get("failure_count") or 0) > 0)
+        terminal_failed = int((snapshot.get("counts") or {}).get("failed") or 0)
+        snapshot["retryable_failures"] = pending_retries + terminal_failed
     except WorkerError:
         pass
     try:
@@ -1534,7 +1620,7 @@ def launch_dashboard(
         delay=_env_float("ENRICHMENT_DEFAULT_DELAY", DEFAULT_DELAY),
         jitter=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER),
         limit=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT),
-        detail_timeout=8.0,
+        detail_timeout=DEFAULT_DETAIL_TIMEOUT,
         debug=dbg,
         dry_run=False,
     )
@@ -1596,7 +1682,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jitter", type=float, default=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER))
     parser.add_argument("--once", action="store_true", help="Alias for --process-pending --limit 1.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve and parse without mutating worker job state.")
-    parser.add_argument("--detail-timeout", type=float, default=8.0, help="Per-page detail fetch deadline.")
+    parser.add_argument(
+        "--detail-timeout",
+        type=float,
+        default=DEFAULT_DETAIL_TIMEOUT,
+        help="Per-page detail fetch deadline (seconds).",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",

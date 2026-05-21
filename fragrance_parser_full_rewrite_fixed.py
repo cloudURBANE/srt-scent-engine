@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+import requests
 import argparse
 import html
 import base64
@@ -23,6 +24,65 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 
+_DRISSION_ORIGIN_PATCH_ACTIVE = False
+_DRISSION_LAST_WS_CONNECT: dict[str, Any] | None = None
+_CLEARANCE_RAW_CDP_LAST_RESULT: dict[str, Any] | None = None
+_CHROMIUM_UA_RE = re.compile(r"(HeadlessChrome|Chrome)/([0-9.]+)")
+
+
+def _install_drission_websocket_origin_patch() -> None:
+    """Force an Origin header for DrissionPage's DevTools websocket on Railway."""
+    global _DRISSION_ORIGIN_PATCH_ACTIVE
+
+    configured_origin = os.environ.get("DRISSION_FORCE_ORIGIN", "").strip()
+    enabled = configured_origin.lower() in {"1", "true", "yes", "on"}
+    explicit_origin = configured_origin.startswith(("http://", "https://"))
+    railway_runtime = any(
+        os.environ.get(name)
+        for name in (
+            "RAILWAY_SERVICE_ID",
+            "RAILWAY_DEPLOYMENT_ID",
+            "RAILWAY_ENVIRONMENT_ID",
+            "RAILWAY_GIT_COMMIT_SHA",
+        )
+    )
+    if not (enabled or explicit_origin or railway_runtime):
+        return
+
+    try:
+        import websocket as _ws_lib  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return
+
+    original_create_connection = _ws_lib.create_connection
+    if getattr(original_create_connection, "_srt_forces_origin", False):
+        _DRISSION_ORIGIN_PATCH_ACTIVE = True
+        return
+
+    def _create_connection_with_origin(url: str, *args: Any, **kwargs: Any) -> Any:
+        global _DRISSION_LAST_WS_CONNECT
+        had_suppress_origin = "suppress_origin" in kwargs
+        kwargs.pop("suppress_origin", None)
+        if "origin" not in kwargs:
+            if explicit_origin:
+                kwargs["origin"] = configured_origin
+            else:
+                kwargs["origin"] = "http://127.0.0.1"
+        _DRISSION_LAST_WS_CONNECT = {
+            "url": url,
+            "origin": kwargs.get("origin"),
+            "had_suppress_origin": had_suppress_origin,
+            "enable_multithread": kwargs.get("enable_multithread"),
+        }
+        return original_create_connection(url, *args, **kwargs)
+
+    _create_connection_with_origin._srt_forces_origin = True  # type: ignore[attr-defined]
+    _ws_lib.create_connection = _create_connection_with_origin
+    _DRISSION_ORIGIN_PATCH_ACTIVE = True
+
+
+_install_drission_websocket_origin_patch()
+
 try:
     import cloudscraper  # pyright: ignore[reportMissingImports]
 except ModuleNotFoundError:
@@ -33,6 +93,14 @@ except ModuleNotFoundError:
     curl_requests = None  # type: ignore[assignment]
 try:
     from DrissionPage import ChromiumOptions, ChromiumPage  # pyright: ignore[reportMissingImports]
+    if _DRISSION_ORIGIN_PATCH_ACTIVE:
+        try:
+            import DrissionPage._base.driver as _drission_driver  # pyright: ignore[reportMissingImports]
+            import websocket as _ws_lib  # pyright: ignore[reportMissingImports]
+
+            _drission_driver.create_connection = _ws_lib.create_connection
+        except Exception:
+            pass
 except ModuleNotFoundError:
     ChromiumOptions = None  # type: ignore[assignment]
     ChromiumPage = None  # type: ignore[assignment]
@@ -70,6 +138,13 @@ class UnifiedDetails:
     pros_cons: list[str] = field(default_factory=list)
     reviews: list[Review] = field(default_factory=list)
     derived_metrics: dict[str, Any] | None = None
+    # Diagnostic: per-source fetch errors keyed by short tag ("fg", "bn").
+    # Populated only when an HTTP fetch fails; worker uses these to
+    # distinguish bucket B (HTTP) from bucket C (parser) failures.
+    fetch_errors: dict[str, str] = field(default_factory=dict)
+    # Per-source parse/fetch diagnostics used by the worker when a fetched
+    # page yields no cards.
+    parse_diagnostics: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class UnifiedFragrance:
@@ -384,6 +459,12 @@ class IdentityTools:
         "jpg": {"jean paul gaultier", "jpg"},
         "dolce and gabbana": {"dolce and gabbana", "d and g", "dg"},
     }
+    # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
+    # Keys are normalized sub-line tokens; values are designer labels to crawl.
+    FRAGRANTICA_LINE_ALIASES: dict[str, tuple[str, ...]] = {
+        "casamorati": ("Casamorati 1888",),
+        "casamorati 1888": ("Casamorati 1888",),
+    }
     
     @staticmethod
     def tokenized(text: str) -> set[str]:
@@ -430,6 +511,98 @@ class IdentityTools:
             if normalized in all_forms:
                 return canonical
         return normalized if normalized in IdentityTools.BRAND_ALIASES else ""
+
+    @staticmethod
+    def sub_brand_label(name: str, house: str = "") -> str:
+        """Leading product-line token when it is not the parent house (e.g. Casamorati Mefisto / Xerjoff)."""
+        cleaned = TextSanitizer.clean(name)
+        if not cleaned or not TextSanitizer.clean(house):
+            return ""
+        tokens = [t for t in TextSanitizer.normalize_identity(cleaned).split() if t and t not in IdentityTools.STOPWORDS]
+        if len(tokens) < 2:
+            return ""
+        lead = tokens[0]
+        if len(lead) < 4:
+            return ""
+        if house:
+            house_tokens = IdentityTools.brand_tokens(house)
+            if lead in house_tokens:
+                return ""
+            if any(IdentityTools.compatible_brand(lead, form) for form in IdentityTools.brand_forms(house)):
+                return ""
+        return cleaned.split()[0]
+
+    @staticmethod
+    def sub_brand_from_bn_slug(bn_url: str) -> str:
+        if not bn_url:
+            return ""
+        slug = bn_url.rstrip("/").split("/")[-1]
+        slug = re.sub(r"\.\d+$", "", slug, flags=re.I)
+        slug = re.split(r"(?i)-by-", slug, maxsplit=1)[0]
+        lead = slug.split("-", 1)[0] if slug else ""
+        if len(lead) < 4:
+            return ""
+        return TextSanitizer.title_from_slug(lead)
+
+    @staticmethod
+    def catalog_brand_keys(house: str, name: str = "", *, bn_url: str = "") -> list[str]:
+        """Ordered designer labels to crawl: parent house, sub-line, and Fragrantica line aliases."""
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def add(label: str) -> None:
+            cleaned = TextSanitizer.clean(label)
+            norm = TextSanitizer.normalize_identity(cleaned)
+            if not norm or norm in seen:
+                return
+            seen.add(norm)
+            keys.append(cleaned)
+
+        if house:
+            add(house)
+        sub = IdentityTools.sub_brand_label(name, house)
+        if sub:
+            add(sub)
+        slug_sub = IdentityTools.sub_brand_from_bn_slug(bn_url)
+        if slug_sub:
+            add(slug_sub)
+        for norm_key in list(seen):
+            for alias in IdentityTools.FRAGRANTICA_LINE_ALIASES.get(norm_key, ()):
+                add(alias)
+        combined_norm = TextSanitizer.normalize_identity(f"{house} {name}")
+        for line_key, aliases in IdentityTools.FRAGRANTICA_LINE_ALIASES.items():
+            if line_key in combined_norm:
+                for alias in aliases:
+                    add(alias)
+        return keys
+
+    @staticmethod
+    def query_anchor_tokens(query: str) -> set[str]:
+        """Distinctive query tokens used to sanity-check native Fragrantica search rows."""
+        anchors: set[str] = set()
+        for token in TextSanitizer.normalize_identity(query).split():
+            if len(token) >= 4 and token not in IdentityTools.STOPWORDS:
+                anchors.add(token)
+        return anchors
+
+    @staticmethod
+    def compatible_catalog_brand(house: str, catalog_brand: str, name: str = "") -> bool:
+        """True when a catalog designer slug plausibly belongs to the parent house + product line."""
+        if IdentityTools.compatible_brand(house, catalog_brand):
+            return True
+        sub_norm = TextSanitizer.normalize_identity(IdentityTools.sub_brand_label(name, house))
+        cat_norm = TextSanitizer.normalize_identity(catalog_brand)
+        if sub_norm and (sub_norm in cat_norm or cat_norm.startswith(sub_norm)):
+            return True
+        name_norm = TextSanitizer.normalize_identity(name)
+        for line_key, aliases in IdentityTools.FRAGRANTICA_LINE_ALIASES.items():
+            if line_key not in name_norm and line_key not in sub_norm:
+                continue
+            for alias in aliases:
+                alias_norm = TextSanitizer.normalize_identity(alias)
+                if alias_norm == cat_norm or line_key in cat_norm:
+                    return True
+        return False
         
     @staticmethod
     def compatible_brand(a: str, b: str) -> bool:
@@ -2164,7 +2337,26 @@ class Http:
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
     }
-    
+
+    # Thread-local diagnostic: the reason the last get() call returned None,
+    # so callers can surface "HTTP 403" / "Timeout" without re-fetching.
+    _LAST_ERROR = threading.local()
+
+    @staticmethod
+    def _record_error(exc: Exception | None) -> None:
+        if exc is None:
+            Http._LAST_ERROR.value = None
+            return
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status:
+            Http._LAST_ERROR.value = f"HTTP {status}"
+        else:
+            Http._LAST_ERROR.value = f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def last_error() -> str | None:
+        return getattr(Http._LAST_ERROR, "value", None)
+
     @staticmethod
     def get(
         scraper,
@@ -2176,16 +2368,20 @@ class Http:
         sleep_seconds: float = 0.25,
     ):
         headers = dict(Http.DEFAULT_HEADERS)
+        if type(scraper).__name__ == "Session" or getattr(scraper, "headers", {}).get("User-Agent"):
+            headers = {}
         if referer:
             headers["Referer"] = referer
         last_error: Exception | None = None
         for attempt in range(max(1, attempts)):
             if deadline and deadline.expired():
+                last_error = last_error or TimeoutError("deadline expired before attempt")
                 break
             try:
                 request_timeout = deadline.timeout(timeout) if deadline else timeout
                 res = scraper.get(url, timeout=request_timeout, headers=headers)
                 res.raise_for_status()
+                Http._record_error(None)
                 return res
             except Exception as exc:  # network parser must degrade cleanly
                 last_error = exc
@@ -2194,6 +2390,7 @@ class Http:
                 if deadline and deadline.remaining(0) is not None and deadline.remaining(0) <= sleep_seconds:
                     break
                 time.sleep(sleep_seconds)
+        Http._record_error(last_error)
         return None
 
 _BASENOTES_CACHE_FILE = Path(
@@ -2212,6 +2409,372 @@ _BASENOTES_CHALLENGE_MARKERS = (
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
 _BASENOTES_LAST_MINT_ERROR: str | None = None
+_BASENOTES_NEXT_MINT_AFTER = 0.0
+
+_FRAGRANTICA_CACHE_FILE = Path(
+    os.environ.get(
+        "FRAGRANTICA_CLEARANCE_CACHE",
+        str(Path(__file__).with_name(".fragrantica_clearance_cache.json")),
+    )
+)
+_FRAGRANTICA_SESSION_LOCK = threading.Lock()
+_FRAGRANTICA_SESSION = None
+_FRAGRANTICA_LAST_MINT_ERROR: str | None = None
+_FRAGRANTICA_NEXT_MINT_AFTER = 0.0
+
+
+def _clearance_mint_cooldown_seconds() -> float:
+    try:
+        raw = (
+            os.environ.get("SRT_MINT_COOLDOWN_SECONDS")
+            or os.environ.get("CLEARANCE_MINT_COOLDOWN_SECONDS")
+            or "300"
+        )
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
+def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def _load_clearance_from_env(prefix: str) -> tuple[str, dict[str, str]] | None:
+    user_agent = str(os.environ.get(f"{prefix}_CLEARANCE_UA") or "").strip()
+    cookie_header = str(os.environ.get(f"{prefix}_CLEARANCE_COOKIE_HEADER") or "").strip()
+    cookies_json = str(os.environ.get(f"{prefix}_CLEARANCE_COOKIES_JSON") or "").strip()
+    cookies: dict[str, str] = {}
+    if cookies_json:
+        try:
+            parsed = json.loads(cookies_json)
+            if isinstance(parsed, dict):
+                cookies = {str(k): str(v) for k, v in parsed.items() if str(k).strip()}
+        except Exception:
+            cookies = {}
+    if not cookies and cookie_header:
+        cookies = _parse_cookie_header(cookie_header)
+    if not user_agent or not cookies:
+        return None
+    return user_agent, cookies
+
+
+def _kill_chromiums_for_user_data_dir(user_data_dir: str) -> None:
+    if not user_data_dir or os.name == "nt":
+        return
+    pgrep = shutil.which("pgrep")
+    if not pgrep:
+        return
+    try:
+        import signal
+        import subprocess
+
+        proc = subprocess.run(
+            [pgrep, "-f", user_data_dir],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        my_pid = os.getpid()
+        for raw_pid in proc.stdout.split():
+            if not raw_pid.isdigit():
+                continue
+            pid = int(raw_pid)
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _mint_clearance_with_raw_cdp(
+    *,
+    chromium_path: str,
+    site_url: str,
+    user_data_dir: str,
+    wait_seconds: int,
+    headless: bool,
+    display_mode: str,
+) -> tuple[str, dict[str, str]] | None:
+    global _CLEARANCE_RAW_CDP_LAST_RESULT
+    import socket
+    import subprocess
+
+    result: dict[str, Any] = {
+        "site_url": site_url,
+        "display_mode": display_mode,
+        "step": "start",
+        "ok": False,
+        "port": None,
+        "ws_url": None,
+        "cookie_count": 0,
+        "has_cf_clearance": False,
+        "title": None,
+        "current_url": None,
+        "error": None,
+    }
+    _CLEARANCE_RAW_CDP_LAST_RESULT = result
+
+    def fail(step: str, error: str | None = None) -> None:
+        result["step"] = step
+        result["error"] = error
+
+    try:
+        import websocket  # pyright: ignore[reportMissingImports]
+    except Exception:
+        fail("import_websocket", "websocket-client unavailable")
+        return None
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        result["port"] = port
+    finally:
+        sock.close()
+
+    args = [
+        chromium_path,
+        "--window-position=-2000,-2000",
+        "--window-size=1280,900",
+        "--mute-audio",
+        "--no-first-run",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-background-networking",
+        "--disable-infobars",
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--lang=en-US,en",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        f"--user-data-dir={user_data_dir}",
+        "about:blank",
+    ]
+    if headless:
+        args.insert(1, "--headless=new")
+    elif display_mode == "xvfb":
+        xvfb_run = shutil.which("xvfb-run")
+        if not xvfb_run:
+            fail("xvfb_missing", "xvfb-run not found on PATH")
+            return None
+        args = [
+            xvfb_run,
+            "-a",
+            "-s",
+            "-screen 0 1280x900x24",
+            *args,
+        ]
+
+    proc: subprocess.Popen[bytes] | None = None
+    ws = None
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 12
+        version_payload = None
+        session = requests.Session()
+        session.trust_env = False
+        result["step"] = "wait_json_version"
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                fail("chromium_exited", f"exit_code={proc.returncode}")
+                return None
+            try:
+                res = session.get(
+                    f"http://127.0.0.1:{port}/json/version",
+                    timeout=2,
+                    headers={"Connection": "close"},
+                )
+                if res.ok:
+                    version_payload = res.json()
+                    result["error"] = None
+                    break
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                time.sleep(0.2)
+        if not version_payload:
+            fail("json_version_unavailable", result.get("error"))
+            return None
+
+        ws_url = version_payload.get("webSocketDebuggerUrl")
+        if not ws_url:
+            fail("missing_websocket_url", str(version_payload)[:500])
+            return None
+        result["ws_url"] = ws_url
+        result["step"] = "connect_ws"
+        ws = websocket.create_connection(
+            ws_url,
+            timeout=10,
+            enable_multithread=True,
+            origin="http://127.0.0.1",
+        )
+        next_id = 0
+
+        def cdp(method: str, params: dict[str, Any] | None = None, session_id: str | None = None) -> dict[str, Any]:
+            nonlocal next_id
+            next_id += 1
+            message: dict[str, Any] = {"id": next_id, "method": method}
+            if params:
+                message["params"] = params
+            if session_id:
+                message["sessionId"] = session_id
+            ws.send(json.dumps(message))
+            end = time.time() + 10
+            while time.time() < end:
+                reply = json.loads(ws.recv())
+                if reply.get("id") == next_id:
+                    return reply
+            raise TimeoutError(f"CDP timeout waiting for {method}")
+
+        result["step"] = "browser_get_version"
+        version = cdp("Browser.getVersion").get("result", {})
+        reported_user_agent = str(version.get("userAgent") or "")
+        match = _CHROMIUM_UA_RE.search(reported_user_agent)
+        chrome_version = match.group(2) if match else "122.0.6261.69"
+        user_agent = (
+            f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
+        )
+        result["step"] = "create_target"
+        target = cdp("Target.createTarget", {"url": "about:blank"}).get("result", {})
+        target_id = target.get("targetId")
+        if not target_id:
+            fail("missing_target_id", str(target)[:500])
+            return None
+        result["step"] = "attach_target"
+        attached = cdp(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+        ).get("result", {})
+        session_id = attached.get("sessionId")
+        if not session_id:
+            fail("missing_session_id", str(attached)[:500])
+            return None
+
+        result["step"] = "enable_domains"
+        cdp("Page.enable", session_id=session_id)
+        cdp("Runtime.enable", session_id=session_id)
+        cdp("Network.enable", session_id=session_id)
+        result["step"] = "set_user_agent"
+        cdp(
+            "Network.setUserAgentOverride",
+            {
+                "userAgent": user_agent,
+                "acceptLanguage": "en-US,en;q=0.9",
+                "platform": "Linux x86_64",
+            },
+            session_id=session_id,
+        )
+        cdp("Emulation.setAutomationOverride", {"enabled": False}, session_id=session_id)
+        cdp(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+(() => {
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    window.chrome = window.chrome || { runtime: {} };
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters)
+      );
+    }
+  } catch (e) {}
+})();
+""",
+            },
+            session_id=session_id,
+        )
+        result["step"] = "navigate"
+        cdp("Page.navigate", {"url": site_url}, session_id=session_id)
+
+        cookies: dict[str, str] = {}
+        result["step"] = "wait_cookies"
+        for _ in range(max(1, wait_seconds)):
+            try:
+                cookie_result = cdp("Network.getAllCookies", session_id=session_id).get("result", {})
+                cookie_list = cookie_result.get("cookies") or []
+                cookies = {
+                    str(c["name"]): str(c["value"])
+                    for c in cookie_list
+                    if "name" in c and "value" in c
+                }
+                result["cookie_count"] = len(cookies)
+                result["has_cf_clearance"] = bool(cookies.get("cf_clearance"))
+                if cookies.get("cf_clearance"):
+                    break
+                title_result = cdp(
+                    "Runtime.evaluate",
+                    {"expression": "document.title", "returnByValue": True},
+                    session_id=session_id,
+                ).get("result", {})
+                title = str(title_result.get("result", {}).get("value") or "")
+                result["title"] = title
+                url_result = cdp(
+                    "Runtime.evaluate",
+                    {"expression": "location.href", "returnByValue": True},
+                    session_id=session_id,
+                ).get("result", {})
+                result["current_url"] = str(url_result.get("result", {}).get("value") or "")
+                if cookies and not any(
+                    marker in title.lower()
+                    for marker in ("just a moment", "attention required")
+                ):
+                    break
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+            time.sleep(1)
+
+        if cookies:
+            result["ok"] = True
+            result["step"] = "cookies_collected"
+            return user_agent, cookies
+        fail("no_cookies", result.get("error"))
+        return None
+    except Exception as exc:
+        fail(result.get("step") or "raw_cdp_exception", f"{type(exc).__name__}: {exc}")
+        return None
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
 
 
 def _response_has_challenge(res: Any) -> bool:
@@ -2241,6 +2804,9 @@ def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
 
 
 def _load_basenotes_cache() -> tuple[str, dict[str, str]] | None:
+    env_clearance = _load_clearance_from_env("BASENOTES")
+    if env_clearance:
+        return env_clearance
     try:
         with _BASENOTES_CACHE_FILE.open("r", encoding="utf-8") as handle:
             cache = json.load(handle)
@@ -2276,6 +2842,7 @@ def _mint_basenotes_clearance():
         return None
 
     page = None
+    user_data_dir = tempfile.mkdtemp(prefix="bn-chromium-")
     try:
         options = ChromiumOptions()
         chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
@@ -2310,8 +2877,15 @@ def _mint_basenotes_clearance():
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-gpu")
         options.set_argument("--disable-blink-features=AutomationControlled")
-        if os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}:
+        options.set_argument("--disable-extensions")
+        options.set_argument("--disable-component-extensions-with-background-pages")
+        options.set_argument("--disable-background-networking")
+        options.set_argument("--remote-allow-origins=*")
+        options.set_argument(f"--user-data-dir={user_data_dir}")
+        headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
+        if headless:
             options.set_argument("--headless=new")
         options.auto_port()
 
@@ -2334,13 +2908,54 @@ def _mint_basenotes_clearance():
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
     except Exception as exc:
         _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-        return None
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        raw_minted = None
+        if shutil.which("xvfb-run"):
+            xvfb_user_data_dir = tempfile.mkdtemp(prefix="bn-xvfb-chromium-")
+            try:
+                raw_minted = _mint_clearance_with_raw_cdp(
+                    chromium_path=chromium_path,
+                    site_url="https://basenotes.com/",
+                    user_data_dir=xvfb_user_data_dir,
+                    wait_seconds=max(50, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
+                    headless=False,
+                    display_mode="xvfb",
+                )
+            finally:
+                _kill_chromiums_for_user_data_dir(xvfb_user_data_dir)
+                try:
+                    shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        if raw_minted is None and not shutil.which("xvfb-run"):
+            raw_minted = _mint_clearance_with_raw_cdp(
+                chromium_path=chromium_path,
+                site_url="https://basenotes.com/",
+                user_data_dir=user_data_dir,
+                wait_seconds=max(35, int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")),
+                headless=os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"},
+                display_mode="headless",
+            )
+        if raw_minted is None:
+            raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
+            _BASENOTES_LAST_MINT_ERROR = (
+                f"{_BASENOTES_LAST_MINT_ERROR}; raw_cdp_step="
+                f"{raw_result.get('step')}; raw_cdp_mode={raw_result.get('display_mode')}; "
+                f"raw_cdp_error={raw_result.get('error')}"
+            )
+            return None
+        user_agent, cookies = raw_minted
     finally:
         if page is not None:
             try:
                 page.quit()
             except Exception:
                 pass
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     if not cookies:
         return None
@@ -2385,15 +3000,252 @@ def reset_basenotes_scraper(clear_cache: bool = False) -> None:
                 pass
 
 
+def _new_fragrantica_http_session(user_agent: str, cookies: dict[str, str]):
+    if curl_requests is None:
+        return None
+    session = curl_requests.Session(
+        impersonate=os.environ.get("FRAGRANTICA_CURL_IMPERSONATE", "chrome120")
+    )
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept": Http.DEFAULT_HEADERS["Accept"],
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": FragranticaEngine.BASE_URL if "FragranticaEngine" in globals() else "https://www.fragrantica.com/",
+    })
+    session.cookies.update(cookies)
+    return session
+
+
+def _load_fragrantica_cache() -> tuple[str, dict[str, str]] | None:
+    env_clearance = _load_clearance_from_env("FRAGRANTICA")
+    if env_clearance:
+        return env_clearance
+    try:
+        with _FRAGRANTICA_CACHE_FILE.open("r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+        user_agent = str(cache.get("ua") or "").strip()
+        cookies = cache.get("cookies") or {}
+        if not user_agent or not isinstance(cookies, dict):
+            return None
+        return user_agent, {str(k): str(v) for k, v in cookies.items()}
+    except Exception:
+        return None
+
+
+def _save_fragrantica_cache(user_agent: str, cookies: dict[str, str]) -> None:
+    try:
+        _FRAGRANTICA_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _FRAGRANTICA_CACHE_FILE.open("w", encoding="utf-8") as handle:
+            json.dump({"ua": user_agent, "cookies": cookies}, handle)
+    except Exception:
+        pass
+
+
+def _validate_fragrantica_session(session: Any) -> bool:
+    try:
+        res = session.get("https://www.fragrantica.com/", timeout=5)
+        return int(getattr(res, "status_code", 0) or 0) == 200 and not _response_has_challenge(res)
+    except Exception:
+        return False
+
+
+def _mint_fragrantica_clearance():
+    global _FRAGRANTICA_LAST_MINT_ERROR
+    if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
+        return None
+
+    page = None
+    user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
+    try:
+        options = ChromiumOptions()
+        chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        if not (
+            chromium_path
+            and os.path.isfile(chromium_path)
+            and os.access(chromium_path, os.X_OK)
+        ):
+            chromium_path = ""
+            for candidate in (
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "chrome",
+            ):
+                resolved = shutil.which(candidate)
+                if resolved:
+                    chromium_path = resolved
+                    break
+
+        if not chromium_path:
+            _FRAGRANTICA_LAST_MINT_ERROR = "No Chromium binary discovered (env BASENOTES_CHROMIUM_PATH or common names in PATH)."
+            return None
+
+        if chromium_path:
+            try:
+                options.set_browser_path(chromium_path)
+            except Exception as exc:
+                _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+        options.set_argument("--window-position=-2000,-2000")
+        options.set_argument("--mute-audio")
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-gpu")
+        options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument("--disable-extensions")
+        options.set_argument("--disable-component-extensions-with-background-pages")
+        options.set_argument("--disable-background-networking")
+        options.set_argument("--remote-allow-origins=*")
+        options.set_argument(f"--user-data-dir={user_data_dir}")
+        headless_env = (
+            os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+            or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+        )
+        if headless_env.lower() in {"1", "true", "yes"}:
+            options.set_argument("--headless=new")
+        options.auto_port()
+
+        page = ChromiumPage(options)
+        page.get("https://www.fragrantica.com/")
+
+        wait_seconds = int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")
+        for _ in range(max(1, wait_seconds)):
+            title = str(getattr(page, "title", "") or "")
+            if not any(marker in title.lower() for marker in ("just a moment", "attention required")):
+                break
+            time.sleep(1)
+
+        cookie_data = page.cookies()
+        cookies = (
+            {str(c["name"]): str(c["value"]) for c in cookie_data if "name" in c and "value" in c}
+            if isinstance(cookie_data, list)
+            else {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
+        )
+        user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
+    except Exception as exc:
+        _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        raw_minted = None
+        if shutil.which("xvfb-run"):
+            xvfb_user_data_dir = tempfile.mkdtemp(prefix="fg-xvfb-chromium-")
+            try:
+                raw_minted = _mint_clearance_with_raw_cdp(
+                    chromium_path=chromium_path,
+                    site_url="https://www.fragrantica.com/",
+                    user_data_dir=xvfb_user_data_dir,
+                    wait_seconds=max(50, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                    headless=False,
+                    display_mode="xvfb",
+                )
+            finally:
+                _kill_chromiums_for_user_data_dir(xvfb_user_data_dir)
+                try:
+                    shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        if raw_minted is None and not shutil.which("xvfb-run"):
+            raw_minted = _mint_clearance_with_raw_cdp(
+                chromium_path=chromium_path,
+                site_url="https://www.fragrantica.com/",
+                user_data_dir=user_data_dir,
+                wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                headless=(
+                    os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+                    or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+                ).lower() in {"1", "true", "yes"},
+                display_mode="headless",
+            )
+        if raw_minted is None:
+            raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
+            _FRAGRANTICA_LAST_MINT_ERROR = (
+                f"{_FRAGRANTICA_LAST_MINT_ERROR}; raw_cdp_step="
+                f"{raw_result.get('step')}; raw_cdp_mode={raw_result.get('display_mode')}; "
+                f"raw_cdp_error={raw_result.get('error')}"
+            )
+            return None
+        user_agent, cookies = raw_minted
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:
+                pass
+        _kill_chromiums_for_user_data_dir(user_data_dir)
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if not cookies:
+        return None
+    _save_fragrantica_cache(user_agent, cookies)
+    session = _new_fragrantica_http_session(user_agent, cookies)
+    if session is not None and _validate_fragrantica_session(session):
+        _FRAGRANTICA_LAST_MINT_ERROR = None
+        return session
+    return None
+
+
+def get_fragrantica_scraper(fallback: Any = None, *, mint_clearance: bool = False):
+    global _FRAGRANTICA_SESSION
+    with _FRAGRANTICA_SESSION_LOCK:
+        if _FRAGRANTICA_SESSION is not None:
+            return _FRAGRANTICA_SESSION
+
+        cached = _load_fragrantica_cache()
+        if cached:
+            session = _new_fragrantica_http_session(*cached)
+            if session is not None and _validate_fragrantica_session(session):
+                _FRAGRANTICA_SESSION = session
+                return _FRAGRANTICA_SESSION
+
+        if mint_clearance:
+            minted = _mint_fragrantica_clearance()
+            if minted is not None:
+                _FRAGRANTICA_SESSION = minted
+                return _FRAGRANTICA_SESSION
+
+    return fallback
+
+
+def reset_fragrantica_scraper(clear_cache: bool = False) -> None:
+    global _FRAGRANTICA_SESSION
+    with _FRAGRANTICA_SESSION_LOCK:
+        _FRAGRANTICA_SESSION = None
+        if clear_cache:
+            try:
+                _FRAGRANTICA_CACHE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 class RoutedScraper:
-    def __init__(self, default_scraper: Any, basenotes_scraper: Any = None):
+    def __init__(self, default_scraper: Any, basenotes_scraper: Any = None, fragrantica_scraper: Any = None):
         self.default_scraper = default_scraper
         self._basenotes_scraper = basenotes_scraper
+        self._fragrantica_scraper = fragrantica_scraper
 
     def _for_url(self, url: str):
+        global _BASENOTES_NEXT_MINT_AFTER, _FRAGRANTICA_NEXT_MINT_AFTER
+
         host = (urlparse(url).netloc or "").lower()
+        if host.endswith("fragrantica.com"):
+            mint_clearance = _FRAGRANTICA_SESSION is None and time.monotonic() >= _FRAGRANTICA_NEXT_MINT_AFTER
+            if mint_clearance:
+                _FRAGRANTICA_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
+            self._fragrantica_scraper = get_fragrantica_scraper(
+                self._fragrantica_scraper or self.default_scraper,
+                mint_clearance=mint_clearance,
+            )
+            return self._fragrantica_scraper or self.default_scraper
         if host.endswith("basenotes.com"):
-            self._basenotes_scraper = get_basenotes_scraper(self._basenotes_scraper or self.default_scraper)
+            mint_clearance = _BASENOTES_SESSION is None and time.monotonic() >= _BASENOTES_NEXT_MINT_AFTER
+            if mint_clearance:
+                _BASENOTES_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
+            self._basenotes_scraper = get_basenotes_scraper(
+                self._basenotes_scraper or self.default_scraper,
+                mint_clearance=mint_clearance,
+            )
             return self._basenotes_scraper or self.default_scraper
         return self.default_scraper
 
@@ -2411,7 +3263,11 @@ def get_scraper():
         )
     else:
         default = requests.Session()
-    return RoutedScraper(default, get_basenotes_scraper(default))
+    return RoutedScraper(
+        default,
+        get_basenotes_scraper(default),
+        get_fragrantica_scraper(default),
+    )
 
 
 def draw_bar(pct: float | int | None, width: int = 20, color: str = G, empty_label: str = "No Data") -> str:
@@ -2879,13 +3735,16 @@ def bounded_parallel(
     jobs: dict[str, Callable[[], Any]],
     seconds: float,
     max_workers: int | None = None,
+    raise_on: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Run independent jobs under one shared wall-clock deadline."""
     results: dict[str, Any] = {}
+    raise_names = set(raise_on or [])
     executor = ThreadPoolExecutor(max_workers=max_workers or max(1, len(jobs)))
     future_to_name = {executor.submit(fn): name for name, fn in jobs.items()}
     deadline = time.monotonic() + max(0.0, seconds)
     pending = set(future_to_name)
+    raised: BaseException | None = None
     while pending:
         remaining = max(0.0, deadline - time.monotonic())
         if remaining <= 0:
@@ -2895,12 +3754,20 @@ def bounded_parallel(
             name = future_to_name[future]
             try:
                 results[name] = future.result(timeout=0)
-            except Exception:
+            except Exception as exc:
+                if name in raise_names:
+                    raised = exc
+                    pending.add(future)
+                    break
                 results[name] = None
+        if raised is not None:
+            break
     for future in pending:
         future.cancel()
         results.setdefault(future_to_name[future], None)
     executor.shutdown(wait=False, cancel_futures=True)
+    if raised is not None:
+        raise raised
     return results
 
 def run_budgeted_items(
@@ -3016,7 +3883,48 @@ class SearchSniper:
                 item.resolver_source = "fg_cache"
                 item.resolver_score = 0.98
                 linked += 1
+                continue
+            for brand_label, lookup_name in SearchSniper._cache_lookup_pairs(
+                item.brand, item.name, bn_url=item.bn_url
+            ):
+                url = cache.get(brand_label, lookup_name, item.year)
+                if url:
+                    item.frag_url = url
+                    item.resolver_source = "fg_cache_line"
+                    item.resolver_score = 0.98
+                    linked += 1
+                    break
         return linked
+
+    @staticmethod
+    def _cache_lookup_pairs(
+        house: str, name: str, *, bn_url: str = ""
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        meta_name = name
+        meta_brand = house
+        if bn_url:
+            meta = BasenotesEngine._parse_name_metadata(bn_url, "", "")
+            if meta.name:
+                meta_name = meta.name
+            if meta.brand:
+                meta_brand = meta.brand
+        sub = IdentityTools.sub_brand_label(meta_name, meta_brand)
+        stripped = meta_name
+        if sub and stripped.lower().startswith(sub.lower()):
+            stripped = stripped[len(sub) :].strip()
+        for brand_label in IdentityTools.catalog_brand_keys(meta_brand, meta_name, bn_url=bn_url):
+            for lookup_name in (meta_name, stripped):
+                cleaned_name = TextSanitizer.clean(lookup_name)
+                if not cleaned_name:
+                    continue
+                key = (TextSanitizer.normalize_identity(brand_label), TextSanitizer.normalize_identity(cleaned_name))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((brand_label, cleaned_name))
+        return pairs
         
     @staticmethod
     def cache_successes(candidates: list[UnifiedFragrance], cache: IdentityCache, source: str = "") -> None:
@@ -3129,32 +4037,47 @@ class SearchSniper:
             return 0
         deadline = Deadline(budget_seconds)
         branch_token = trace.start("designer_catalog", query=f"{len(missing)} missing", deadline=deadline) if trace else None
-        brands = []
+        brand_labels: list[str] = []
+        brand_keys_seen: set[str] = set()
+        item_catalog_keys: dict[int, list[str]] = {}
         for item in missing:
-            key = TextSanitizer.normalize_identity(item.brand)
-            if key and key not in brands:
-                brands.append(key)
+            meta_name = item.name
+            meta_brand = item.brand
+            if item.bn_url:
+                meta = BasenotesEngine._parse_name_metadata(item.bn_url, "", "")
+                if meta.name:
+                    meta_name = meta.name
+                if meta.brand:
+                    meta_brand = meta.brand
+            keys: list[str] = []
+            for label in IdentityTools.catalog_brand_keys(meta_brand, meta_name, bn_url=item.bn_url):
+                norm = TextSanitizer.normalize_identity(label)
+                if norm and norm not in brand_keys_seen:
+                    brand_keys_seen.add(norm)
+                    brand_labels.append(label)
+                keys.append(norm)
+            item_catalog_keys[id(item)] = keys
         catalogs_by_brand: dict[str, list[CatalogItem]] = {}
-        def fetch_brand(brand_key: str) -> None:
-            representative = next((m.brand for m in missing if TextSanitizer.normalize_identity(m.brand) == brand_key), brand_key)
+        def fetch_brand(brand_label: str) -> None:
+            brand_key = TextSanitizer.normalize_identity(brand_label)
             catalogs_by_brand[brand_key] = SearchSniper.catalog_candidates_for_brand(
                 scraper,
-                representative,
+                brand_label,
                 deadline=deadline,
                 slug_limit=slug_limit,
                 trace=trace,
             )
-        run_budgeted_items(brands, fetch_brand, seconds=budget_seconds, max_workers=max_workers)
+        run_budgeted_items(brand_labels, fetch_brand, seconds=budget_seconds, max_workers=max_workers)
         linked = 0
         for item in missing:
-            brand_key = TextSanitizer.normalize_identity(item.brand)
             best: CatalogItem | None = None
             best_score = 0.0
-            for catalog_item in catalogs_by_brand.get(brand_key, []):
-                score = Orchestrator.identity_score(item, catalog_item)
-                if score > best_score:
-                    best = catalog_item
-                    best_score = score
+            for brand_key in item_catalog_keys.get(id(item), []):
+                for catalog_item in catalogs_by_brand.get(brand_key, []):
+                    score = Orchestrator.identity_score(item, catalog_item)
+                    if score > best_score:
+                        best = catalog_item
+                        best_score = score
             if best and best_score >= Orchestrator.CATALOG_ACCEPT:
                 item.frag_url = best.url
                 item.resolver_source = "designer_catalog"
@@ -3171,6 +4094,58 @@ class SearchSniper:
         cache.save()
         if trace and branch_token:
             trace.finish(branch_token, result_count=sum(len(v) for v in catalogs_by_brand.values()), linked_count=linked, skipped_reason="" if linked else "score_below_threshold", deadline=deadline)
+        return linked
+
+    @staticmethod
+    def attach_from_bn_crosswalk(
+        scraper,
+        candidates: list[UnifiedFragrance],
+        cache: IdentityCache,
+        budget_seconds: float = 4.0,
+        trace: ResolverTrace | None = None,
+    ) -> int:
+        """Use Basenotes detail-page Fragrantica links when native search and catalog miss."""
+        missing = [item for item in candidates if not item.frag_url and item.bn_url]
+        if not missing or budget_seconds <= 0:
+            if trace:
+                trace.add_skip("bn_crosswalk", "already_linked" if not missing else "budget_exhausted")
+            return 0
+        deadline = Deadline(budget_seconds)
+        branch_token = trace.start("bn_crosswalk", query=f"{len(missing)} missing", deadline=deadline) if trace else None
+        linked = 0
+
+        def resolve_one(item: UnifiedFragrance) -> None:
+            nonlocal linked
+            if deadline.expired() or item.frag_url:
+                return
+            urls = BasenotesEngine.fragrantica_urls_from_bn_page(scraper, item.bn_url, deadline=deadline)
+            best_url = ""
+            best_score = 0.0
+            for url in urls:
+                probe = CatalogItem(
+                    FragranticaEngine.name_from_url(url),
+                    FragranticaEngine.brand_from_url(url),
+                    "",
+                    url,
+                )
+                score = Orchestrator.identity_score(item, probe)
+                if score > best_score:
+                    best_url = url
+                    best_score = score
+            if best_url and best_score >= Orchestrator.CATALOG_ACCEPT:
+                item.frag_url = best_url
+                item.resolver_source = "bn_crosswalk"
+                item.resolver_score = best_score
+                cache.put(item, source="bn_crosswalk")
+                linked += 1
+                if trace:
+                    token = trace.start("bn_crosswalk", brand=item.brand, name=item.name, deadline=deadline)
+                    trace.finish(token, linked_count=1, accepted_url=best_url, deadline=deadline)
+
+        run_budgeted_items(missing, resolve_one, seconds=budget_seconds, max_workers=2)
+        cache.save()
+        if trace and branch_token:
+            trace.finish(branch_token, linked_count=linked, skipped_reason="" if linked else "no_fragrantica_links_on_bn_page", deadline=deadline)
         return linked
         
     @staticmethod
@@ -3461,6 +4436,38 @@ class BasenotesEngine:
             brand = ""
         return UnifiedFragrance(name=name, brand=brand, year=year, bn_url=url)
         
+    @staticmethod
+    def fragrantica_urls_from_html(markup: str) -> list[str]:
+        if not markup:
+            return []
+        soup = BeautifulSoup(markup, "html.parser")
+        urls: list[str] = []
+        seen: set[str] = set()
+        for a in soup.find_all("a", href=True):
+            href = FragranticaEngine.canonical_url(a.get("href", ""))
+            if not FragranticaEngine.is_perfume_url(href):
+                continue
+            key = FragranticaEngine.dedupe_key(href)
+            if key in seen:
+                continue
+            seen.add(key)
+            urls.append(href)
+        return urls
+
+    @staticmethod
+    def fragrantica_urls_from_bn_page(
+        scraper,
+        bn_url: str,
+        deadline: Deadline | None = None,
+        timeout: float = 4.0,
+    ) -> list[str]:
+        if not bn_url:
+            return []
+        res = BasenotesEngine._get_with_retries(scraper, bn_url, timeout=timeout, attempts=1, deadline=deadline)
+        if not res:
+            return []
+        return BasenotesEngine.fragrantica_urls_from_html(res.text)
+
     @staticmethod
     def fetch_metrics(scraper, frag: UnifiedFragrance, deadline: Deadline | None = None) -> None:
         if not frag.bn_url:
@@ -4012,6 +5019,20 @@ class FragranticaEngine:
         return "", ""
     
     @staticmethod
+    def native_search_unusable(query: str, results: list[UnifiedFragrance]) -> bool:
+        """True when Fragrantica returned rows but none echo distinctive query tokens."""
+        if not results:
+            return True
+        anchors = IdentityTools.query_anchor_tokens(query)
+        if not anchors:
+            return False
+        for item in results:
+            blob = TextSanitizer.normalize_identity(f"{item.brand} {item.name}")
+            if any(anchor in blob for anchor in anchors):
+                return False
+        return len(results) >= 3
+
+    @staticmethod
     def extract_search_data(
         scraper,
         query: str,
@@ -4034,6 +5055,8 @@ class FragranticaEngine:
                 continue
             results = FragranticaEngine.parse_search_html(res.text, max_results=max_results)
             if results:
+                if FragranticaEngine.native_search_unusable(query, results):
+                    return []
                 return results
             time.sleep(0.15)
         return []
@@ -4194,16 +5217,26 @@ class FragranticaEngine:
         href = html.unescape(href or "").strip()
         if not href:
             return ""
+        known_hosts = ("fragrantica.com", "www.fragrantica.com", "beta.fragrantica.com")
+        lower = href.lower()
+        if "://" not in href and any(
+            lower == host or lower.startswith(host + "/")
+            for host in known_hosts
+        ):
+            href = "https://" + href
         url = urljoin(FragranticaEngine.BASE_URL, href)
-        url = url.split("#", 1)[0].split("?", 1)[0]
-        url = url.replace("http://www.fragrantica.com", "https://www.fragrantica.com")
-        url = url.replace("http://fragrantica.com", "https://www.fragrantica.com")
-        url = url.replace("https://fragrantica.com", "https://www.fragrantica.com")
-        return url
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if host == "fragrantica.com" or host.endswith(".fragrantica.com"):
+            host = "www.fragrantica.com"
+        scheme = "https" if host.endswith("fragrantica.com") else (parsed.scheme or "https")
+        path = parsed.path or ""
+        return f"{scheme}://{host}{path}"
         
     @staticmethod
     def is_perfume_url(url: str) -> bool:
-        return bool(FragranticaEngine.PERFUME_URL_RE.match(url or ""))
+        canonical = FragranticaEngine.canonical_url(url)
+        return bool(FragranticaEngine.PERFUME_URL_RE.match(canonical or ""))
         
     @staticmethod
     def dedupe_key(url: str) -> str:
@@ -4265,25 +5298,52 @@ class FragranticaEngine:
     ) -> None:
         if not url:
             return
-        res = Http.get(scraper, url, timeout=5.0, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
+        url = FragranticaEngine.canonical_url(url)
+        diag = unified_details.parse_diagnostics.setdefault("fg", {})
+        diag["url"] = url
+        timeout = deadline.timeout(15.0) if deadline else 15.0
+        res = Http.get(scraper, url, timeout=timeout, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
         if not res:
+            err = Http.last_error()
+            if err:
+                unified_details.fetch_errors["fg"] = err
+                diag["fetch_error"] = err
+            return
+        diag["http_status"] = int(getattr(res, "status_code", 0) or 0)
+        diag["html_bytes"] = len(getattr(res, "content", b"") or b"")
+        challenge_detected = _response_has_challenge(res)
+        diag["challenge_detected"] = bool(challenge_detected)
+        if challenge_detected:
+            unified_details.fetch_errors["fg"] = "challenge_page"
+            diag["fetch_error"] = "challenge_page"
             return
         soup = BeautifulSoup(res.content, "html.parser", from_encoding="utf-8")
 
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
+        diag["has_status_payload"] = bool(status_payload)
+        diag["status_decode_ok"] = False
 
         if status_payload:
-            
-            decoded_status = FragranticaEngine.decode_fragrantica_status_payload(status_payload, url)
-                
-            
+            try:
+                decoded_status = FragranticaEngine.decode_fragrantica_status_payload(status_payload, url)
+                diag["status_decode_ok"] = isinstance(decoded_status, dict)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                diag["status_decode_error"] = message
+                unified_details.fetch_errors["fg"] = f"status_decode_failed: {message}"
 
         status_metric_cards = FragranticaEngine.extract_status_metric_cards(decoded_status)
 
         for card_name, metrics in status_metric_cards.items():
             if metrics:
                 unified_details.frag_cards[card_name] = metrics
+
+        performance_card_names = set(FragranticaEngine.PERFORMANCE_CARD_NAMES.values())
+        status_performance_cards = {
+            name: rows for name, rows in status_metric_cards.items()
+            if name in performance_card_names and rows
+        }
 
 
         
@@ -4389,6 +5449,13 @@ class FragranticaEngine:
 
         unified_details.pros_cons.extend(FragranticaEngine.extract_people_say(soup, unified_details.pros_cons))
         unified_details.reviews.extend(FragranticaEngine.extract_reviews(soup))
+        diag["frag_card_count"] = len(unified_details.frag_cards or {})
+        diag["notes_count"] = (
+            len(unified_details.notes.top)
+            + len(unified_details.notes.heart)
+            + len(unified_details.notes.base)
+            + len(unified_details.notes.flat)
+        )
 
     @staticmethod
     def extract_main_accords(soup: BeautifulSoup) -> list[dict[str, Any]]:
@@ -6032,16 +7099,17 @@ class Orchestrator:
         b_brand = TextSanitizer.clean(getattr(b, "brand", ""))
         
         # Hard Gate: Ensure brand compatibility
+        a_name_raw = TextSanitizer.clean(getattr(a, "name", ""))
+        b_name_raw = TextSanitizer.clean(getattr(b, "name", ""))
         brand_ok = (
             not a_brand or not b_brand 
             or a_brand.lower() == "unknown" or b_brand.lower() == "unknown"
             or IdentityTools.compatible_brand(a_brand, b_brand)
+            or IdentityTools.compatible_catalog_brand(a_brand, b_brand, a_name_raw)
+            or IdentityTools.compatible_catalog_brand(b_brand, a_brand, b_name_raw)
         )
         if not brand_ok:
             return 0.0
-            
-        a_name_raw = TextSanitizer.clean(getattr(a, "name", ""))
-        b_name_raw = TextSanitizer.clean(getattr(b, "name", ""))
         
         a_name = IdentityTools.name_tokens(a_name_raw, getattr(a, "brand", ""))
         b_name = IdentityTools.name_tokens(b_name_raw, getattr(b, "brand", ""))
@@ -6295,6 +7363,16 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     if args.debug_timing and catalog_hits:
         print(f"{D}[SYS] Designer catalog linked {catalog_hits} candidate(s).{Z}")
     timer.mark("designer_catalog_resolve")
+    bn_crosswalk_hits = SearchSniper.attach_from_bn_crosswalk(
+        scraper,
+        candidates,
+        cache,
+        budget_seconds=min(4.0, args.catalog_budget),
+        trace=trace,
+    )
+    if args.debug_timing and bn_crosswalk_hits:
+        print(f"{D}[SYS] BN crosswalk linked {bn_crosswalk_hits} candidate(s).{Z}")
+    timer.mark("bn_crosswalk_resolve")
     if args.related_budget > 0:
         related_hits = SearchSniper.attach_related_from_known_pages(
             scraper,
@@ -6353,32 +7431,44 @@ def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
                 repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
+        catalog_labels = IdentityTools.catalog_brand_keys("", query)
         canonical_brand = IdentityTools.canonical_brand_query(query)
         if canonical_brand:
-            catalog = SearchSniper.catalog_candidates_for_brand(
-                scraper,
-                canonical_brand,
-                Deadline(args.catalog_budget),
-                slug_limit=args.catalog_slug_limit,
-            )
+            catalog_labels = IdentityTools.catalog_brand_keys(canonical_brand, query)
+        if catalog_labels:
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
-            for item in catalog:
-                if item.url in seen:
-                    continue
-                seen.add(item.url)
-                frag = UnifiedFragrance(
-                    name=item.name,
-                    brand=item.brand,
-                    year=item.year,
-                    frag_url=item.url,
-                    resolver_source="designer_catalog_brand_query",
-                    resolver_score=0.98,
-                    query_score=1.0,
+            deadline = Deadline(args.catalog_budget)
+            for brand_label in catalog_labels:
+                if deadline.expired():
+                    break
+                catalog = SearchSniper.catalog_candidates_for_brand(
+                    scraper,
+                    brand_label,
+                    deadline,
+                    slug_limit=args.catalog_slug_limit,
                 )
-                brand_results.append(frag)
+                for item in catalog:
+                    if item.url in seen:
+                        continue
+                    seen.add(item.url)
+                    frag = UnifiedFragrance(
+                        name=item.name,
+                        brand=item.brand,
+                        year=item.year,
+                        frag_url=item.url,
+                        resolver_source="designer_catalog_brand_query",
+                        resolver_score=0.98,
+                        query_score=IdentityTools.relevance_score(query, UnifiedFragrance(
+                            name=item.name, brand=item.brand, year=item.year,
+                        )),
+                    )
+                    brand_results.append(frag)
+                    if len(brand_results) >= args.max_results:
+                        break
                 if len(brand_results) >= args.max_results:
                     break
+            brand_results = filter_relevant_candidates(query, brand_results)
             if brand_results:
                 return brand_results
         best = max((item.query_score for item in candidates), default=0.0)
@@ -6390,10 +7480,12 @@ def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
 def fetch_selected_details(scraper, selected: UnifiedFragrance, detail_timeout: float) -> UnifiedDetails:
     details = UnifiedDetails(notes=NotesList())
     deadline = Deadline(detail_timeout)
-    bounded_parallel({
-        "bn": lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline),
+    jobs = {
         "fg": lambda: FragranticaEngine.fetch_details(scraper, selected.frag_url, details, deadline=deadline),
-    }, seconds=detail_timeout, max_workers=2)
+    }
+    if selected.bn_url:
+        jobs["bn"] = lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline)
+    bounded_parallel(jobs, seconds=detail_timeout, max_workers=len(jobs), raise_on={"fg"})
     normalize_notes(details.notes)
     details.reviews = dedupe_reviews(details.reviews)
     # FG + BN detail synchronization is complete; attach the normalized,

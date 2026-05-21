@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from fastapi import HTTPException
+
 import api
 import fragrance_parser_full_rewrite_fixed as engine
 
@@ -33,6 +35,49 @@ def test_live_candidate_filter() -> None:
     filtered = engine.filter_relevant_candidates("dior", rows)
     identities = [(item.brand, item.name) for item in filtered]
     check("brand-only query keeps matching brand rows", identities == [("Dior", "J'adore Eau de Toilette 2002")], str(identities))
+
+
+def test_sub_brand_catalog_keys_for_casamorati() -> None:
+    print("Sub-brand catalog key checks:")
+    keys = engine.IdentityTools.catalog_brand_keys(
+        "Xerjoff",
+        "Casamorati Mefisto",
+        bn_url="https://basenotes.com/fragrances/casamorati-mefisto-by-xerjoff.26136299",
+    )
+    normalized = [engine.TextSanitizer.normalize_identity(key) for key in keys]
+    check("parent house is included", "xerjoff" in normalized, str(keys))
+    check("sub-line alias Casamorati 1888 is included", "casamorati 1888" in normalized, str(keys))
+
+
+def test_compatible_catalog_brand_accepts_parent_line() -> None:
+    print("Catalog parent/line brand compatibility checks:")
+    ok = engine.IdentityTools.compatible_catalog_brand(
+        "Xerjoff",
+        "Casamorati 1888",
+        "Casamorati Mefisto",
+    )
+    check("Xerjoff house can match Casamorati 1888 catalog brand", ok, "compatible_catalog_brand returned False")
+
+
+def test_native_search_unusable_detects_junk() -> None:
+    print("Native Fragrantica search junk checks:")
+    query = "Xerjoff Casamorati Mefisto"
+    junk_rows = [
+        candidate("Azzaro", "Orange Tonic"),
+        candidate("Givenchy", "Amarige"),
+        candidate("Lanvin", "Arpege Pour Homme"),
+    ]
+    check(
+        "unrelated FG rows with no query anchors are unusable",
+        engine.FragranticaEngine.native_search_unusable(query, junk_rows),
+        "expected unusable",
+    )
+    good_rows = junk_rows + [candidate("Casamorati 1888", "Mefisto")]
+    check(
+        "FG rows containing a query anchor are usable",
+        not engine.FragranticaEngine.native_search_unusable(query, good_rows),
+        "expected usable",
+    )
 
 
 def test_brand_plus_name_filter() -> None:
@@ -123,6 +168,37 @@ def test_details_request_recovers_identity_from_legacy_blank_id() -> None:
     )
 
 
+def test_details_request_accepts_source_prefixed_id() -> None:
+    print("Source-prefixed id recovery checks:")
+    url = "https://www.fragrantica.com/perfume/Le-Labo/Santal-33-12201.html"
+    selected = api._candidate_from_request(api.DetailRequest(id=f"source:{url}"))
+    check("source: id routes to fragrantica URL", selected.frag_url == url, selected.frag_url)
+    check("source: id recovers display name", selected.name == "Santal 33", selected.name)
+    check("source: id recovers display house", selected.brand == "Le Labo", selected.brand)
+
+
+def test_details_request_rejects_bad_source_prefixed_id() -> None:
+    print("Source-prefixed id validation checks:")
+    try:
+        api._candidate_from_request(api.DetailRequest(id="source:javascript:fragrantica.com"))
+    except HTTPException as exc:
+        check("bad source: id returns 400", exc.status_code == 400, str(exc.status_code))
+        check("bad source: id error is clear", "source_url must" in str(exc.detail), str(exc.detail))
+    else:
+        check("bad source: id returns 400", False, "no exception")
+
+
+def test_details_request_rejects_app_catalog_ids_clearly() -> None:
+    print("App-catalog id routing checks:")
+    try:
+        api._candidate_from_request(api.DetailRequest(id="catalog:test"))
+    except HTTPException as exc:
+        check("catalog id returns a clear 400", exc.status_code == 400, str(exc.status_code))
+        check("catalog id error is not base64 padding", "padding" not in str(exc.detail).lower(), str(exc.detail))
+    else:
+        check("catalog id returns a clear 400", False, "no exception")
+
+
 def test_bundled_identity_cache_rescues_deploy_repros() -> None:
     print("Bundled identity-cache fallback checks:")
     old_cache = api._ARGS.fg_cache
@@ -156,11 +232,17 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
 
 def main() -> int:
     test_live_candidate_filter()
+    test_sub_brand_catalog_keys_for_casamorati()
+    test_compatible_catalog_brand_accepts_parent_line()
+    test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_api_cache_threshold_matches_engine()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()
+    test_details_request_accepts_source_prefixed_id()
+    test_details_request_rejects_bad_source_prefixed_id()
+    test_details_request_rejects_app_catalog_ids_clearly()
     test_bundled_identity_cache_rescues_deploy_repros()
 
     print()

@@ -1,6 +1,21 @@
 [phases.setup]
-aptPkgs = ["chromium", "chromium-driver"]
+# Ubuntu 22.04's apt `chromium` / `chromium-browser` packages are snap-transition
+# shims (they print "requires the chromium snap to be installed" and exit). Snap
+# does not run inside Railway's container, so DrissionPage's ChromiumPage timed
+# out with BrowserConnectError on every mint. nixPkgs gives us a real Chromium
+# binary on PATH (Nix-managed, not snap), which DrissionPage can drive.
+#
+# Declaring [phases.setup] replaces the auto-detected provider setup, so we have
+# to list Python here too -- otherwise `python -m venv` fails with exit 127.
+#
+# nixpkgsArchive currently pins Chromium to 122.0.6261.69 (2024-02-24). This
+# did not by itself fix Railway's DevTools WebSocket 404, so do not treat
+# Chromium 130 as the sole root cause. The app also patches DrissionPage's
+# suppressed websocket Origin header automatically when running on Railway.
+nixpkgsArchive = "336eda0d07dc5e2be1f923990ad9fdb6bc8e28e3"
+nixPkgs = ["python311", "gcc", "chromium", "xvfb-run"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
-BASENOTES_CHROMIUM_PATH = "/bin/chromium-browser"
+# BASENOTES_CHROMIUM_PATH intentionally unset: the engine's mint helpers fall
+# back to shutil.which("chromium") which resolves to the nixPkgs binary.
