@@ -277,6 +277,8 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
         "image_url": getattr(item, "image_url", None),
         "gender": "Unisex / Unspecified",  # engine default; resolved at detail
         "source_url": source_url,
+        "bn_positive_pct": getattr(item, "bn_positive_pct", -1),
+        "bn_vote_count": getattr(item, "bn_vote_count", 0),
     }
 
 
