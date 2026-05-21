@@ -418,6 +418,7 @@ def requeue_job(job_id: str, *, priority: int = 10) -> dict[str, Any] | None:
             SET status = 'pending',
                 priority = GREATEST(priority, %s),
                 requested_count = requested_count + 1,
+                failure_count = 0,
                 last_requested_at = now(),
                 claimed_at = NULL,
                 claim_expires_at = NULL,
@@ -724,13 +725,13 @@ def _find_fragrance_record_key(
         """
         SELECT record_key
         FROM fragrance_records
-        WHERE (%s IS NOT NULL AND canonical_fg_url = %s)
-           OR (%s IS NOT NULL AND bn_url = %s)
-           OR record_key = %s
+        WHERE (%s::text IS NOT NULL AND canonical_fg_url = %s::text)
+           OR (%s::text IS NOT NULL AND bn_url = %s::text)
+           OR record_key = %s::text
         ORDER BY
             CASE
-                WHEN %s IS NOT NULL AND canonical_fg_url = %s THEN 0
-                WHEN %s IS NOT NULL AND bn_url = %s THEN 1
+                WHEN %s::text IS NOT NULL AND canonical_fg_url = %s::text THEN 0
+                WHEN %s::text IS NOT NULL AND bn_url = %s::text THEN 1
                 ELSE 2
             END
         LIMIT 1
@@ -900,12 +901,12 @@ def lookup_fragrance_record(
             """
             SELECT *
             FROM fragrance_records
-            WHERE (%s IS NOT NULL AND canonical_fg_url = %s)
-               OR (%s IS NOT NULL AND bn_url = %s)
+            WHERE (%s::text IS NOT NULL AND canonical_fg_url = %s::text)
+               OR (%s::text IS NOT NULL AND bn_url = %s::text)
             ORDER BY
                 CASE
-                    WHEN %s IS NOT NULL AND canonical_fg_url = %s THEN 0
-                    WHEN %s IS NOT NULL AND bn_url = %s THEN 1
+                    WHEN %s::text IS NOT NULL AND canonical_fg_url = %s::text THEN 0
+                    WHEN %s::text IS NOT NULL AND bn_url = %s::text THEN 1
                     ELSE 2
                 END
             LIMIT 1
