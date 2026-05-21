@@ -29,6 +29,7 @@ on every boot and never drops or rewrites existing data.
 """
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ from typing import Any
 # installed in a given environment.
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 ENABLED = bool(DATABASE_URL)
+logger = logging.getLogger(__name__)
 
 _pool: Any = None  # psycopg_pool.ConnectionPool, lazily created in init_db()
 
@@ -229,6 +231,68 @@ def _now() -> datetime:
 # ---------------------------------------------------------------------------
 # enrichment_jobs -- Pass 1 queue
 # ---------------------------------------------------------------------------
+
+
+def _upsert_completed_fragrance_record(
+    conn: Any, job: dict[str, Any], cache_row: dict[str, Any]
+) -> None:
+    """Best-effort aggregate update for a completed enrichment payload."""
+    from psycopg.types.json import Json
+
+    record_key = _find_fragrance_record_key(
+        conn,
+        canonical_fg_url=_clean_url(cache_row["canonical_fg_url"]),
+        bn_url=_clean_url(job.get("bn_url")),
+        fallback_key=_fragrance_record_key(
+            {
+                "canonical_fg_url": cache_row["canonical_fg_url"],
+                "bn_url": job.get("bn_url"),
+                "name": cache_row.get("name"),
+                "house": cache_row.get("house"),
+                "year": cache_row.get("year"),
+            }
+        ),
+    )
+    fg_raw = {
+        "frag_cards": cache_row["frag_cards"],
+        "notes": cache_row.get("notes") or {},
+        "pros_cons": cache_row.get("pros_cons") or [],
+        "reviews": cache_row.get("reviews") or [],
+        "raw_identity": cache_row.get("raw_identity") or {},
+        "source": cache_row.get("source", "worker"),
+        "quality_status": cache_row.get("quality_status", "complete"),
+    }
+    conn.execute(
+        """
+        INSERT INTO fragrance_records
+            (record_key, canonical_fg_url, bn_url, name, house, year,
+             image_url, fg_raw_json, source_captured_at,
+             first_seen_at, last_seen_at, updated_at)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+        ON CONFLICT (record_key) DO UPDATE SET
+            canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
+            bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
+            name             = COALESCE(EXCLUDED.name, fragrance_records.name),
+            house            = COALESCE(EXCLUDED.house, fragrance_records.house),
+            year             = COALESCE(EXCLUDED.year, fragrance_records.year),
+            image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+            fg_raw_json      = EXCLUDED.fg_raw_json,
+            source_captured_at = now(),
+            last_seen_at     = now(),
+            updated_at       = now()
+        """,
+        (
+            record_key,
+            _clean_url(cache_row["canonical_fg_url"]),
+            _clean_url(job.get("bn_url")),
+            _clean_text(cache_row.get("name")),
+            _clean_text(cache_row.get("house")),
+            cache_row.get("year"),
+            _clean_text(cache_row.get("image_url")),
+            Json(fg_raw),
+        ),
+    )
 
 
 def enqueue_job(
@@ -533,60 +597,18 @@ def complete_job(job_id: str, cache_row: dict[str, Any]) -> dict[str, Any] | Non
                     cache_row.get("quality_status", "complete"),
                 ),
             )
-            record_key = _find_fragrance_record_key(
-                conn,
-                canonical_fg_url=_clean_url(cache_row["canonical_fg_url"]),
-                bn_url=_clean_url(job.get("bn_url")),
-                fallback_key=_fragrance_record_key(
-                    {
-                        "canonical_fg_url": cache_row["canonical_fg_url"],
-                        "bn_url": job.get("bn_url"),
-                        "name": cache_row.get("name"),
-                        "house": cache_row.get("house"),
-                        "year": cache_row.get("year"),
-                    }
-                ),
-            )
-            fg_raw = {
-                "frag_cards": cache_row["frag_cards"],
-                "notes": cache_row.get("notes") or {},
-                "pros_cons": cache_row.get("pros_cons") or [],
-                "reviews": cache_row.get("reviews") or [],
-                "raw_identity": cache_row.get("raw_identity") or {},
-                "source": cache_row.get("source", "worker"),
-                "quality_status": cache_row.get("quality_status", "complete"),
-            }
-            conn.execute(
-                """
-                INSERT INTO fragrance_records
-                    (record_key, canonical_fg_url, bn_url, name, house, year,
-                     image_url, fg_raw_json, source_captured_at,
-                     first_seen_at, last_seen_at, updated_at)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
-                ON CONFLICT (record_key) DO UPDATE SET
-                    canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
-                    bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
-                    name             = COALESCE(EXCLUDED.name, fragrance_records.name),
-                    house            = COALESCE(EXCLUDED.house, fragrance_records.house),
-                    year             = COALESCE(EXCLUDED.year, fragrance_records.year),
-                    image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
-                    fg_raw_json      = EXCLUDED.fg_raw_json,
-                    source_captured_at = now(),
-                    last_seen_at     = now(),
-                    updated_at       = now()
-                """,
-                (
-                    record_key,
-                    _clean_url(cache_row["canonical_fg_url"]),
-                    _clean_url(job.get("bn_url")),
-                    _clean_text(cache_row.get("name")),
-                    _clean_text(cache_row.get("house")),
-                    cache_row.get("year"),
-                    _clean_text(cache_row.get("image_url")),
-                    Json(fg_raw),
-                ),
-            )
+            try:
+                # The aggregate record is an acceleration layer. Keep the
+                # worker contract healthy even if that secondary write hits an
+                # old schema, unique-index conflict, or malformed legacy row.
+                with conn.transaction():
+                    _upsert_completed_fragrance_record(conn, job, cache_row)
+            except Exception:
+                logger.exception(
+                    "complete_job aggregate record write failed job_id=%s canonical=%s",
+                    job_id,
+                    cache_row["canonical_fg_url"],
+                )
             updated = conn.execute(
                 """
                 UPDATE enrichment_jobs
