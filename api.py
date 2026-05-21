@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -100,6 +101,16 @@ _ALLOW_BUNDLED_FG_SEARCH_CACHE = _env_flag(
     default=not db.ENABLED or bool(os.environ.get("FG_CACHE_PATH")),
 )
 _CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or "0")
+    except (TypeError, ValueError):
+        return default
+
+
+_FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
 
 # Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
 # `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
@@ -269,6 +280,124 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
     }
 
 
+def _candidate_from_fragrance_record(
+    record: dict[str, Any], source: str = "fragrance_db"
+) -> engine.UnifiedFragrance | None:
+    fg_url = _canonical_fg_url(str(record.get("canonical_fg_url") or ""))
+    bn_url = str(record.get("bn_url") or "").strip()
+    name = str(record.get("name") or "").strip()
+    house = str(record.get("house") or "").strip()
+    year = str(record.get("year") or "").strip()
+    if fg_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
+        if _identity_needs_recovery(name):
+            name = engine.FragranticaEngine.name_from_url(fg_url) or name
+        if _identity_needs_recovery(house):
+            house = engine.FragranticaEngine.brand_from_url(fg_url) or house
+    if not name or not house:
+        return None
+    candidate = engine.UnifiedFragrance(
+        name=name,
+        brand=house,
+        year=year,
+        bn_url=bn_url,
+        frag_url=fg_url,
+        resolver_source=source,
+        resolver_score=0.99,
+    )
+    image_url = str(record.get("image_url") or "").strip()
+    if image_url:
+        setattr(candidate, "image_url", image_url)
+    search_blob = record.get("search") or {}
+    if isinstance(search_blob, dict):
+        try:
+            candidate.bn_positive_pct = int(search_blob.get("bn_positive_pct") or -1)
+        except (TypeError, ValueError):
+            candidate.bn_positive_pct = -1
+        try:
+            candidate.bn_vote_count = int(search_blob.get("bn_vote_count") or 0)
+        except (TypeError, ValueError):
+            candidate.bn_vote_count = 0
+    return candidate
+
+
+def _fragrance_record_is_stale(record: dict[str, Any]) -> bool:
+    if _FRAGRANCE_RECORD_TTL_HOURS <= 0:
+        return False
+    captured = str(record.get("source_captured_at") or record.get("updated_at") or "")
+    if not captured:
+        return False
+    try:
+        captured_at = datetime.fromisoformat(captured.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - captured_at > timedelta(
+        hours=_FRAGRANCE_RECORD_TTL_HOURS
+    )
+
+
+def _fragrance_record_search(
+    query: str, limit: int
+) -> list[engine.UnifiedFragrance]:
+    candidates: list[engine.UnifiedFragrance] = []
+    seen: set[str] = set()
+    for record in db.search_fragrance_records(query, limit=limit * 2):
+        if _fragrance_record_is_stale(record):
+            continue
+        item = _candidate_from_fragrance_record(record)
+        if not item:
+            continue
+        item.query_score = engine.IdentityTools.relevance_score(query, item)
+        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+            continue
+        key = item.frag_url or item.bn_url or item.cache_key
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
+    candidates.sort(
+        key=lambda item: (item.query_score, item.resolver_score, item.year),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def _persist_search_results(query: str, results: list[engine.UnifiedFragrance]) -> None:
+    """Best-effort light upsert of live search rows into the aggregate DB."""
+    if not db.ENABLED:
+        return
+    for item in results:
+        try:
+            identity = _recover_candidate_identity(item)
+            db.upsert_fragrance_search(
+                {
+                    "canonical_fg_url": _canonical_fg_url(item.frag_url),
+                    "bn_url": item.bn_url or None,
+                    "name": identity["name"] or item.name,
+                    "house": identity["house"] or item.brand,
+                    "year": _coerce_year(item.year),
+                    "image_url": getattr(item, "image_url", None),
+                    "search": _json_for_db_blob(
+                        {
+                            "query": query,
+                            "bn_positive_pct": getattr(item, "bn_positive_pct", None),
+                            "bn_vote_count": getattr(item, "bn_vote_count", None),
+                            "resolver_source": getattr(item, "resolver_source", None),
+                            "resolver_score": getattr(item, "resolver_score", None),
+                            "query_score": getattr(item, "query_score", None),
+                        }
+                    ),
+                }
+            )
+        except Exception:
+            logger.exception(
+                "upsert_fragrance_search failed name=%s house=%s",
+                item.name,
+                item.brand,
+            )
+
+
 def _candidate_from_cache_entry(
     entry: dict[str, Any], source: str
 ) -> engine.UnifiedFragrance | None:
@@ -361,24 +490,27 @@ def _identity_cache_search(query: str, limit: int) -> list[engine.UnifiedFragran
 def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedFragrance], str | None]:
     """Fallback search for blocked live providers, with DB as source of truth."""
     seen: set[str] = set()
-    candidates: list[engine.UnifiedFragrance] = []
+    candidates = _fragrance_record_search(query, limit)
     source: str | None = None
 
-    for entry in db.search_detail_cache(query, limit=limit * 2):
-        item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
-        if not item:
-            continue
-        item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
-            continue
-        key = item.frag_url or item.cache_key
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(item)
     if candidates:
-        source = "db"
+        source = "aggregate_db"
     else:
+        for entry in db.search_detail_cache(query, limit=limit * 2):
+            item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
+            if not item:
+                continue
+            item.query_score = engine.IdentityTools.relevance_score(query, item)
+            if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+                continue
+            key = item.frag_url or item.cache_key
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(item)
+        if candidates:
+            source = "db"
+    if not candidates:
         candidates = _json_cache_search(query, limit)
         if candidates:
             source = "json"
@@ -1224,6 +1356,16 @@ def search(
     if not query:
         raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
 
+    cached_results = _fragrance_record_search(query, _ARGS.max_results)
+    if cached_results:
+        diagnostics = _search_diagnostics(cached_results)
+        diagnostics["cache_source"] = "aggregate_db"
+        return {
+            "query": query,
+            "results": [_search_result_to_dict(item) for item in cached_results],
+            "diagnostics": diagnostics,
+        }
+
     scraper = engine.get_scraper()
     try:
         results = engine.search_once(scraper, query, _ARGS)
@@ -1238,6 +1380,8 @@ def search(
     # after URL-based backfills, suppress it instead of surfacing a broken
     # "House unavailable" row to the client.
     results = [item for item in results if _candidate_has_display_identity(item)]
+    if fallback_source != "aggregate_db":
+        _persist_search_results(query, results)
 
     diagnostics = _search_diagnostics(results)
     if fallback_source:
@@ -2797,6 +2941,166 @@ def _hydrate_details_from_entry(
     return True
 
 
+def _notes_to_dict(notes: engine.NotesList) -> dict[str, Any]:
+    return {
+        "has_pyramid": bool(notes.has_pyramid),
+        "top": list(notes.top or []),
+        "heart": list(notes.heart or []),
+        "base": list(notes.base or []),
+        "flat": list(notes.flat or []),
+    }
+
+
+def _review_to_dict(review: Any) -> dict[str, str]:
+    if isinstance(review, dict):
+        text = review.get("text", "")
+        source = review.get("source", "")
+    else:
+        text = getattr(review, "text", "")
+        source = getattr(review, "source", "")
+    return {
+        "text": str(text or ""),
+        "source": str(source or ""),
+    }
+
+
+def _review_source_is(review: dict[str, str], needle: str) -> bool:
+    return needle.lower() in str(review.get("source") or "").lower()
+
+
+def _record_has_detail_payload(record: dict[str, Any]) -> bool:
+    bn_raw = record.get("bn_raw") or {}
+    fg_raw = record.get("fg_raw") or {}
+    return bool(
+        bn_raw.get("bn_consensus")
+        or bn_raw.get("description")
+        or bn_raw.get("reviews")
+        or fg_raw.get("frag_cards")
+        or fg_raw.get("reviews")
+    )
+
+
+def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDetails:
+    bn_raw = record.get("bn_raw") or {}
+    fg_raw = record.get("fg_raw") or {}
+    notes_raw = fg_raw.get("notes") or bn_raw.get("notes") or {}
+    if not isinstance(notes_raw, dict):
+        notes_raw = {}
+    details = engine.UnifiedDetails(
+        notes=engine.NotesList(
+            has_pyramid=bool(notes_raw.get("has_pyramid", False)),
+            top=list(notes_raw.get("top", []) or []),
+            heart=list(notes_raw.get("heart", []) or []),
+            base=list(notes_raw.get("base", []) or []),
+            flat=list(notes_raw.get("flat", []) or []),
+        ),
+        gender=str(record.get("gender") or "Unisex / Unspecified"),
+        description=str(bn_raw.get("description") or ""),
+        bn_consensus=bn_raw.get("bn_consensus") or {},
+        frag_cards=fg_raw.get("frag_cards") or {},
+        pros_cons=list(fg_raw.get("pros_cons") or []),
+        derived_metrics=record.get("derived_metrics"),
+    )
+    for raw_review in list(bn_raw.get("reviews") or []) + list(fg_raw.get("reviews") or []):
+        if isinstance(raw_review, dict) and raw_review.get("text"):
+            details.reviews.append(
+                engine.Review(
+                    text=str(raw_review["text"]),
+                    source=str(raw_review.get("source", "")),
+                )
+            )
+    if details.derived_metrics is None:
+        try:
+            from derived_metrics_adapter import build_derived_metrics
+
+            details.derived_metrics = build_derived_metrics(details)
+        except Exception:
+            details.derived_metrics = None
+    return details
+
+
+def _lookup_stored_detail(
+    selected: engine.UnifiedFragrance,
+) -> engine.UnifiedDetails | None:
+    record = db.lookup_fragrance_record(
+        canonical_fg_url=_canonical_fg_url(selected.frag_url),
+        bn_url=selected.bn_url or None,
+    )
+    if (
+        not record
+        or not _record_has_detail_payload(record)
+        or _fragrance_record_is_stale(record)
+    ):
+        return None
+    item = _candidate_from_fragrance_record(record, source="fragrance_db_detail")
+    if item:
+        if _identity_needs_recovery(selected.name):
+            selected.name = item.name
+        if _identity_needs_recovery(selected.brand):
+            selected.brand = item.brand
+        selected.year = selected.year or item.year
+        selected.bn_url = selected.bn_url or item.bn_url
+        selected.frag_url = selected.frag_url or item.frag_url
+        image_url = getattr(item, "image_url", "")
+        if image_url and not getattr(selected, "image_url", ""):
+            setattr(selected, "image_url", image_url)
+    return _details_from_fragrance_record(record)
+
+
+def _persist_detail_record(
+    selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
+) -> None:
+    if not db.ENABLED:
+        return
+    try:
+        reviews = [_review_to_dict(r) for r in (details.reviews or [])]
+        bn_reviews = [r for r in reviews if _review_source_is(r, "basenotes")]
+        fg_reviews = [r for r in reviews if _review_source_is(r, "fragrantica")]
+        other_reviews = [
+            r
+            for r in reviews
+            if not _review_source_is(r, "basenotes")
+            and not _review_source_is(r, "fragrantica")
+        ]
+        notes_blob = _notes_to_dict(details.notes)
+        db.upsert_fragrance_details(
+            {
+                "canonical_fg_url": _canonical_fg_url(selected.frag_url),
+                "bn_url": selected.bn_url or None,
+                "name": selected.name or None,
+                "house": selected.brand or None,
+                "year": _coerce_year(selected.year),
+                "gender": details.gender,
+                "image_url": getattr(selected, "image_url", None),
+                "bn_raw": _json_for_db_blob(
+                    {
+                        "description": details.description,
+                        "bn_consensus": details.bn_consensus or {},
+                        "notes": notes_blob,
+                        "reviews": bn_reviews + other_reviews,
+                    }
+                ),
+                "fg_raw": _json_for_db_blob(
+                    {
+                        "frag_cards": details.frag_cards or {},
+                        "notes": notes_blob,
+                        "pros_cons": details.pros_cons or [],
+                        "reviews": fg_reviews,
+                    }
+                ),
+                "derived_metrics": _json_for_db_blob(details.derived_metrics)
+                if details.derived_metrics is not None
+                else None,
+            }
+        )
+    except Exception:
+        logger.exception(
+            "upsert_fragrance_details failed name=%s house=%s",
+            selected.name,
+            selected.brand,
+        )
+
+
 def _apply_fg_detail_cache_db(
     selected: engine.UnifiedFragrance, details: engine.UnifiedDetails
 ) -> bool:
@@ -3023,6 +3327,17 @@ def details(req: DetailRequest) -> dict[str, Any]:
             detail="Request resolved to no source URL; provide a valid 'id'.",
         )
 
+    stored_detail = _lookup_stored_detail(selected)
+    if stored_detail is not None:
+        _persist_detail_record(selected, stored_detail)
+        return _details_to_dict(
+            selected,
+            stored_detail,
+            fragrantica_cached=bool(stored_detail.frag_cards),
+            fragrantica_cache_source="aggregate_db" if stored_detail.frag_cards else None,
+            enrichment_status="complete",
+        )
+
     scraper = engine.get_scraper()
     try:
         detail_bundle = engine.fetch_selected_details(
@@ -3055,6 +3370,8 @@ def details(req: DetailRequest) -> dict[str, Any]:
         enrichment_status = "bundled_cache"
     elif not detail_bundle.frag_cards:
         enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
+
+    _persist_detail_record(selected, detail_bundle)
 
     return _details_to_dict(
         selected,

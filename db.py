@@ -88,6 +88,34 @@ CREATE TABLE IF NOT EXISTS enrichment_jobs (
 CREATE INDEX IF NOT EXISTS idx_enrichment_jobs_status
     ON enrichment_jobs (status, priority DESC, last_requested_at);
 
+CREATE TABLE IF NOT EXISTS fragrance_records (
+    record_key          TEXT PRIMARY KEY,
+    canonical_fg_url    TEXT,
+    bn_url              TEXT,
+    name                TEXT,
+    house               TEXT,
+    year                INTEGER,
+    gender              TEXT,
+    image_url           TEXT,
+    search_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fg_raw_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    bn_raw_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    derived_metrics_json JSONB,
+    source_captured_at  TIMESTAMPTZ,
+    metrics_computed_at TIMESTAMPTZ,
+    first_seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fragrance_records_fg_url
+    ON fragrance_records (canonical_fg_url)
+    WHERE canonical_fg_url IS NOT NULL AND canonical_fg_url <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fragrance_records_bn_url
+    ON fragrance_records (bn_url)
+    WHERE bn_url IS NOT NULL AND bn_url <> '';
+CREATE INDEX IF NOT EXISTS idx_fragrance_records_identity
+    ON fragrance_records (house, name);
+
 CREATE TABLE IF NOT EXISTS fg_detail_cache (
     canonical_fg_url  TEXT PRIMARY KEY,
     name              TEXT,
@@ -505,6 +533,60 @@ def complete_job(job_id: str, cache_row: dict[str, Any]) -> dict[str, Any] | Non
                     cache_row.get("quality_status", "complete"),
                 ),
             )
+            record_key = _find_fragrance_record_key(
+                conn,
+                canonical_fg_url=_clean_url(cache_row["canonical_fg_url"]),
+                bn_url=_clean_url(job.get("bn_url")),
+                fallback_key=_fragrance_record_key(
+                    {
+                        "canonical_fg_url": cache_row["canonical_fg_url"],
+                        "bn_url": job.get("bn_url"),
+                        "name": cache_row.get("name"),
+                        "house": cache_row.get("house"),
+                        "year": cache_row.get("year"),
+                    }
+                ),
+            )
+            fg_raw = {
+                "frag_cards": cache_row["frag_cards"],
+                "notes": cache_row.get("notes") or {},
+                "pros_cons": cache_row.get("pros_cons") or [],
+                "reviews": cache_row.get("reviews") or [],
+                "raw_identity": cache_row.get("raw_identity") or {},
+                "source": cache_row.get("source", "worker"),
+                "quality_status": cache_row.get("quality_status", "complete"),
+            }
+            conn.execute(
+                """
+                INSERT INTO fragrance_records
+                    (record_key, canonical_fg_url, bn_url, name, house, year,
+                     image_url, fg_raw_json, source_captured_at,
+                     first_seen_at, last_seen_at, updated_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+                ON CONFLICT (record_key) DO UPDATE SET
+                    canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
+                    bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
+                    name             = COALESCE(EXCLUDED.name, fragrance_records.name),
+                    house            = COALESCE(EXCLUDED.house, fragrance_records.house),
+                    year             = COALESCE(EXCLUDED.year, fragrance_records.year),
+                    image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+                    fg_raw_json      = EXCLUDED.fg_raw_json,
+                    source_captured_at = now(),
+                    last_seen_at     = now(),
+                    updated_at       = now()
+                """,
+                (
+                    record_key,
+                    _clean_url(cache_row["canonical_fg_url"]),
+                    _clean_url(job.get("bn_url")),
+                    _clean_text(cache_row.get("name")),
+                    _clean_text(cache_row.get("house")),
+                    cache_row.get("year"),
+                    _clean_text(cache_row.get("image_url")),
+                    Json(fg_raw),
+                ),
+            )
             updated = conn.execute(
                 """
                 UPDATE enrichment_jobs
@@ -572,6 +654,288 @@ def ignore_job(job_id: str, note: str | None) -> dict[str, Any] | None:
             (note, job_id),
         ).fetchone()
         return _job_to_dict(row) if row else None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# fragrance_records -- write-through aggregate built by user traffic
+# ---------------------------------------------------------------------------
+
+
+def _clean_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _clean_url(value: Any) -> str | None:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return None
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        if "/" in rest:
+            host, path = rest.split("/", 1)
+            text = f"{scheme.lower()}://{host.lower()}/{path}"
+        else:
+            text = f"{scheme.lower()}://{rest.lower()}"
+    return text
+
+
+def _fragrance_record_key(row: dict[str, Any]) -> str:
+    fg_url = _clean_url(row.get("canonical_fg_url"))
+    bn_url = _clean_url(row.get("bn_url"))
+    if fg_url:
+        return f"fg:{fg_url}"
+    if bn_url:
+        return f"bn:{bn_url}"
+    house = str(row.get("house") or "").strip().lower()
+    name = str(row.get("name") or "").strip().lower()
+    year = str(row.get("year") or "").strip()
+    return f"id:{house}|{name}|{year}"
+
+
+def _find_fragrance_record_key(
+    conn: Any, *, canonical_fg_url: str | None, bn_url: str | None, fallback_key: str
+) -> str:
+    row = conn.execute(
+        """
+        SELECT record_key
+        FROM fragrance_records
+        WHERE (%s IS NOT NULL AND canonical_fg_url = %s)
+           OR (%s IS NOT NULL AND bn_url = %s)
+           OR record_key = %s
+        ORDER BY
+            CASE
+                WHEN %s IS NOT NULL AND canonical_fg_url = %s THEN 0
+                WHEN %s IS NOT NULL AND bn_url = %s THEN 1
+                ELSE 2
+            END
+        LIMIT 1
+        """,
+        (
+            canonical_fg_url,
+            canonical_fg_url,
+            bn_url,
+            bn_url,
+            fallback_key,
+            canonical_fg_url,
+            canonical_fg_url,
+            bn_url,
+            bn_url,
+        ),
+    ).fetchone()
+    return row["record_key"] if row else fallback_key
+
+
+def upsert_fragrance_search(row: dict[str, Any]) -> None:
+    """Light write-through upsert from /search. No extra fetches."""
+    if not ENABLED:
+        return
+    from psycopg.types.json import Json
+
+    canonical_fg_url = _clean_url(row.get("canonical_fg_url"))
+    bn_url = _clean_url(row.get("bn_url"))
+    fallback_key = _fragrance_record_key(
+        {**row, "canonical_fg_url": canonical_fg_url, "bn_url": bn_url}
+    )
+    ctx, conn = _conn()
+    try:
+        with conn.transaction():
+            record_key = _find_fragrance_record_key(
+                conn,
+                canonical_fg_url=canonical_fg_url,
+                bn_url=bn_url,
+                fallback_key=fallback_key,
+            )
+            conn.execute(
+                """
+                INSERT INTO fragrance_records
+                    (record_key, canonical_fg_url, bn_url, name, house, year,
+                     image_url, search_json, source_captured_at, first_seen_at,
+                     last_seen_at, updated_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+                ON CONFLICT (record_key) DO UPDATE SET
+                    canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
+                    bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
+                    name             = COALESCE(EXCLUDED.name, fragrance_records.name),
+                    house            = COALESCE(EXCLUDED.house, fragrance_records.house),
+                    year             = COALESCE(EXCLUDED.year, fragrance_records.year),
+                    image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+                    search_json      = fragrance_records.search_json || EXCLUDED.search_json,
+                    source_captured_at = now(),
+                    last_seen_at     = now(),
+                    updated_at       = now()
+                """,
+                (
+                    record_key,
+                    canonical_fg_url,
+                    bn_url,
+                    _clean_text(row.get("name")),
+                    _clean_text(row.get("house")),
+                    row.get("year"),
+                    _clean_text(row.get("image_url")),
+                    Json(row.get("search") or {}),
+                ),
+            )
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def upsert_fragrance_details(row: dict[str, Any]) -> None:
+    """Full write-through upsert from /details, including raw source blobs."""
+    if not ENABLED:
+        return
+    from psycopg.types.json import Json
+
+    canonical_fg_url = _clean_url(row.get("canonical_fg_url"))
+    bn_url = _clean_url(row.get("bn_url"))
+    fallback_key = _fragrance_record_key(
+        {**row, "canonical_fg_url": canonical_fg_url, "bn_url": bn_url}
+    )
+    fg_raw = row.get("fg_raw") or {}
+    bn_raw = row.get("bn_raw") or {}
+    derived_metrics = row.get("derived_metrics")
+    ctx, conn = _conn()
+    try:
+        with conn.transaction():
+            record_key = _find_fragrance_record_key(
+                conn,
+                canonical_fg_url=canonical_fg_url,
+                bn_url=bn_url,
+                fallback_key=fallback_key,
+            )
+            conn.execute(
+                """
+                INSERT INTO fragrance_records
+                    (record_key, canonical_fg_url, bn_url, name, house, year,
+                     gender, image_url, search_json, fg_raw_json, bn_raw_json,
+                     derived_metrics_json, source_captured_at,
+                     metrics_computed_at, first_seen_at, last_seen_at, updated_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                     now(), CASE WHEN %s THEN now() ELSE NULL END, now(), now(), now())
+                ON CONFLICT (record_key) DO UPDATE SET
+                    canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
+                    bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
+                    name             = COALESCE(EXCLUDED.name, fragrance_records.name),
+                    house            = COALESCE(EXCLUDED.house, fragrance_records.house),
+                    year             = COALESCE(EXCLUDED.year, fragrance_records.year),
+                    gender           = COALESCE(EXCLUDED.gender, fragrance_records.gender),
+                    image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+                    search_json      = fragrance_records.search_json || EXCLUDED.search_json,
+                    fg_raw_json      = CASE
+                        WHEN EXCLUDED.fg_raw_json <> '{}'::jsonb THEN EXCLUDED.fg_raw_json
+                        ELSE fragrance_records.fg_raw_json
+                    END,
+                    bn_raw_json      = CASE
+                        WHEN EXCLUDED.bn_raw_json <> '{}'::jsonb THEN EXCLUDED.bn_raw_json
+                        ELSE fragrance_records.bn_raw_json
+                    END,
+                    derived_metrics_json = COALESCE(EXCLUDED.derived_metrics_json, fragrance_records.derived_metrics_json),
+                    source_captured_at = now(),
+                    metrics_computed_at = CASE
+                        WHEN EXCLUDED.derived_metrics_json IS NOT NULL THEN now()
+                        ELSE fragrance_records.metrics_computed_at
+                    END,
+                    last_seen_at     = now(),
+                    updated_at       = now()
+                """,
+                (
+                    record_key,
+                    canonical_fg_url,
+                    bn_url,
+                    _clean_text(row.get("name")),
+                    _clean_text(row.get("house")),
+                    row.get("year"),
+                    _clean_text(row.get("gender")),
+                    _clean_text(row.get("image_url")),
+                    Json(row.get("search") or {}),
+                    Json(fg_raw),
+                    Json(bn_raw),
+                    Json(derived_metrics) if derived_metrics is not None else None,
+                    derived_metrics is not None,
+                ),
+            )
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def lookup_fragrance_record(
+    *, canonical_fg_url: str | None = None, bn_url: str | None = None
+) -> dict[str, Any] | None:
+    """Fetch one aggregate record by either source URL."""
+    if not ENABLED:
+        return None
+    canonical_fg_url = _clean_url(canonical_fg_url)
+    bn_url = _clean_url(bn_url)
+    if not canonical_fg_url and not bn_url:
+        return None
+    ctx, conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM fragrance_records
+            WHERE (%s IS NOT NULL AND canonical_fg_url = %s)
+               OR (%s IS NOT NULL AND bn_url = %s)
+            ORDER BY
+                CASE
+                    WHEN %s IS NOT NULL AND canonical_fg_url = %s THEN 0
+                    WHEN %s IS NOT NULL AND bn_url = %s THEN 1
+                    ELSE 2
+                END
+            LIMIT 1
+            """,
+            (
+                canonical_fg_url,
+                canonical_fg_url,
+                bn_url,
+                bn_url,
+                canonical_fg_url,
+                canonical_fg_url,
+                bn_url,
+                bn_url,
+            ),
+        ).fetchone()
+        return _fragrance_record_to_dict(row) if row else None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Search aggregate identities. Empty when storage is absent/disabled."""
+    if not ENABLED:
+        return []
+    text = (query or "").strip()
+    if not text:
+        return []
+    limit = max(1, min(int(limit or 15), 50))
+    like = f"%{text}%"
+    ctx, conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM fragrance_records
+            WHERE name ILIKE %s
+               OR house ILIKE %s
+               OR concat_ws(' ', house, name) ILIKE %s
+               OR concat_ws(' ', name, house) ILIKE %s
+            ORDER BY
+                CASE
+                    WHEN concat_ws(' ', house, name) ILIKE %s THEN 0
+                    WHEN name ILIKE %s THEN 1
+                    WHEN house ILIKE %s THEN 2
+                    ELSE 3
+                END,
+                last_seen_at DESC
+            LIMIT %s
+            """,
+            (like, like, like, like, like, like, like, limit),
+        ).fetchall()
+        return [_fragrance_record_to_dict(row) for row in rows]
     finally:
         ctx.__exit__(None, None, None)
 
@@ -678,6 +1042,30 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Row serialization
 # ---------------------------------------------------------------------------
+
+
+def _fragrance_record_to_dict(row: Any) -> dict[str, Any]:
+    if not row:
+        return {}
+    return {
+        "record_key": row["record_key"],
+        "canonical_fg_url": row["canonical_fg_url"],
+        "bn_url": row["bn_url"],
+        "name": row["name"],
+        "house": row["house"],
+        "year": row["year"],
+        "gender": row["gender"],
+        "image_url": row["image_url"],
+        "search": row["search_json"] or {},
+        "fg_raw": row["fg_raw_json"] or {},
+        "bn_raw": row["bn_raw_json"] or {},
+        "derived_metrics": row["derived_metrics_json"],
+        "source_captured_at": _iso(row["source_captured_at"]),
+        "metrics_computed_at": _iso(row["metrics_computed_at"]),
+        "first_seen_at": _iso(row["first_seen_at"]),
+        "last_seen_at": _iso(row["last_seen_at"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
 
 
 def _iso(dt: Any) -> str | None:
