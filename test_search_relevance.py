@@ -37,6 +37,49 @@ def test_live_candidate_filter() -> None:
     check("brand-only query keeps matching brand rows", identities == [("Dior", "J'adore Eau de Toilette 2002")], str(identities))
 
 
+def test_sub_brand_catalog_keys_for_casamorati() -> None:
+    print("Sub-brand catalog key checks:")
+    keys = engine.IdentityTools.catalog_brand_keys(
+        "Xerjoff",
+        "Casamorati Mefisto",
+        bn_url="https://basenotes.com/fragrances/casamorati-mefisto-by-xerjoff.26136299",
+    )
+    normalized = [engine.TextSanitizer.normalize_identity(key) for key in keys]
+    check("parent house is included", "xerjoff" in normalized, str(keys))
+    check("sub-line alias Casamorati 1888 is included", "casamorati 1888" in normalized, str(keys))
+
+
+def test_compatible_catalog_brand_accepts_parent_line() -> None:
+    print("Catalog parent/line brand compatibility checks:")
+    ok = engine.IdentityTools.compatible_catalog_brand(
+        "Xerjoff",
+        "Casamorati 1888",
+        "Casamorati Mefisto",
+    )
+    check("Xerjoff house can match Casamorati 1888 catalog brand", ok, "compatible_catalog_brand returned False")
+
+
+def test_native_search_unusable_detects_junk() -> None:
+    print("Native Fragrantica search junk checks:")
+    query = "Xerjoff Casamorati Mefisto"
+    junk_rows = [
+        candidate("Azzaro", "Orange Tonic"),
+        candidate("Givenchy", "Amarige"),
+        candidate("Lanvin", "Arpege Pour Homme"),
+    ]
+    check(
+        "unrelated FG rows with no query anchors are unusable",
+        engine.FragranticaEngine.native_search_unusable(query, junk_rows),
+        "expected unusable",
+    )
+    good_rows = junk_rows + [candidate("Casamorati 1888", "Mefisto")]
+    check(
+        "FG rows containing a query anchor are usable",
+        not engine.FragranticaEngine.native_search_unusable(query, good_rows),
+        "expected usable",
+    )
+
+
 def test_brand_plus_name_filter() -> None:
     print("Brand + name relevance checks:")
     rows = [
@@ -189,6 +232,9 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
 
 def main() -> int:
     test_live_candidate_filter()
+    test_sub_brand_catalog_keys_for_casamorati()
+    test_compatible_catalog_brand_accepts_parent_line()
+    test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_api_cache_threshold_matches_engine()
     test_search_serialization_recovers_fragrantica_identity()

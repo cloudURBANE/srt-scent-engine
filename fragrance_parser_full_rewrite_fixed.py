@@ -459,6 +459,12 @@ class IdentityTools:
         "jpg": {"jean paul gaultier", "jpg"},
         "dolce and gabbana": {"dolce and gabbana", "d and g", "dg"},
     }
+    # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
+    # Keys are normalized sub-line tokens; values are designer labels to crawl.
+    FRAGRANTICA_LINE_ALIASES: dict[str, tuple[str, ...]] = {
+        "casamorati": ("Casamorati 1888",),
+        "casamorati 1888": ("Casamorati 1888",),
+    }
     
     @staticmethod
     def tokenized(text: str) -> set[str]:
@@ -505,6 +511,98 @@ class IdentityTools:
             if normalized in all_forms:
                 return canonical
         return normalized if normalized in IdentityTools.BRAND_ALIASES else ""
+
+    @staticmethod
+    def sub_brand_label(name: str, house: str = "") -> str:
+        """Leading product-line token when it is not the parent house (e.g. Casamorati Mefisto / Xerjoff)."""
+        cleaned = TextSanitizer.clean(name)
+        if not cleaned or not TextSanitizer.clean(house):
+            return ""
+        tokens = [t for t in TextSanitizer.normalize_identity(cleaned).split() if t and t not in IdentityTools.STOPWORDS]
+        if len(tokens) < 2:
+            return ""
+        lead = tokens[0]
+        if len(lead) < 4:
+            return ""
+        if house:
+            house_tokens = IdentityTools.brand_tokens(house)
+            if lead in house_tokens:
+                return ""
+            if any(IdentityTools.compatible_brand(lead, form) for form in IdentityTools.brand_forms(house)):
+                return ""
+        return cleaned.split()[0]
+
+    @staticmethod
+    def sub_brand_from_bn_slug(bn_url: str) -> str:
+        if not bn_url:
+            return ""
+        slug = bn_url.rstrip("/").split("/")[-1]
+        slug = re.sub(r"\.\d+$", "", slug, flags=re.I)
+        slug = re.split(r"(?i)-by-", slug, maxsplit=1)[0]
+        lead = slug.split("-", 1)[0] if slug else ""
+        if len(lead) < 4:
+            return ""
+        return TextSanitizer.title_from_slug(lead)
+
+    @staticmethod
+    def catalog_brand_keys(house: str, name: str = "", *, bn_url: str = "") -> list[str]:
+        """Ordered designer labels to crawl: parent house, sub-line, and Fragrantica line aliases."""
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def add(label: str) -> None:
+            cleaned = TextSanitizer.clean(label)
+            norm = TextSanitizer.normalize_identity(cleaned)
+            if not norm or norm in seen:
+                return
+            seen.add(norm)
+            keys.append(cleaned)
+
+        if house:
+            add(house)
+        sub = IdentityTools.sub_brand_label(name, house)
+        if sub:
+            add(sub)
+        slug_sub = IdentityTools.sub_brand_from_bn_slug(bn_url)
+        if slug_sub:
+            add(slug_sub)
+        for norm_key in list(seen):
+            for alias in IdentityTools.FRAGRANTICA_LINE_ALIASES.get(norm_key, ()):
+                add(alias)
+        combined_norm = TextSanitizer.normalize_identity(f"{house} {name}")
+        for line_key, aliases in IdentityTools.FRAGRANTICA_LINE_ALIASES.items():
+            if line_key in combined_norm:
+                for alias in aliases:
+                    add(alias)
+        return keys
+
+    @staticmethod
+    def query_anchor_tokens(query: str) -> set[str]:
+        """Distinctive query tokens used to sanity-check native Fragrantica search rows."""
+        anchors: set[str] = set()
+        for token in TextSanitizer.normalize_identity(query).split():
+            if len(token) >= 4 and token not in IdentityTools.STOPWORDS:
+                anchors.add(token)
+        return anchors
+
+    @staticmethod
+    def compatible_catalog_brand(house: str, catalog_brand: str, name: str = "") -> bool:
+        """True when a catalog designer slug plausibly belongs to the parent house + product line."""
+        if IdentityTools.compatible_brand(house, catalog_brand):
+            return True
+        sub_norm = TextSanitizer.normalize_identity(IdentityTools.sub_brand_label(name, house))
+        cat_norm = TextSanitizer.normalize_identity(catalog_brand)
+        if sub_norm and (sub_norm in cat_norm or cat_norm.startswith(sub_norm)):
+            return True
+        name_norm = TextSanitizer.normalize_identity(name)
+        for line_key, aliases in IdentityTools.FRAGRANTICA_LINE_ALIASES.items():
+            if line_key not in name_norm and line_key not in sub_norm:
+                continue
+            for alias in aliases:
+                alias_norm = TextSanitizer.normalize_identity(alias)
+                if alias_norm == cat_norm or line_key in cat_norm:
+                    return True
+        return False
         
     @staticmethod
     def compatible_brand(a: str, b: str) -> bool:
@@ -3785,7 +3883,48 @@ class SearchSniper:
                 item.resolver_source = "fg_cache"
                 item.resolver_score = 0.98
                 linked += 1
+                continue
+            for brand_label, lookup_name in SearchSniper._cache_lookup_pairs(
+                item.brand, item.name, bn_url=item.bn_url
+            ):
+                url = cache.get(brand_label, lookup_name, item.year)
+                if url:
+                    item.frag_url = url
+                    item.resolver_source = "fg_cache_line"
+                    item.resolver_score = 0.98
+                    linked += 1
+                    break
         return linked
+
+    @staticmethod
+    def _cache_lookup_pairs(
+        house: str, name: str, *, bn_url: str = ""
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        meta_name = name
+        meta_brand = house
+        if bn_url:
+            meta = BasenotesEngine._parse_name_metadata(bn_url, "", "")
+            if meta.name:
+                meta_name = meta.name
+            if meta.brand:
+                meta_brand = meta.brand
+        sub = IdentityTools.sub_brand_label(meta_name, meta_brand)
+        stripped = meta_name
+        if sub and stripped.lower().startswith(sub.lower()):
+            stripped = stripped[len(sub) :].strip()
+        for brand_label in IdentityTools.catalog_brand_keys(meta_brand, meta_name, bn_url=bn_url):
+            for lookup_name in (meta_name, stripped):
+                cleaned_name = TextSanitizer.clean(lookup_name)
+                if not cleaned_name:
+                    continue
+                key = (TextSanitizer.normalize_identity(brand_label), TextSanitizer.normalize_identity(cleaned_name))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((brand_label, cleaned_name))
+        return pairs
         
     @staticmethod
     def cache_successes(candidates: list[UnifiedFragrance], cache: IdentityCache, source: str = "") -> None:
@@ -3898,32 +4037,47 @@ class SearchSniper:
             return 0
         deadline = Deadline(budget_seconds)
         branch_token = trace.start("designer_catalog", query=f"{len(missing)} missing", deadline=deadline) if trace else None
-        brands = []
+        brand_labels: list[str] = []
+        brand_keys_seen: set[str] = set()
+        item_catalog_keys: dict[int, list[str]] = {}
         for item in missing:
-            key = TextSanitizer.normalize_identity(item.brand)
-            if key and key not in brands:
-                brands.append(key)
+            meta_name = item.name
+            meta_brand = item.brand
+            if item.bn_url:
+                meta = BasenotesEngine._parse_name_metadata(item.bn_url, "", "")
+                if meta.name:
+                    meta_name = meta.name
+                if meta.brand:
+                    meta_brand = meta.brand
+            keys: list[str] = []
+            for label in IdentityTools.catalog_brand_keys(meta_brand, meta_name, bn_url=item.bn_url):
+                norm = TextSanitizer.normalize_identity(label)
+                if norm and norm not in brand_keys_seen:
+                    brand_keys_seen.add(norm)
+                    brand_labels.append(label)
+                keys.append(norm)
+            item_catalog_keys[id(item)] = keys
         catalogs_by_brand: dict[str, list[CatalogItem]] = {}
-        def fetch_brand(brand_key: str) -> None:
-            representative = next((m.brand for m in missing if TextSanitizer.normalize_identity(m.brand) == brand_key), brand_key)
+        def fetch_brand(brand_label: str) -> None:
+            brand_key = TextSanitizer.normalize_identity(brand_label)
             catalogs_by_brand[brand_key] = SearchSniper.catalog_candidates_for_brand(
                 scraper,
-                representative,
+                brand_label,
                 deadline=deadline,
                 slug_limit=slug_limit,
                 trace=trace,
             )
-        run_budgeted_items(brands, fetch_brand, seconds=budget_seconds, max_workers=max_workers)
+        run_budgeted_items(brand_labels, fetch_brand, seconds=budget_seconds, max_workers=max_workers)
         linked = 0
         for item in missing:
-            brand_key = TextSanitizer.normalize_identity(item.brand)
             best: CatalogItem | None = None
             best_score = 0.0
-            for catalog_item in catalogs_by_brand.get(brand_key, []):
-                score = Orchestrator.identity_score(item, catalog_item)
-                if score > best_score:
-                    best = catalog_item
-                    best_score = score
+            for brand_key in item_catalog_keys.get(id(item), []):
+                for catalog_item in catalogs_by_brand.get(brand_key, []):
+                    score = Orchestrator.identity_score(item, catalog_item)
+                    if score > best_score:
+                        best = catalog_item
+                        best_score = score
             if best and best_score >= Orchestrator.CATALOG_ACCEPT:
                 item.frag_url = best.url
                 item.resolver_source = "designer_catalog"
@@ -3940,6 +4094,58 @@ class SearchSniper:
         cache.save()
         if trace and branch_token:
             trace.finish(branch_token, result_count=sum(len(v) for v in catalogs_by_brand.values()), linked_count=linked, skipped_reason="" if linked else "score_below_threshold", deadline=deadline)
+        return linked
+
+    @staticmethod
+    def attach_from_bn_crosswalk(
+        scraper,
+        candidates: list[UnifiedFragrance],
+        cache: IdentityCache,
+        budget_seconds: float = 4.0,
+        trace: ResolverTrace | None = None,
+    ) -> int:
+        """Use Basenotes detail-page Fragrantica links when native search and catalog miss."""
+        missing = [item for item in candidates if not item.frag_url and item.bn_url]
+        if not missing or budget_seconds <= 0:
+            if trace:
+                trace.add_skip("bn_crosswalk", "already_linked" if not missing else "budget_exhausted")
+            return 0
+        deadline = Deadline(budget_seconds)
+        branch_token = trace.start("bn_crosswalk", query=f"{len(missing)} missing", deadline=deadline) if trace else None
+        linked = 0
+
+        def resolve_one(item: UnifiedFragrance) -> None:
+            nonlocal linked
+            if deadline.expired() or item.frag_url:
+                return
+            urls = BasenotesEngine.fragrantica_urls_from_bn_page(scraper, item.bn_url, deadline=deadline)
+            best_url = ""
+            best_score = 0.0
+            for url in urls:
+                probe = CatalogItem(
+                    FragranticaEngine.name_from_url(url),
+                    FragranticaEngine.brand_from_url(url),
+                    "",
+                    url,
+                )
+                score = Orchestrator.identity_score(item, probe)
+                if score > best_score:
+                    best_url = url
+                    best_score = score
+            if best_url and best_score >= Orchestrator.CATALOG_ACCEPT:
+                item.frag_url = best_url
+                item.resolver_source = "bn_crosswalk"
+                item.resolver_score = best_score
+                cache.put(item, source="bn_crosswalk")
+                linked += 1
+                if trace:
+                    token = trace.start("bn_crosswalk", brand=item.brand, name=item.name, deadline=deadline)
+                    trace.finish(token, linked_count=1, accepted_url=best_url, deadline=deadline)
+
+        run_budgeted_items(missing, resolve_one, seconds=budget_seconds, max_workers=2)
+        cache.save()
+        if trace and branch_token:
+            trace.finish(branch_token, linked_count=linked, skipped_reason="" if linked else "no_fragrantica_links_on_bn_page", deadline=deadline)
         return linked
         
     @staticmethod
@@ -4230,6 +4436,38 @@ class BasenotesEngine:
             brand = ""
         return UnifiedFragrance(name=name, brand=brand, year=year, bn_url=url)
         
+    @staticmethod
+    def fragrantica_urls_from_html(markup: str) -> list[str]:
+        if not markup:
+            return []
+        soup = BeautifulSoup(markup, "html.parser")
+        urls: list[str] = []
+        seen: set[str] = set()
+        for a in soup.find_all("a", href=True):
+            href = FragranticaEngine.canonical_url(a.get("href", ""))
+            if not FragranticaEngine.is_perfume_url(href):
+                continue
+            key = FragranticaEngine.dedupe_key(href)
+            if key in seen:
+                continue
+            seen.add(key)
+            urls.append(href)
+        return urls
+
+    @staticmethod
+    def fragrantica_urls_from_bn_page(
+        scraper,
+        bn_url: str,
+        deadline: Deadline | None = None,
+        timeout: float = 4.0,
+    ) -> list[str]:
+        if not bn_url:
+            return []
+        res = BasenotesEngine._get_with_retries(scraper, bn_url, timeout=timeout, attempts=1, deadline=deadline)
+        if not res:
+            return []
+        return BasenotesEngine.fragrantica_urls_from_html(res.text)
+
     @staticmethod
     def fetch_metrics(scraper, frag: UnifiedFragrance, deadline: Deadline | None = None) -> None:
         if not frag.bn_url:
@@ -4781,6 +5019,20 @@ class FragranticaEngine:
         return "", ""
     
     @staticmethod
+    def native_search_unusable(query: str, results: list[UnifiedFragrance]) -> bool:
+        """True when Fragrantica returned rows but none echo distinctive query tokens."""
+        if not results:
+            return True
+        anchors = IdentityTools.query_anchor_tokens(query)
+        if not anchors:
+            return False
+        for item in results:
+            blob = TextSanitizer.normalize_identity(f"{item.brand} {item.name}")
+            if any(anchor in blob for anchor in anchors):
+                return False
+        return len(results) >= 3
+
+    @staticmethod
     def extract_search_data(
         scraper,
         query: str,
@@ -4803,6 +5055,8 @@ class FragranticaEngine:
                 continue
             results = FragranticaEngine.parse_search_html(res.text, max_results=max_results)
             if results:
+                if FragranticaEngine.native_search_unusable(query, results):
+                    return []
                 return results
             time.sleep(0.15)
         return []
@@ -6845,16 +7099,17 @@ class Orchestrator:
         b_brand = TextSanitizer.clean(getattr(b, "brand", ""))
         
         # Hard Gate: Ensure brand compatibility
+        a_name_raw = TextSanitizer.clean(getattr(a, "name", ""))
+        b_name_raw = TextSanitizer.clean(getattr(b, "name", ""))
         brand_ok = (
             not a_brand or not b_brand 
             or a_brand.lower() == "unknown" or b_brand.lower() == "unknown"
             or IdentityTools.compatible_brand(a_brand, b_brand)
+            or IdentityTools.compatible_catalog_brand(a_brand, b_brand, a_name_raw)
+            or IdentityTools.compatible_catalog_brand(b_brand, a_brand, b_name_raw)
         )
         if not brand_ok:
             return 0.0
-            
-        a_name_raw = TextSanitizer.clean(getattr(a, "name", ""))
-        b_name_raw = TextSanitizer.clean(getattr(b, "name", ""))
         
         a_name = IdentityTools.name_tokens(a_name_raw, getattr(a, "brand", ""))
         b_name = IdentityTools.name_tokens(b_name_raw, getattr(b, "brand", ""))
@@ -7108,6 +7363,16 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     if args.debug_timing and catalog_hits:
         print(f"{D}[SYS] Designer catalog linked {catalog_hits} candidate(s).{Z}")
     timer.mark("designer_catalog_resolve")
+    bn_crosswalk_hits = SearchSniper.attach_from_bn_crosswalk(
+        scraper,
+        candidates,
+        cache,
+        budget_seconds=min(4.0, args.catalog_budget),
+        trace=trace,
+    )
+    if args.debug_timing and bn_crosswalk_hits:
+        print(f"{D}[SYS] BN crosswalk linked {bn_crosswalk_hits} candidate(s).{Z}")
+    timer.mark("bn_crosswalk_resolve")
     if args.related_budget > 0:
         related_hits = SearchSniper.attach_related_from_known_pages(
             scraper,
@@ -7166,32 +7431,44 @@ def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
                 repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
+        catalog_labels = IdentityTools.catalog_brand_keys("", query)
         canonical_brand = IdentityTools.canonical_brand_query(query)
         if canonical_brand:
-            catalog = SearchSniper.catalog_candidates_for_brand(
-                scraper,
-                canonical_brand,
-                Deadline(args.catalog_budget),
-                slug_limit=args.catalog_slug_limit,
-            )
+            catalog_labels = IdentityTools.catalog_brand_keys(canonical_brand, query)
+        if catalog_labels:
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
-            for item in catalog:
-                if item.url in seen:
-                    continue
-                seen.add(item.url)
-                frag = UnifiedFragrance(
-                    name=item.name,
-                    brand=item.brand,
-                    year=item.year,
-                    frag_url=item.url,
-                    resolver_source="designer_catalog_brand_query",
-                    resolver_score=0.98,
-                    query_score=1.0,
+            deadline = Deadline(args.catalog_budget)
+            for brand_label in catalog_labels:
+                if deadline.expired():
+                    break
+                catalog = SearchSniper.catalog_candidates_for_brand(
+                    scraper,
+                    brand_label,
+                    deadline,
+                    slug_limit=args.catalog_slug_limit,
                 )
-                brand_results.append(frag)
+                for item in catalog:
+                    if item.url in seen:
+                        continue
+                    seen.add(item.url)
+                    frag = UnifiedFragrance(
+                        name=item.name,
+                        brand=item.brand,
+                        year=item.year,
+                        frag_url=item.url,
+                        resolver_source="designer_catalog_brand_query",
+                        resolver_score=0.98,
+                        query_score=IdentityTools.relevance_score(query, UnifiedFragrance(
+                            name=item.name, brand=item.brand, year=item.year,
+                        )),
+                    )
+                    brand_results.append(frag)
+                    if len(brand_results) >= args.max_results:
+                        break
                 if len(brand_results) >= args.max_results:
                     break
+            brand_results = filter_relevant_candidates(query, brand_results)
             if brand_results:
                 return brand_results
         best = max((item.query_score for item in candidates), default=0.0)
