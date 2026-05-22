@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -126,7 +127,7 @@ def _env_float(name: str, default: float) -> float:
 # API latency budget. Keep the CLI parser defaults exploratory, but make HTTP
 # search suitable for the first screen: live first-pass work is bounded tightly,
 # and candidate metrics are left to /details.
-_ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 3.0)
+_ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 5.5)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
 _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
 
@@ -160,11 +161,42 @@ class ClearanceCookieRequest(BaseModel):
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
+_BN_WARMUP_LOCK = threading.Lock()
+_BN_WARMUP_STARTED = False
+
+
+def _warm_basenotes_clearance() -> None:
+    try:
+        scraper = engine.get_scraper()
+        rows = engine.BasenotesEngine.extract_search_data(
+            scraper,
+            "xerjoff naxos",
+            deadline=engine.Deadline(_ARGS.initial_timeout),
+        )
+        logger.info("Basenotes startup warmup completed with %d rows", len(rows))
+    except Exception:
+        logger.warning("Basenotes startup warmup failed", exc_info=True)
+
+
+def _start_basenotes_warmup() -> None:
+    global _BN_WARMUP_STARTED
+    with _BN_WARMUP_LOCK:
+        if _BN_WARMUP_STARTED:
+            return
+        _BN_WARMUP_STARTED = True
+    thread = threading.Thread(
+        target=_warm_basenotes_clearance,
+        name="basenotes-startup-warmup",
+        daemon=True,
+    )
+    thread.start()
+
 
 @app.on_event("startup")
 def _startup() -> None:
     """Bootstrap durable storage. Inert when DATABASE_URL is unset (local dev)."""
     db.init_db()
+    _start_basenotes_warmup()
 
 # ---------------------------------------------------------------------------
 # CORS -- restricted to the frontend origin(s).
