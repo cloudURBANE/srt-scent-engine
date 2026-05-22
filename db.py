@@ -137,6 +137,15 @@ CREATE TABLE IF NOT EXISTS fg_detail_cache (
 );
 ALTER TABLE fg_detail_cache
     ADD COLUMN IF NOT EXISTS image_url TEXT;
+-- quality_status was added to the CREATE TABLE above after the table already
+-- existed in production, so `CREATE TABLE IF NOT EXISTS` never adds it to a
+-- legacy database. Migrate it explicitly. Decision: rows that predate this
+-- column are legacy-complete -- before the column existed every cached entry
+-- was unconditionally trusted for hydration, so the NOT NULL DEFAULT 'complete'
+-- backfills them to exactly that prior behaviour. Genuinely partial entries
+-- only exist going forward, where the worker stamps quality_status explicitly.
+ALTER TABLE fg_detail_cache
+    ADD COLUMN IF NOT EXISTS quality_status TEXT NOT NULL DEFAULT 'complete';
 
 CREATE TABLE IF NOT EXISTS worker_accounts (
     id              TEXT PRIMARY KEY,
@@ -306,19 +315,25 @@ def enqueue_job(
     year: int | None,
     bn_url: str | None,
     fg_url: str | None,
-) -> None:
+) -> int | None:
     """Upsert a job by job_key. A duplicate request bumps counters, never dupes.
 
     On conflict the row's status is left untouched (a pending job stays pending,
     a completed job is not resurrected) except that an `ignored` job is never
     touched at all -- it was deliberately retired.
+
+    Returns the row's resulting `requested_count` -- 1 on first insert, then
+    incremented once per duplicate request -- so callers can surface a
+    bounded-retry signal to the client. Returns None when storage is disabled,
+    or when the conflicting job is `ignored` (the upsert WHERE clause skips it,
+    so no row is returned).
     """
     if not ENABLED:
-        return
+        return None
     ctx, conn = _conn()
     try:
         with conn.transaction():
-            conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO enrichment_jobs
                     (id, job_key, query, name, house, year, bn_url, fg_url,
@@ -336,9 +351,11 @@ def enqueue_job(
                     bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url),
                     fg_url            = COALESCE(EXCLUDED.fg_url, enrichment_jobs.fg_url)
                 WHERE enrichment_jobs.status <> 'ignored'
+                RETURNING requested_count
                 """,
                 (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url),
-            )
+            ).fetchone()
+            return row["requested_count"] if row else None
     finally:
         ctx.__exit__(None, None, None)
 

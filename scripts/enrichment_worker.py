@@ -488,6 +488,34 @@ def resolve_candidate(
     raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
 
 
+_FG_METRIC_GROUPS = (
+    "performance_score",
+    "value_score",
+    "community_interest_score",
+    "wear_profile",
+)
+
+
+def _worker_metrics_complete(details: Any) -> bool:
+    """True when all 4 Fragrantica status-derived metric groups parsed.
+
+    Mirrors api._fg_metrics_complete: a partial fetch (encrypted status payload
+    did not decode) must not be stored as a trustworthy 'complete' cache entry,
+    otherwise api._apply_fg_detail_cache_db would hydrate from it and the job
+    would never be re-enqueued for a retry.
+    """
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        dm = build_derived_metrics(details)
+    except Exception:
+        return False
+    if not isinstance(dm, dict):
+        return False
+    cov = dm.get("source_coverage") or {}
+    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+
 def fetch_payload(
     scraper,
     candidate: engine.UnifiedFragrance,
@@ -566,7 +594,10 @@ def fetch_payload(
         "pros_cons": list(details.pros_cons or []),
         "reviews": _reviews_payload(details.reviews or []),
         "raw_identity": raw_identity,
-        "quality_status": "complete",
+        # "complete" only when all 4 status-derived metric groups parsed. A
+        # "partial" entry is ignored by api._apply_fg_detail_cache_db, so the
+        # job is naturally re-enqueued and retried on the next /details call.
+        "quality_status": "complete" if _worker_metrics_complete(details) else "partial",
     }
 
 
@@ -1489,6 +1520,27 @@ def _read_secret(label: str) -> str:
         return input(label)
 
 
+def _run_automatic_clearance_mint() -> None:
+    """Trigger the Fragrantica clearance minting process locally."""
+    c = _colors()
+    print(f"   {c['D']}>> Minting Fragrantica clearance session...{c['Z']}")
+    if os.name == "nt" and not os.environ.get("BASENOTES_CHROMIUM_PATH"):
+        default_chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if os.path.exists(default_chrome):
+            os.environ["BASENOTES_CHROMIUM_PATH"] = default_chrome
+    
+    try:
+        os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = "0"
+        session = engine._mint_fragrantica_clearance()
+        if session is not None:
+            print(f"   {c['G']}✓ Fragrantica clearance minted and cached successfully.{c['Z']}")
+        else:
+            err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None) or "Unknown error"
+            print(f"   {c['R']}x Failed to mint Fragrantica clearance: {err}{c['Z']}")
+    except Exception as exc:
+        print(f"   {c['R']}x Error during minting: {exc}{c['Z']}")
+
+
 def _dashboard_token_prompt(client: ApiClient, config: WorkerConfig) -> bool:
     """Paste worker token while the live dashboard is running ([m]).
 
@@ -1522,6 +1574,7 @@ def _dashboard_token_prompt(client: ApiClient, config: WorkerConfig) -> bool:
             time.sleep(1.0)
     else:
         print(f"   {c['G']}✓ access granted.{c['Z']}")
+        _run_automatic_clearance_mint()
 
     try:
         input(f"\n   {c['D']}Press Enter to return to the dashboard…{c['Z']} ")
@@ -1592,6 +1645,7 @@ def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -
             time.sleep(1.4)
             return True
         print(f"   {c['G']}✓ access granted.{c['Z']}")
+        _run_automatic_clearance_mint()
         time.sleep(0.8)
         return True
     return False

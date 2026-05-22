@@ -2,6 +2,7 @@
 """Plain-script checks for search result relevance filtering."""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -318,6 +319,156 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
     )
 
 
+class _FakeSerperResponse:
+    """Minimal stand-in for a requests.Response from google.serper.dev."""
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+_SERPER_SAMPLE_PAYLOAD = {
+    "organic": [
+        {"link": "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"},
+        {"link": "https://example.com/not-fragrance"},
+        {"link": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html?utm=1"},
+    ]
+}
+
+
+def _set_serper_env(enabled: bool) -> dict[str, str | None]:
+    saved = {
+        "SERP_API_PROVIDER": os.environ.get("SERP_API_PROVIDER"),
+        "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
+    }
+    if enabled:
+        os.environ["SERP_API_PROVIDER"] = "serper"
+        os.environ["SERPER_API_KEY"] = "test-key-not-real"
+    else:
+        os.environ.pop("SERP_API_PROVIDER", None)
+        os.environ.pop("SERPER_API_KEY", None)
+    return saved
+
+
+def _restore_serper_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_serper_disabled_without_env() -> None:
+    print("Serper env-gating checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=False)
+    old_post = engine.requests.post
+    calls = {"http": 0}
+    try:
+        def forbidden_post(*args, **kwargs):
+            calls["http"] += 1
+            raise AssertionError("requests.post must not be called when Serper is disabled")
+
+        engine.requests.post = forbidden_post
+        enabled = engine.SerperClient.enabled()
+        urls = engine.SerperClient.search_fragrantica_urls("xerjoff naxos")
+        rows = engine.SerperClient.discover_fragrances("xerjoff naxos")
+    finally:
+        engine.requests.post = old_post
+        _restore_serper_env(saved)
+
+    check("SerperClient.enabled() is False without env", enabled is False, str(enabled))
+    check("disabled Serper returns no URLs", urls == [], str(urls))
+    check("disabled Serper returns no rows", rows == [], str(rows))
+    check("disabled Serper makes no HTTP call", calls["http"] == 0, str(calls))
+
+
+def test_serper_parses_fragrantica_urls() -> None:
+    print("Serper URL parsing checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=True)
+    old_post = engine.requests.post
+    seen: dict[str, object] = {}
+    try:
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            seen["url"] = url
+            seen["query"] = (json or {}).get("q")
+            seen["api_key"] = (headers or {}).get("X-API-KEY")
+            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+
+        engine.requests.post = fake_post
+        urls = engine.SerperClient.search_fragrantica_urls("xerjoff naxos")
+        rows = engine.SerperClient.discover_fragrances("xerjoff naxos")
+    finally:
+        engine.requests.post = old_post
+        _restore_serper_env(saved)
+
+    check(
+        "Serper keeps only canonical Fragrantica perfume URLs",
+        urls == [
+            "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html",
+            "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html",
+        ],
+        str(urls),
+    )
+    check(
+        "Serper request is site-scoped to fragrantica perfume pages",
+        seen.get("query") == "xerjoff naxos site:fragrantica.com/perfume",
+        str(seen.get("query")),
+    )
+    check("Serper request sends the API key header", seen.get("api_key") == "test-key-not-real", str(seen.get("api_key")))
+    check("Serper request hits the serper.dev endpoint", seen.get("url") == engine.SerperClient.ENDPOINT, str(seen.get("url")))
+
+    naxos = next((row for row in rows if "Naxos" in row.name), None)
+    identities = [(row.brand, row.name) for row in rows]
+    check(
+        "Serper row recovers Fragrantica identity from the URL",
+        naxos is not None and naxos.name == "1861 Naxos" and naxos.brand == "Xerjoff",
+        str(identities),
+    )
+    check(
+        "Serper row carries the canonical Fragrantica URL",
+        naxos is not None and naxos.frag_url == "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html",
+        str(naxos.frag_url if naxos else None),
+    )
+    check(
+        "Serper row is labelled with the serper resolver source",
+        naxos is not None and naxos.resolver_source == "serper_fragrantica_search",
+        str(naxos.resolver_source if naxos else None),
+    )
+
+
+def test_serper_caches_responses() -> None:
+    print("Serper response cache checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=True)
+    old_post = engine.requests.post
+    calls = {"http": 0}
+    try:
+        def counting_post(url, json=None, headers=None, timeout=None, **kwargs):
+            calls["http"] += 1
+            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+
+        engine.requests.post = counting_post
+        first = engine.SerperClient.search_fragrantica_urls("creed aventus")
+        second = engine.SerperClient.search_fragrantica_urls("creed aventus")
+    finally:
+        engine.requests.post = old_post
+        _restore_serper_env(saved)
+
+    check("repeated Serper query is served from the in-process cache", calls["http"] == 1, str(calls))
+    check(
+        "cached Serper result matches the first live result",
+        first == second and first != [],
+        str((first, second)),
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
@@ -328,6 +479,9 @@ def main() -> int:
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_fragrantica_native_search_bypassed_by_default()
+    test_serper_disabled_without_env()
+    test_serper_parses_fragrantica_urls()
+    test_serper_caches_responses()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()

@@ -2393,6 +2393,130 @@ class Http:
         Http._record_error(last_error)
         return None
 
+
+class SerperClient:
+    """Structured Fragrantica URL discovery via Serper.dev.
+
+    Google/Bing SERP HTML scraping is permanently dead from datacenter hosts
+    (JS-shell pages with no result links). This client moves Fragrantica
+    perfume-URL discovery onto a structured API (https://google.serper.dev).
+
+    Env-gated: active only when ``SERP_API_PROVIDER=serper`` and
+    ``SERPER_API_KEY`` is set. With the env unset, ``enabled()`` is False and
+    the engine keeps its current behavior (no HTTP call is made).
+
+    The first pass is latency-bound, so this client makes a single attempt,
+    caps its timeout at 1.5 s (further capped by the shared first-pass
+    Deadline), and caches responses per normalized query to limit spend
+    (Serper bills ~$1 / 1000 queries).
+    """
+
+    ENDPOINT = "https://google.serper.dev/search"
+    MAX_TIMEOUT = 1.5
+    _RESOLVER_SCORE = 0.9
+    _cache: dict[str, list[str]] = {}
+    _cache_lock = threading.Lock()
+
+    @staticmethod
+    def enabled() -> bool:
+        provider = (os.environ.get("SERP_API_PROVIDER", "") or "").strip().lower()
+        key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
+        return provider == "serper" and bool(key)
+
+    @staticmethod
+    def _cache_key(query: str) -> str:
+        return TextSanitizer.normalize_identity(query)
+
+    @classmethod
+    def _post(cls, query: str, timeout: float) -> dict:
+        key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
+        headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+        body = {"q": f"{query} site:fragrantica.com/perfume"}
+        res = requests.post(cls.ENDPOINT, json=body, headers=headers, timeout=timeout)
+        res.raise_for_status()
+        return res.json() or {}
+
+    @classmethod
+    def search_fragrantica_urls(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> list[str]:
+        """Return canonical Fragrantica perfume URLs for ``query``.
+
+        Returns ``[]`` when disabled, on any HTTP/parse error, or when the
+        shared deadline is already exhausted. Successful lookups are cached
+        per normalized query; failures are not cached.
+        """
+        query = (query or "").strip()
+        if not query or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(query)
+        with cls._cache_lock:
+            cached = cls._cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        # Single attempt, bounded by 1.5 s and the shared first-pass budget.
+        budget = min(float(timeout), cls.MAX_TIMEOUT)
+        if deadline is not None:
+            if deadline.expired():
+                return []
+            budget = min(budget, deadline.timeout(budget))
+        urls: list[str] = []
+        try:
+            payload = cls._post(query, budget)
+            seen: set[str] = set()
+            for entry in payload.get("organic", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                canonical = FragranticaEngine.canonical_url(entry.get("link", "") or "")
+                if not canonical or not FragranticaEngine.is_perfume_url(canonical):
+                    continue
+                dedupe = FragranticaEngine.dedupe_key(canonical)
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                urls.append(canonical)
+        except Exception:
+            # Degraded-search style: never raise into the first pass.
+            return []
+        with cls._cache_lock:
+            cls._cache[cache_key] = list(urls)
+        return urls
+
+    @classmethod
+    def discover_fragrances(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 25,
+    ) -> list[UnifiedFragrance]:
+        """Serper-discovered Fragrantica URLs as UnifiedFragrance rows.
+
+        Identity (name/brand) is recovered from the URL only; no Fragrantica
+        detail page is fetched. ``query_score`` is left at 0.0 here and is
+        assigned downstream by ``filter_relevant_candidates()``.
+        """
+        rows: list[UnifiedFragrance] = []
+        for url in cls.search_fragrantica_urls(query, deadline=deadline, timeout=timeout):
+            name = FragranticaEngine.name_from_url(url)
+            if not name:
+                continue
+            rows.append(UnifiedFragrance(
+                name=name,
+                brand=FragranticaEngine.brand_from_url(url),
+                year="",
+                frag_url=url,
+                resolver_source="serper_fragrantica_search",
+                resolver_score=cls._RESOLVER_SCORE,
+            ))
+            if max_results and len(rows) >= max_results:
+                break
+        return rows
+
+
 _BASENOTES_CACHE_FILE = Path(
     os.environ.get(
         "BASENOTES_CLEARANCE_CACHE",
@@ -2886,6 +3010,7 @@ def _mint_basenotes_clearance():
         options.set_argument(f"--user-data-dir={user_data_dir}")
         headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
         if headless:
+            options.headless(True)
             options.set_argument("--headless=new")
         options.auto_port()
 
@@ -3102,6 +3227,7 @@ def _mint_fragrantica_clearance():
             or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
         )
         if headless_env.lower() in {"1", "true", "yes"}:
+            options.headless(True)
             options.set_argument("--headless=new")
         options.auto_port()
 
@@ -7305,14 +7431,25 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     shared_deadline = Deadline(args.initial_timeout)
     def fg_search_job() -> list[UnifiedFragrance]:
         token = trace.start("raw_search", query=query, deadline=shared_deadline)
-        rows = FragranticaEngine.extract_search_data(
-            scraper,
-            query,
-            max_results=args.max_frag_results,
-            deadline=shared_deadline,
-            native_search_enabled=getattr(args, "native_fragrantica_search", False),
-        )
-        trace.finish(token, result_count=len(rows), linked_count=sum(1 for item in rows if item.frag_url), skipped_reason="" if rows else "no_perfume_links_found", deadline=shared_deadline)
+        # When Serper is env-gated on, structured URL discovery replaces the
+        # dead native Fragrantica SERP scrape for the first pass.
+        if SerperClient.enabled():
+            rows = SerperClient.discover_fragrances(
+                query,
+                deadline=shared_deadline,
+                max_results=args.max_frag_results,
+            )
+            skipped_reason = "" if rows else "serper_no_perfume_links"
+        else:
+            rows = FragranticaEngine.extract_search_data(
+                scraper,
+                query,
+                max_results=args.max_frag_results,
+                deadline=shared_deadline,
+                native_search_enabled=getattr(args, "native_fragrantica_search", False),
+            )
+            skipped_reason = "" if rows else "no_perfume_links_found"
+        trace.finish(token, result_count=len(rows), linked_count=sum(1 for item in rows if item.frag_url), skipped_reason=skipped_reason, deadline=shared_deadline)
         return rows
     initial = bounded_parallel(
         {

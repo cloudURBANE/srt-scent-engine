@@ -21,10 +21,13 @@
 4. **Set the env var** `FRONTEND_ORIGINS` to your deployed frontend origin(s),
    comma-separated — e.g. `https://your-frontend.up.railway.app`. Without it,
    CORS only allows `http://localhost:5173` (Vite dev).
-5. Under **Settings → Networking**, click **Generate Domain** to get the public
+5. On the **API** service, set `API_INITIAL_TIMEOUT=5.5`. This is the
+   recommended first-pass budget for live Basenotes search; strong cached exact
+   hits still return before this budget applies.
+6. Under **Settings → Networking**, click **Generate Domain** to get the public
    URL. That URL is the API base URL.
-6. On the **frontend** service, set `VITE_FRAGRANCE_API_URL` to that URL.
-7. Verify: `GET https://<your-domain>/health` → `{"ok": true}`.
+7. On the **frontend** service, set `VITE_FRAGRANCE_API_URL` to that URL.
+8. Verify: `GET https://<your-domain>/health` → `{"ok": true}`.
 
 The Python API and the Vite frontend are **separate Railway services** in the
 same project.
@@ -56,6 +59,24 @@ return `503`. The existing bundled JSON detail cache keeps working unchanged.
 - Search/detail are blocking; FastAPI runs the sync endpoints in its threadpool.
   If you expect heavy concurrency, scale via Railway replicas or add
   `--workers N` to the start command.
+
+## Search provider env
+
+Recommended API service variable:
+
+```bash
+API_INITIAL_TIMEOUT=5.5
+```
+
+Optional Fragrantica URL discovery variables for the Serper-backed path:
+
+```bash
+SERP_API_PROVIDER=serper
+SERPER_API_KEY=<secret>
+```
+
+Leaving `SERP_API_PROVIDER` or `SERPER_API_KEY` unset preserves the current
+non-Serper behavior.
 
 ## Basenotes / Chromium requirement
 

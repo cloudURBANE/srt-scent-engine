@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -108,6 +109,13 @@ _CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
 # near-exact hit, so the precheck uses a much higher threshold.
 _STRONG_CACHE_MIN_SCORE = 0.95
 
+# Warm-cache floor: below the strong threshold, but still a confident identity
+# match. A warm hit is served immediately (no live wait) AND triggers a bounded
+# background re-resolve, so the next identical query promotes to the strong
+# fast path. Bridges the all-or-nothing gap between a 0.95 precheck hit and a
+# full ~6s live search. See `_spawn_warm_refresh` and the /search warm tier.
+_WARM_CACHE_MIN_SCORE = 0.85
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -126,7 +134,10 @@ def _env_float(name: str, default: float) -> float:
 # API latency budget. Keep the CLI parser defaults exploratory, but make HTTP
 # search suitable for the first screen: live first-pass work is bounded tightly,
 # and candidate metrics are left to /details.
-_ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 3.0)
+_ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 5.5)
+# 1-C: FG/Serper first pass gets a tighter independent cap than the BN-bearing
+# initial_timeout; clamped to initial_timeout inside the engine.
+_ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 3.0)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
 _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
 
@@ -160,11 +171,42 @@ class ClearanceCookieRequest(BaseModel):
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
+_BN_WARMUP_LOCK = threading.Lock()
+_BN_WARMUP_STARTED = False
+
+
+def _warm_basenotes_clearance() -> None:
+    try:
+        scraper = engine.get_scraper()
+        rows = engine.BasenotesEngine.extract_search_data(
+            scraper,
+            "xerjoff naxos",
+            deadline=engine.Deadline(_ARGS.initial_timeout),
+        )
+        logger.info("Basenotes startup warmup completed with %d rows", len(rows))
+    except Exception:
+        logger.warning("Basenotes startup warmup failed", exc_info=True)
+
+
+def _start_basenotes_warmup() -> None:
+    global _BN_WARMUP_STARTED
+    with _BN_WARMUP_LOCK:
+        if _BN_WARMUP_STARTED:
+            return
+        _BN_WARMUP_STARTED = True
+    thread = threading.Thread(
+        target=_warm_basenotes_clearance,
+        name="basenotes-startup-warmup",
+        daemon=True,
+    )
+    thread.start()
+
 
 @app.on_event("startup")
 def _startup() -> None:
     """Bootstrap durable storage. Inert when DATABASE_URL is unset (local dev)."""
     db.init_db()
+    _start_basenotes_warmup()
 
 # ---------------------------------------------------------------------------
 # CORS -- restricted to the frontend origin(s).
@@ -610,6 +652,73 @@ def _strong_cache_search(
     return [], None
 
 
+# Background warm-cache revalidation. Bounded so a burst of warm hits cannot
+# spawn unbounded scraper threads on Railway (see the memory leak note: the
+# danger is orphaned processes, so we cap concurrency and dedupe by query).
+_warm_refresh_lock = threading.Lock()
+_warm_refresh_inflight: set[str] = set()
+_WARM_REFRESH_MAX_INFLIGHT = 2
+
+
+def _spawn_warm_refresh(query: str) -> bool:
+    """Kick off a background live re-resolve for `query`, best-effort.
+
+    Runs the same `search_once` the foreground path runs and persists the
+    fresh rows, so the next request for `query` hits the strong-cache fast
+    path instead of this warm tier. Bounded: at most `_WARM_REFRESH_MAX_INFLIGHT`
+    concurrent refreshes, deduped by query. Daemon thread, reuses the shared
+    scraper (no Chromium mint on the search path -> no orphaned process).
+    Returns True when a refresh was actually started.
+    """
+    key = query.casefold()
+    with _warm_refresh_lock:
+        if key in _warm_refresh_inflight:
+            return False
+        if len(_warm_refresh_inflight) >= _WARM_REFRESH_MAX_INFLIGHT:
+            return False
+        _warm_refresh_inflight.add(key)
+
+    def _run() -> None:
+        try:
+            scraper = engine.get_scraper()
+            results = engine.search_once(scraper, query, _ARGS)
+            results = [
+                item for item in results if _candidate_has_display_identity(item)
+            ]
+            if results:
+                _persist_search_results(query, results)
+        except Exception:
+            logger.warning(
+                "warm-cache background refresh failed q=%r", query, exc_info=True
+            )
+        finally:
+            with _warm_refresh_lock:
+                _warm_refresh_inflight.discard(key)
+
+    threading.Thread(
+        target=_run, name="warm-cache-refresh", daemon=True
+    ).start()
+    return True
+
+
+_FG_METRIC_GROUPS = ("performance_score", "value_score",
+                     "community_interest_score", "wear_profile")
+
+
+def _fg_metrics_complete(details: engine.UnifiedDetails) -> bool:
+    """True when all 4 Fragrantica status-derived metric groups are present.
+
+    Source of truth for 'the encrypted status payload made it through'. Reads
+    the derived_metrics adapter's own source_coverage sub-dict so it is robust
+    to whether a card came from status decode or an HTML fallback.
+    """
+    dm = getattr(details, "derived_metrics", None)
+    if not isinstance(dm, dict):
+        return False
+    cov = dm.get("source_coverage") or {}
+    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+
 def _source_coverage(
     selected: engine.UnifiedFragrance,
     details: engine.UnifiedDetails,
@@ -637,9 +746,10 @@ def _source_coverage(
     fg_linked = bool(selected.frag_url)
     bn_has_data = bn_linked and bool(details.bn_consensus)
     fg_has_data = fg_linked and bool(details.frag_cards)
+    fg_complete = fg_has_data and _fg_metrics_complete(details)
     if details.derived_metrics is None:
         derived = "none"
-    elif bn_has_data and fg_has_data:
+    elif bn_has_data and fg_complete:
         derived = "full"
     else:
         derived = "partial"
@@ -647,6 +757,10 @@ def _source_coverage(
         "basenotes": bn_has_data,
         "fragrantica": fg_has_data,
         "fragrantica_cached": fragrantica_cached,
+        # True only when all 4 Fragrantica status-derived metric groups made it
+        # through -- the frontend keys off this to decide whether to keep
+        # refreshing a partial wardrobe tile. See `_fg_metrics_complete`.
+        "fragrantica_metrics_complete": fg_complete,
         # "db" (durable Postgres cache), "json" (bundled file), or null (live or
         # absent). Additive honesty signal; existing keys keep their meaning.
         "fragrantica_cache_source": fragrantica_cache_source,
@@ -765,6 +879,7 @@ def _details_to_dict(
     fragrantica_cached: bool = False,
     fragrantica_cache_source: str | None = None,
     enrichment_status: str | None = None,
+    enrichment_requested_count: int | None = None,
 ) -> dict[str, Any]:
     """Serialize a full detail bundle.
 
@@ -815,11 +930,17 @@ def _details_to_dict(
         },
     }
     if enrichment_status:
-        payload["enrichment"] = {
+        enrichment_block: dict[str, Any] = {
             "status": enrichment_status,
             "requires_worker": enrichment_status == "pending",
             "cache_source": fragrantica_cache_source,
         }
+        # Surface the durable retry counter so the frontend's bounded-retry cap
+        # (MAX_ENRICHMENT_ATTEMPTS) can actually fire -- without this field it
+        # reads `undefined` and a permanently-partial item polls forever.
+        if enrichment_requested_count is not None:
+            enrichment_block["requested_count"] = enrichment_requested_count
+        payload["enrichment"] = enrichment_block
     return payload
 
 
@@ -846,6 +967,77 @@ class RequeueDetailRequest(DetailRequest):
 def health() -> dict[str, bool]:
     """Liveness probe for Railway and the frontend."""
     return {"ok": True}
+
+
+def _read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _matching_processes(needles: tuple[str, ...]) -> list[dict[str, Any]]:
+    if os.name == "nt" or not os.path.isdir("/proc"):
+        return []
+    my_pid = os.getpid()
+    rows: list[dict[str, Any]] = []
+    lowered_needles = tuple(needle.lower() for needle in needles)
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == my_pid:
+            continue
+        cmdline = _read_proc_cmdline(pid)
+        if not cmdline:
+            continue
+        haystack = cmdline.lower()
+        if any(needle in haystack for needle in lowered_needles):
+            rows.append({"pid": pid, "cmdline": cmdline[:500]})
+    return rows
+
+
+def _proc_self_memory() -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                if key in {"VmRSS", "VmHWM", "VmSize", "VmData", "Threads"}:
+                    cleaned = value.strip()
+                    fields[key] = cleaned
+                    parts = cleaned.split()
+                    if parts and parts[0].isdigit():
+                        fields[f"{key}_kb"] = int(parts[0])
+    except Exception:
+        pass
+    rss_kb = fields.get("VmRSS_kb")
+    if isinstance(rss_kb, int):
+        fields["VmRSS_mb"] = round(rss_kb / 1024, 1)
+    return fields
+
+
+@app.get("/api/diagnostics/memory")
+def memory_diagnostics() -> dict[str, Any]:
+    """Report API RSS and browser helper processes without shelling to procps."""
+    chromium = _matching_processes(("chromium", "chrome"))
+    xvfb = _matching_processes(("xvfb", "xvfb-run"))
+    return {
+        "pid": os.getpid(),
+        "memory": _proc_self_memory(),
+        "chromium_mint_disabled": bool(engine._chromium_mint_disabled()),
+        "process_counts": {
+            "chromium_or_chrome": len(chromium),
+            "xvfb": len(xvfb),
+        },
+        "processes": {
+            "chromium_or_chrome": chromium[:20],
+            "xvfb": xvfb[:20],
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1461,9 +1653,40 @@ def search(
             "diagnostics": diagnostics,
         }
 
+    # Warm-cache tier. No strong hit, but a slightly-below-strong cached row is
+    # still a confident identity match. Serve it now -- no live wait -- and
+    # revalidate live in the background so the next identical query promotes to
+    # the strong fast path above. This is the stale-while-revalidate bridge
+    # between a tens-of-ms precheck hit and a full multi-second live search.
+    warm_results, warm_source = _strong_cache_search(
+        query, _ARGS.max_results, min_score=_WARM_CACHE_MIN_SCORE
+    )
+    warm_results = [
+        item for item in warm_results if _candidate_has_display_identity(item)
+    ]
+    if warm_results:
+        refreshing = _spawn_warm_refresh(query)
+        diagnostics = _search_diagnostics(warm_results)
+        diagnostics["cache_source"] = warm_source
+        diagnostics["cache_mode"] = "warm"
+        diagnostics["live_search_skipped"] = True
+        # True when a live re-resolve is now running; the client may choose to
+        # re-query shortly to pick up fresher breadth. Never blocks this response.
+        diagnostics["background_refresh"] = refreshing
+        return {
+            "query": query,
+            "results": [_search_result_to_dict(item) for item in warm_results],
+            "diagnostics": diagnostics,
+        }
+
     scraper = engine.get_scraper()
+    # `timing` is filled in place by the engine with per-stage wall-clock marks
+    # (initial_fg_bn_fetch, link_attach, ...). Surfaced under
+    # diagnostics.timing so latency can be attributed to a stage instead of
+    # inferred from stdout. Cheap to collect; always on.
+    timing: dict[str, Any] = {}
     try:
-        results = engine.search_once(scraper, query, _ARGS)
+        results = engine.search_once(scraper, query, _ARGS, timing=timing)
     except Exception as exc:  # engine degrades cleanly; surface a 502 if not
         raise HTTPException(status_code=502, detail=f"Search failed: {exc}") from exc
 
@@ -1479,6 +1702,8 @@ def search(
         _persist_search_results(query, results)
 
     diagnostics = _search_diagnostics(results)
+    if timing:
+        diagnostics["timing"] = timing
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
         fallback_label = (
@@ -1524,6 +1749,7 @@ _FIRST_PASS_COUNT_RE = __import__("re").compile(
 # Railway-vs-local args drift (esp. shorter deadlines) is immediately visible.
 _SEARCH_TIMING_ARG_KEYS = (
     "initial_timeout",
+    "fg_timeout",
     "detail_timeout",
     "metrics_budget",
     "metrics_workers",
@@ -1840,23 +2066,14 @@ def _bn_diag_kill_orphan_chromiums() -> dict[str, Any]:
     across mint=1 calls and wedge subsequent chromium spawns. Delete this block
     once the clearance gap is resolved.
     """
-    import subprocess
-
     info: dict[str, Any] = {"ran": True, "killed_pids": [], "error": None}
     try:
-        proc = subprocess.run(
-            ["pgrep", "-f", "chromium"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        pids = [int(p) for p in proc.stdout.split() if p.strip().isdigit()]
-        my_pid = os.getpid()
-        for pid in pids:
-            if pid == my_pid:
-                continue
+        import signal
+
+        for row in _matching_processes(("chromium", "chrome")):
+            pid = int(row["pid"])
             try:
-                os.kill(pid, 9)
+                os.kill(pid, signal.SIGKILL)
                 info["killed_pids"].append(pid)
             except Exception as exc:
                 info["error"] = f"{type(exc).__name__}: {exc}"
@@ -1922,6 +2139,12 @@ def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
     proc: subprocess.Popen[bytes] | None = None
     try:
         result["ran"] = True
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             [
                 binary,
@@ -1935,8 +2158,7 @@ def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
                 "--remote-allow-origins=*",
                 "about:blank",
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            **popen_kwargs,
         )
         result["spawn_pid"] = proc.pid
 
@@ -2040,15 +2262,7 @@ def _bn_diag_raw_cdp_probe() -> dict[str, Any]:
         result["spawn_error"] = f"{type(exc).__name__}: {exc}"
     finally:
         if proc is not None:
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-            except Exception:
-                pass
+            engine._terminate_process_tree(proc)
             result["spawn_exit_code"] = proc.returncode
             try:
                 err = proc.stderr.read() if proc.stderr else b""
@@ -2991,14 +3205,26 @@ def _hydrate_details_from_entry(
     dict with the same shape (`frag_cards` / `notes` / `pros_cons` / `reviews`).
     Returns True only when cached Fragrantica data was actually applied.
 
-    Strictly additive -- live data always wins (callers only invoke this when
-    `details.frag_cards` is empty), fields are filled only when empty, and the
-    existing derived_metrics adapter is re-run exactly as the engine runs it.
+    Strictly additive -- live data always wins. `frag_cards` is merged per card
+    so a *complete* cache entry can backfill a *partial* live/stored bundle
+    (cards present live are never overwritten); notes/pros_cons/reviews stay
+    fill-only. The existing derived_metrics adapter is re-run exactly as the
+    engine runs it. Returns True only when something was actually added.
     """
     cached_cards = entry.get("frag_cards")
     if not isinstance(cached_cards, dict) or not cached_cards:
         return False
-    details.frag_cards = cached_cards
+
+    applied = False
+    # Per-card merge: backfill cards missing from the live/stored bundle, never
+    # overwrite ones already present (live wins). This lets a complete cache
+    # entry heal a partial bundle instead of only hydrating an empty one.
+    if not isinstance(details.frag_cards, dict):
+        details.frag_cards = {}
+    for name, rows in cached_cards.items():
+        if rows and name not in details.frag_cards:
+            details.frag_cards[name] = rows
+            applied = True
 
     # Notes: fill only when the live bundle carried none (BN supplied nothing).
     notes = details.notes
@@ -3010,20 +3236,41 @@ def _hydrate_details_from_entry(
             notes.heart = list(cached_notes.get("heart", []) or [])
             notes.base = list(cached_notes.get("base", []) or [])
             notes.flat = list(cached_notes.get("flat", []) or [])
+            if notes.top or notes.heart or notes.base or notes.flat:
+                applied = True
 
-    # pros_cons / reviews: additive only -- never replace live content.
+    # pros_cons / reviews: additive but de-duplicated -- never replace live
+    # content, and never accumulate copies. This helper can run more than once
+    # over the same bundle (a stored detail that already carries pros_cons /
+    # reviews is then overlaid with a cache entry repeating them, or the same
+    # bundle is re-hydrated on a later request), so a plain extend/append would
+    # grow duplicate rows each pass. Skip any item already present by value.
     cached_pros_cons = entry.get("pros_cons") or []
-    if isinstance(cached_pros_cons, list):
-        details.pros_cons.extend(str(p) for p in cached_pros_cons)
+    if isinstance(cached_pros_cons, list) and cached_pros_cons:
+        seen_pros = set(details.pros_cons)
+        for raw in cached_pros_cons:
+            text = str(raw)
+            if text not in seen_pros:
+                details.pros_cons.append(text)
+                seen_pros.add(text)
+                applied = True
     cached_reviews = entry.get("reviews") or []
     if isinstance(cached_reviews, list):
+        seen_reviews = {
+            (str(rv.text), str(rv.source)) for rv in details.reviews
+        }
         for r in cached_reviews:
             if isinstance(r, dict) and r.get("text"):
-                details.reviews.append(
-                    engine.Review(
-                        text=str(r["text"]), source=str(r.get("source", ""))
+                key = (str(r["text"]), str(r.get("source", "")))
+                if key not in seen_reviews:
+                    details.reviews.append(
+                        engine.Review(text=key[0], source=key[1])
                     )
-                )
+                    seen_reviews.add(key)
+                    applied = True
+
+    if not applied:
+        return False
 
     # Re-run the existing adapter over the merged object. Best-effort: a failure
     # here must not break the raw detail response (mirrors the engine contract
@@ -3206,7 +3453,7 @@ def _apply_fg_detail_cache_db(
     bundled JSON cache -> partial). Only `quality_status = 'complete'` entries
     are trusted for hydration; weaker entries are left for a worker re-fetch.
     """
-    if details.frag_cards or not selected.frag_url:
+    if _fg_metrics_complete(details) or not selected.frag_url:
         return False
     entry = db.lookup_detail_cache(_canonical_fg_url(selected.frag_url))
     if not entry or entry.get("quality_status") != "complete":
@@ -3224,8 +3471,8 @@ def _apply_fg_detail_cache(
     Fragrantica data always wins: if details.frag_cards is already populated
     this is a no-op and returns False.
     """
-    # Live Fragrantica data present -> never touch it.
-    if details.frag_cards:
+    # Complete Fragrantica metrics present -> nothing to backfill.
+    if _fg_metrics_complete(details):
         return False
     if not _ALLOW_BUNDLED_FG_DETAIL_CACHE:
         return False
@@ -3338,7 +3585,7 @@ def _identity_job_key(selected: engine.UnifiedFragrance) -> str:
 
 def _enqueue_enrichment_job(
     selected: engine.UnifiedFragrance, req: DetailRequest
-) -> bool:
+) -> int | None:
     """Enqueue (or upsert) an enrichment job for a partial detail result.
 
     Job key prefers the canonical Fragrantica URL, falls back to the canonical
@@ -3347,6 +3594,13 @@ def _enqueue_enrichment_job(
     Repeated requests for the same fragrance bump requested_count instead of
     duplicating. Any failure here is swallowed -- enrichment is a background
     nicety and must never break the user-facing /details response.
+
+    Returns the job's resulting `requested_count` (>= 1) on success; `0` when
+    the write was accepted but no count is available (storage disabled, or a
+    deliberately `ignored` job left untouched); and `None` only when the write
+    raised. Callers treat any non-None result as "queued" -- this preserves the
+    prior bool contract while letting `/details` surface the retry counter the
+    frontend's MAX_ENRICHMENT_ATTEMPTS cap reads.
     """
     try:
         job_key = (
@@ -3355,8 +3609,8 @@ def _enqueue_enrichment_job(
             or _identity_job_key(selected)
         )
         if not job_key:
-            return False
-        db.enqueue_job(
+            return None
+        count = db.enqueue_job(
             job_key=job_key,
             query=(req.source_url or None),
             name=selected.name or None,
@@ -3365,7 +3619,7 @@ def _enqueue_enrichment_job(
             bn_url=selected.bn_url or None,
             fg_url=selected.frag_url or None,
         )
-        return True
+        return count if isinstance(count, int) else 0
     except Exception:
         # Best-effort: never let queue write failures surface to the client.
         logger.exception(
@@ -3374,7 +3628,7 @@ def _enqueue_enrichment_job(
             selected.name,
             selected.brand,
         )
-        return False
+        return None
 
 
 def _requeue_enrichment_job(
@@ -3429,10 +3683,14 @@ def details(req: DetailRequest) -> dict[str, Any]:
         if _apply_fg_detail_cache_db(selected, stored_detail):
             fragrantica_cache_source = "db"
         enrichment_status: str | None
-        if stored_detail.frag_cards:
+        enrichment_requested_count: int | None = None
+        if _fg_metrics_complete(stored_detail):
             enrichment_status = "completed"
         else:
-            enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
+            enqueued = _enqueue_enrichment_job(selected, req)
+            enrichment_status = "pending" if enqueued is not None else "unavailable"
+            if isinstance(enqueued, int) and enqueued > 0:
+                enrichment_requested_count = enqueued
         _persist_detail_record(selected, stored_detail)
         return _details_to_dict(
             selected,
@@ -3441,6 +3699,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
             fragrantica_cache_source=fragrantica_cache_source
             or ("aggregate_db" if stored_detail.frag_cards else None),
             enrichment_status=enrichment_status,
+            enrichment_requested_count=enrichment_requested_count,
         )
 
     scraper = engine.get_scraper()
@@ -3469,12 +3728,16 @@ def details(req: DetailRequest) -> dict[str, Any]:
     # missing fg_url from name/house at claim time, so BN-only candidates are
     # eligible too. Inert when DATABASE_URL is unset.
     enrichment_status: str | None = None
+    enrichment_requested_count: int | None = None
     if fragrantica_cache_source == "db":
         enrichment_status = "completed"
     elif fragrantica_cache_source == "json":
         enrichment_status = "bundled_cache"
-    elif not detail_bundle.frag_cards:
-        enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
+    elif not _fg_metrics_complete(detail_bundle):
+        enqueued = _enqueue_enrichment_job(selected, req)
+        enrichment_status = "pending" if enqueued is not None else "unavailable"
+        if isinstance(enqueued, int) and enqueued > 0:
+            enrichment_requested_count = enqueued
 
     _persist_detail_record(selected, detail_bundle)
 
@@ -3484,6 +3747,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
         fragrantica_cached,
         fragrantica_cache_source,
         enrichment_status,
+        enrichment_requested_count,
     )
 
 

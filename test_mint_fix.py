@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 # Set Chromium path for local dev
 os.environ["BASENOTES_CHROMIUM_PATH"] = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = "1"
+os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = "0"
 
 from api import app
 import json
