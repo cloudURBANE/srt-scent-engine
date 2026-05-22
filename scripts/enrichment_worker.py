@@ -1489,6 +1489,27 @@ def _read_secret(label: str) -> str:
         return input(label)
 
 
+def _run_automatic_clearance_mint() -> None:
+    """Trigger the Fragrantica clearance minting process locally."""
+    c = _colors()
+    print(f"   {c['D']}>> Minting Fragrantica clearance session...{c['Z']}")
+    if os.name == "nt" and not os.environ.get("BASENOTES_CHROMIUM_PATH"):
+        default_chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if os.path.exists(default_chrome):
+            os.environ["BASENOTES_CHROMIUM_PATH"] = default_chrome
+    
+    try:
+        os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = "0"
+        session = engine._mint_fragrantica_clearance()
+        if session is not None:
+            print(f"   {c['G']}✓ Fragrantica clearance minted and cached successfully.{c['Z']}")
+        else:
+            err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None) or "Unknown error"
+            print(f"   {c['R']}x Failed to mint Fragrantica clearance: {err}{c['Z']}")
+    except Exception as exc:
+        print(f"   {c['R']}x Error during minting: {exc}{c['Z']}")
+
+
 def _dashboard_token_prompt(client: ApiClient, config: WorkerConfig) -> bool:
     """Paste worker token while the live dashboard is running ([m]).
 
@@ -1522,6 +1543,7 @@ def _dashboard_token_prompt(client: ApiClient, config: WorkerConfig) -> bool:
             time.sleep(1.0)
     else:
         print(f"   {c['G']}✓ access granted.{c['Z']}")
+        _run_automatic_clearance_mint()
 
     try:
         input(f"\n   {c['D']}Press Enter to return to the dashboard…{c['Z']} ")
@@ -1592,6 +1614,7 @@ def _login_gate(client: ApiClient, config: WorkerConfig, stop: StopController) -
             time.sleep(1.4)
             return True
         print(f"   {c['G']}✓ access granted.{c['Z']}")
+        _run_automatic_clearance_mint()
         time.sleep(0.8)
         return True
     return False

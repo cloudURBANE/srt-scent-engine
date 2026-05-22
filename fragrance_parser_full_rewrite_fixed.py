@@ -3010,6 +3010,7 @@ def _mint_basenotes_clearance():
         options.set_argument(f"--user-data-dir={user_data_dir}")
         headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
         if headless:
+            options.headless(True)
             options.set_argument("--headless=new")
         options.auto_port()
 
@@ -3226,6 +3227,7 @@ def _mint_fragrantica_clearance():
             or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
         )
         if headless_env.lower() in {"1", "true", "yes"}:
+            options.headless(True)
             options.set_argument("--headless=new")
         options.auto_port()
 
