@@ -278,7 +278,9 @@ def _upsert_completed_fragrance_record(
             year             = COALESCE(EXCLUDED.year, fragrance_records.year),
             image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
             fg_raw_json      = EXCLUDED.fg_raw_json,
+            derived_metrics_json = NULL,
             source_captured_at = now(),
+            metrics_computed_at = NULL,
             last_seen_at     = now(),
             updated_at       = now()
         """,
@@ -856,10 +858,15 @@ def upsert_fragrance_details(row: dict[str, Any]) -> None:
                         WHEN EXCLUDED.bn_raw_json <> '{}'::jsonb THEN EXCLUDED.bn_raw_json
                         ELSE fragrance_records.bn_raw_json
                     END,
-                    derived_metrics_json = COALESCE(EXCLUDED.derived_metrics_json, fragrance_records.derived_metrics_json),
+                    derived_metrics_json = CASE
+                        WHEN EXCLUDED.derived_metrics_json IS NOT NULL THEN EXCLUDED.derived_metrics_json
+                        WHEN EXCLUDED.fg_raw_json <> '{}'::jsonb OR EXCLUDED.bn_raw_json <> '{}'::jsonb THEN NULL
+                        ELSE fragrance_records.derived_metrics_json
+                    END,
                     source_captured_at = now(),
                     metrics_computed_at = CASE
                         WHEN EXCLUDED.derived_metrics_json IS NOT NULL THEN now()
+                        WHEN EXCLUDED.fg_raw_json <> '{}'::jsonb OR EXCLUDED.bn_raw_json <> '{}'::jsonb THEN NULL
                         ELSE fragrance_records.metrics_computed_at
                     END,
                     last_seen_at     = now(),

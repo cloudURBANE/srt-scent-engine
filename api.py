@@ -3011,13 +3011,13 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
                     source=str(raw_review.get("source", "")),
                 )
             )
-    if details.derived_metrics is None:
-        try:
-            from derived_metrics_adapter import build_derived_metrics
+    stored_metrics = details.derived_metrics
+    try:
+        from derived_metrics_adapter import build_derived_metrics
 
-            details.derived_metrics = build_derived_metrics(details)
-        except Exception:
-            details.derived_metrics = None
+        details.derived_metrics = build_derived_metrics(details)
+    except Exception:
+        details.derived_metrics = stored_metrics
     return details
 
 
@@ -3331,13 +3331,22 @@ def details(req: DetailRequest) -> dict[str, Any]:
 
     stored_detail = _lookup_stored_detail(selected)
     if stored_detail is not None:
+        fragrantica_cache_source: str | None = None
+        if _apply_fg_detail_cache_db(selected, stored_detail):
+            fragrantica_cache_source = "db"
+        enrichment_status: str | None
+        if stored_detail.frag_cards:
+            enrichment_status = "completed"
+        else:
+            enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
         _persist_detail_record(selected, stored_detail)
         return _details_to_dict(
             selected,
             stored_detail,
             fragrantica_cached=bool(stored_detail.frag_cards),
-            fragrantica_cache_source="aggregate_db" if stored_detail.frag_cards else None,
-            enrichment_status="complete",
+            fragrantica_cache_source=fragrantica_cache_source
+            or ("aggregate_db" if stored_detail.frag_cards else None),
+            enrichment_status=enrichment_status,
         )
 
     scraper = engine.get_scraper()
@@ -3367,7 +3376,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
     # eligible too. Inert when DATABASE_URL is unset.
     enrichment_status: str | None = None
     if fragrantica_cache_source == "db":
-        enrichment_status = "complete"
+        enrichment_status = "completed"
     elif fragrantica_cache_source == "json":
         enrichment_status = "bundled_cache"
     elif not detail_bundle.frag_cards:
