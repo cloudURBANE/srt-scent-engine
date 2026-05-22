@@ -100,6 +100,94 @@ def test_api_cache_threshold_matches_engine() -> None:
         api._CACHE_SEARCH_MIN_SCORE == engine.QueryRepair.MIN_RESULT_SCORE,
         f"{api._CACHE_SEARCH_MIN_SCORE} != {engine.QueryRepair.MIN_RESULT_SCORE}",
     )
+    check(
+        "strong cache precheck uses a stricter floor",
+        api._STRONG_CACHE_MIN_SCORE > api._CACHE_SEARCH_MIN_SCORE,
+        f"{api._STRONG_CACHE_MIN_SCORE} <= {api._CACHE_SEARCH_MIN_SCORE}",
+    )
+
+
+def test_api_strong_cache_precheck_skips_live_identity_hit() -> None:
+    print("API strong-cache precheck checks:")
+    old_cache = api._ARGS.fg_cache
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    try:
+        api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_detail_cache = lambda query, limit=15: []
+
+        def fail_live_search(*args, **kwargs):
+            raise AssertionError("live search should be skipped")
+
+        api.engine.search_once = fail_live_search
+        response = api.search(q="santal 33")
+    finally:
+        api._ARGS.fg_cache = old_cache
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    identities = [(row.get("house"), row.get("name")) for row in response.get("results", [])]
+    check("identity cache exact hit returns results", ("Le Labo", "Santal 33") in identities, str(identities))
+    check("strong precheck labels source", diagnostics.get("cache_source") == "identity", str(diagnostics))
+    check("strong precheck labels mode", diagnostics.get("cache_mode") == "precheck", str(diagnostics))
+    check("strong precheck reports skipped live search", diagnostics.get("live_search_skipped") is True, str(diagnostics))
+
+
+def test_api_strong_cache_precheck_does_not_bypass_brand_only() -> None:
+    print("API brand-only precheck safety checks:")
+    old_cache = api._ARGS.fg_cache
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    calls = {"live": 0}
+    try:
+        api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
+        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_detail_cache = lambda query, limit=15: []
+
+        def empty_live_search(*args, **kwargs):
+            calls["live"] += 1
+            return []
+
+        api.engine.search_once = empty_live_search
+        response = api.search(q="xerjoff")
+    finally:
+        api._ARGS.fg_cache = old_cache
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    check("brand-only query runs live search", calls["live"] == 1, str(calls))
+    check("brand-only query is not labelled precheck", diagnostics.get("cache_mode") != "precheck", str(diagnostics))
+
+
+def test_fragrantica_native_search_bypassed_by_default() -> None:
+    print("Native Fragrantica search bypass checks:")
+    old_get = engine.Http.get
+    calls = {"http": 0}
+    try:
+        def forbidden_get(*args, **kwargs):
+            calls["http"] += 1
+            raise AssertionError("Http.get should not be called")
+
+        engine.Http.get = forbidden_get
+        rows = engine.FragranticaEngine.extract_search_data(object(), "dior sauvage")
+    finally:
+        engine.Http.get = old_get
+
+    check("native Fragrantica search returns no rows by default", rows == [], str(rows))
+    check("native Fragrantica search does not call Http.get by default", calls["http"] == 0, str(calls))
 
 
 def test_search_serialization_recovers_fragrantica_identity() -> None:
@@ -237,6 +325,9 @@ def main() -> int:
     test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_api_cache_threshold_matches_engine()
+    test_api_strong_cache_precheck_skips_live_identity_hit()
+    test_api_strong_cache_precheck_does_not_bypass_brand_only()
+    test_fragrantica_native_search_bypassed_by_default()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()

@@ -3263,11 +3263,7 @@ def get_scraper():
         )
     else:
         default = requests.Session()
-    return RoutedScraper(
-        default,
-        get_basenotes_scraper(default),
-        get_fragrantica_scraper(default),
-    )
+    return RoutedScraper(default, None, None)
 
 
 def draw_bar(pct: float | int | None, width: int = 20, color: str = G, empty_label: str = "No Data") -> str:
@@ -5038,7 +5034,10 @@ class FragranticaEngine:
         query: str,
         max_results: int = 25,
         deadline: Deadline | None = None,
+        native_search_enabled: bool = False,
     ) -> list[UnifiedFragrance]:
+        if not native_search_enabled:
+            return []
         url = FragranticaEngine.SEARCH_URL.format(query=quote(query))
         for _ in range(2):
             if deadline and deadline.expired():
@@ -7311,6 +7310,7 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
             query,
             max_results=args.max_frag_results,
             deadline=shared_deadline,
+            native_search_enabled=getattr(args, "native_fragrantica_search", False),
         )
         trace.finish(token, result_count=len(rows), linked_count=sum(1 for item in rows if item.frag_url), skipped_reason="" if rows else "no_perfume_links_found", deadline=shared_deadline)
         return rows
@@ -7514,6 +7514,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-frag-results", type=int, default=25, help="Max native Fragrantica search cards to parse.")
     parser.add_argument("--max-results", type=int, default=15, help="Max merged candidates to display.")
+    parser.add_argument("--native-fragrantica-search", action="store_true", help="Opt into Fragrantica's static search page during first-pass search.")
     parser.add_argument("--initial-timeout", type=float, default=6.0, help="Shared deadline for first-pass search.")
     parser.add_argument("--detail-timeout", type=float, default=6.0, help="Shared deadline for selected detail fetch.")
     parser.add_argument("--metrics-budget", type=float, default=0.9, help="Shared budget for rating metrics. Use 0 to skip.")

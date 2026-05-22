@@ -102,12 +102,33 @@ _ALLOW_BUNDLED_FG_SEARCH_CACHE = _env_flag(
 )
 _CACHE_SEARCH_MIN_SCORE = engine.QueryRepair.MIN_RESULT_SCORE
 
+# Strict score floor for the /search strong-cache precheck. _CACHE_SEARCH_MIN_SCORE
+# (0.72) is the right floor *after* live providers fail -- a loose match beats a
+# blank screen. But to skip live resolution entirely, a cached row must be a
+# near-exact hit, so the precheck uses a much higher threshold.
+_STRONG_CACHE_MIN_SCORE = 0.95
+
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)) or "0")
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)) or "0")
+    except (TypeError, ValueError):
+        return default
+
+
+# API latency budget. Keep the CLI parser defaults exploratory, but make HTTP
+# search suitable for the first screen: live first-pass work is bounded tightly,
+# and candidate metrics are left to /details.
+_ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 3.0)
+_ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
+_ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
 
 
 _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
@@ -340,7 +361,7 @@ def _fragrance_record_is_stale(record: dict[str, Any]) -> bool:
 
 
 def _fragrance_record_search(
-    query: str, limit: int
+    query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
 ) -> list[engine.UnifiedFragrance]:
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
@@ -351,7 +372,7 @@ def _fragrance_record_search(
         if not item:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+        if item.query_score < min_score:
             continue
         key = item.frag_url or item.bn_url or item.cache_key
         if key in seen:
@@ -425,7 +446,9 @@ def _candidate_from_cache_entry(
     return candidate
 
 
-def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
+def _json_cache_search(
+    query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
+) -> list[engine.UnifiedFragrance]:
     if not _ALLOW_BUNDLED_FG_DETAIL_CACHE:
         return []
     candidates: list[engine.UnifiedFragrance] = []
@@ -437,7 +460,7 @@ def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
         if not item:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+        if item.query_score < min_score:
             continue
         key = item.frag_url or item.cache_key
         if key in seen:
@@ -451,13 +474,17 @@ def _json_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
     return candidates[:limit]
 
 
-def _identity_cache_search(query: str, limit: int) -> list[engine.UnifiedFragrance]:
+def _identity_cache_search(
+    query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
+) -> list[engine.UnifiedFragrance]:
     """Last-resort search candidates from the engine's existing FG identity cache.
 
     This is used only when live providers return zero candidates. It does not
     alter resolver scoring or the normal search path; it simply exposes the same
     warmed identity cache that SearchSniper already uses after candidates exist.
     """
+    if not _ALLOW_BUNDLED_FG_SEARCH_CACHE:
+        return []
     cache = engine.IdentityCache(getattr(_ARGS, "fg_cache", ""))
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
@@ -478,7 +505,7 @@ def _identity_cache_search(query: str, limit: int) -> list[engine.UnifiedFragran
         if not item.name or not item.brand:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < _CACHE_SEARCH_MIN_SCORE:
+        if item.query_score < min_score:
             continue
         seen.add(fg_url)
         candidates.append(item)
@@ -489,27 +516,40 @@ def _identity_cache_search(query: str, limit: int) -> list[engine.UnifiedFragran
     return candidates[:limit]
 
 
+def _db_detail_cache_search(
+    query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
+) -> list[engine.UnifiedFragrance]:
+    """Search candidates from the durable Postgres fg_detail_cache."""
+    candidates: list[engine.UnifiedFragrance] = []
+    seen: set[str] = set()
+    for entry in db.search_detail_cache(query, limit=limit * 2):
+        item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
+        if not item:
+            continue
+        item.query_score = engine.IdentityTools.relevance_score(query, item)
+        if item.query_score < min_score:
+            continue
+        key = item.frag_url or item.cache_key
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
+    candidates.sort(
+        key=lambda item: (item.query_score, item.resolver_score, item.year),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
 def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedFragrance], str | None]:
     """Fallback search for blocked live providers, with DB as source of truth."""
-    seen: set[str] = set()
     candidates = _fragrance_record_search(query, limit)
     source: str | None = None
 
     if candidates:
         source = "aggregate_db"
     else:
-        for entry in db.search_detail_cache(query, limit=limit * 2):
-            item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
-            if not item:
-                continue
-            item.query_score = engine.IdentityTools.relevance_score(query, item)
-            if item.query_score < _CACHE_SEARCH_MIN_SCORE:
-                continue
-            key = item.frag_url or item.cache_key
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(item)
+        candidates = _db_detail_cache_search(query, limit)
         if candidates:
             source = "db"
     if not candidates:
@@ -526,6 +566,48 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
         reverse=True,
     )
     return candidates[:limit], source
+
+
+def _strong_cache_candidate_ok(
+    query: str, item: engine.UnifiedFragrance, min_score: float
+) -> bool:
+    if float(getattr(item, "query_score", 0.0) or 0.0) < min_score:
+        return False
+
+    # IdentityTools deliberately treats a house-only match as strong enough for
+    # fallback ranking. For a live-search bypass, require the query to touch the
+    # fragrance name itself, so broad brand searches still get live breadth.
+    query_tokens = set(engine.QueryRepair._tokens(query))
+    name_tokens = set(engine.QueryRepair._tokens(item.name))
+    return bool(query_tokens and name_tokens and query_tokens.intersection(name_tokens))
+
+
+def _strong_cache_search(
+    query: str, limit: int, min_score: float = _STRONG_CACHE_MIN_SCORE
+) -> tuple[list[engine.UnifiedFragrance], str | None]:
+    """High-confidence cache search used to *bypass* live resolution entirely.
+
+    Same sources as _cache_search_fallback and in the same source-of-truth
+    order, but gated by the strict _STRONG_CACHE_MIN_SCORE floor: a cached row
+    only short-circuits the live engine when it is a near-exact match for the
+    query. The first non-empty source wins. Returns ([], None) when no source
+    has a confident-enough hit, in which case the caller should run live search.
+    """
+    searches = (
+        ("aggregate_db", _fragrance_record_search),
+        ("db", _db_detail_cache_search),
+        ("json", _json_cache_search),
+        ("identity", _identity_cache_search),
+    )
+    for source, search_fn in searches:
+        candidates = [
+            item
+            for item in search_fn(query, limit, min_score)
+            if _strong_cache_candidate_ok(query, item, min_score)
+        ]
+        if candidates:
+            return candidates, source
+    return [], None
 
 
 def _source_coverage(
@@ -1358,13 +1440,24 @@ def search(
     if not query:
         raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
 
-    cached_results = _fragrance_record_search(query, _ARGS.max_results)
-    if cached_results:
-        diagnostics = _search_diagnostics(cached_results)
-        diagnostics["cache_source"] = "aggregate_db"
+    # Strong cache precheck. Before constructing a scraper or running the live
+    # resolver, see if any warmed cache holds a near-exact hit for this query.
+    # _strong_cache_search uses the strict _STRONG_CACHE_MIN_SCORE floor, so a
+    # match here is high-confidence enough to skip live search entirely -- this
+    # is the fast path that answers common cached queries in tens of ms instead
+    # of waiting behind the engine's first-pass timeout budget.
+    strong_results, strong_source = _strong_cache_search(query, _ARGS.max_results)
+    strong_results = [
+        item for item in strong_results if _candidate_has_display_identity(item)
+    ]
+    if strong_results:
+        diagnostics = _search_diagnostics(strong_results)
+        diagnostics["cache_source"] = strong_source
+        diagnostics["cache_mode"] = "precheck"
+        diagnostics["live_search_skipped"] = True
         return {
             "query": query,
-            "results": [_search_result_to_dict(item) for item in cached_results],
+            "results": [_search_result_to_dict(item) for item in strong_results],
             "diagnostics": diagnostics,
         }
 
@@ -2541,6 +2634,7 @@ def _fg_diag_engine_search(query: str) -> dict[str, Any]:
             scraper,
             query,
             deadline=engine.Deadline(10),
+            native_search_enabled=True,
         )
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["row_count"] = len(rows)
