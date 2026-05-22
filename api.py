@@ -642,6 +642,24 @@ def _strong_cache_search(
     return [], None
 
 
+_FG_METRIC_GROUPS = ("performance_score", "value_score",
+                     "community_interest_score", "wear_profile")
+
+
+def _fg_metrics_complete(details: engine.UnifiedDetails) -> bool:
+    """True when all 4 Fragrantica status-derived metric groups are present.
+
+    Source of truth for 'the encrypted status payload made it through'. Reads
+    the derived_metrics adapter's own source_coverage sub-dict so it is robust
+    to whether a card came from status decode or an HTML fallback.
+    """
+    dm = getattr(details, "derived_metrics", None)
+    if not isinstance(dm, dict):
+        return False
+    cov = dm.get("source_coverage") or {}
+    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+
 def _source_coverage(
     selected: engine.UnifiedFragrance,
     details: engine.UnifiedDetails,
@@ -669,9 +687,10 @@ def _source_coverage(
     fg_linked = bool(selected.frag_url)
     bn_has_data = bn_linked and bool(details.bn_consensus)
     fg_has_data = fg_linked and bool(details.frag_cards)
+    fg_complete = fg_has_data and _fg_metrics_complete(details)
     if details.derived_metrics is None:
         derived = "none"
-    elif bn_has_data and fg_has_data:
+    elif bn_has_data and fg_complete:
         derived = "full"
     else:
         derived = "partial"
@@ -679,6 +698,10 @@ def _source_coverage(
         "basenotes": bn_has_data,
         "fragrantica": fg_has_data,
         "fragrantica_cached": fragrantica_cached,
+        # True only when all 4 Fragrantica status-derived metric groups made it
+        # through -- the frontend keys off this to decide whether to keep
+        # refreshing a partial wardrobe tile. See `_fg_metrics_complete`.
+        "fragrantica_metrics_complete": fg_complete,
         # "db" (durable Postgres cache), "json" (bundled file), or null (live or
         # absent). Additive honesty signal; existing keys keep their meaning.
         "fragrantica_cache_source": fragrantica_cache_source,
@@ -3023,14 +3046,26 @@ def _hydrate_details_from_entry(
     dict with the same shape (`frag_cards` / `notes` / `pros_cons` / `reviews`).
     Returns True only when cached Fragrantica data was actually applied.
 
-    Strictly additive -- live data always wins (callers only invoke this when
-    `details.frag_cards` is empty), fields are filled only when empty, and the
-    existing derived_metrics adapter is re-run exactly as the engine runs it.
+    Strictly additive -- live data always wins. `frag_cards` is merged per card
+    so a *complete* cache entry can backfill a *partial* live/stored bundle
+    (cards present live are never overwritten); notes/pros_cons/reviews stay
+    fill-only. The existing derived_metrics adapter is re-run exactly as the
+    engine runs it. Returns True only when something was actually added.
     """
     cached_cards = entry.get("frag_cards")
     if not isinstance(cached_cards, dict) or not cached_cards:
         return False
-    details.frag_cards = cached_cards
+
+    applied = False
+    # Per-card merge: backfill cards missing from the live/stored bundle, never
+    # overwrite ones already present (live wins). This lets a complete cache
+    # entry heal a partial bundle instead of only hydrating an empty one.
+    if not isinstance(details.frag_cards, dict):
+        details.frag_cards = {}
+    for name, rows in cached_cards.items():
+        if rows and name not in details.frag_cards:
+            details.frag_cards[name] = rows
+            applied = True
 
     # Notes: fill only when the live bundle carried none (BN supplied nothing).
     notes = details.notes
@@ -3042,11 +3077,14 @@ def _hydrate_details_from_entry(
             notes.heart = list(cached_notes.get("heart", []) or [])
             notes.base = list(cached_notes.get("base", []) or [])
             notes.flat = list(cached_notes.get("flat", []) or [])
+            if notes.top or notes.heart or notes.base or notes.flat:
+                applied = True
 
     # pros_cons / reviews: additive only -- never replace live content.
     cached_pros_cons = entry.get("pros_cons") or []
-    if isinstance(cached_pros_cons, list):
+    if isinstance(cached_pros_cons, list) and cached_pros_cons:
         details.pros_cons.extend(str(p) for p in cached_pros_cons)
+        applied = True
     cached_reviews = entry.get("reviews") or []
     if isinstance(cached_reviews, list):
         for r in cached_reviews:
@@ -3056,6 +3094,10 @@ def _hydrate_details_from_entry(
                         text=str(r["text"]), source=str(r.get("source", ""))
                     )
                 )
+                applied = True
+
+    if not applied:
+        return False
 
     # Re-run the existing adapter over the merged object. Best-effort: a failure
     # here must not break the raw detail response (mirrors the engine contract
@@ -3238,7 +3280,7 @@ def _apply_fg_detail_cache_db(
     bundled JSON cache -> partial). Only `quality_status = 'complete'` entries
     are trusted for hydration; weaker entries are left for a worker re-fetch.
     """
-    if details.frag_cards or not selected.frag_url:
+    if _fg_metrics_complete(details) or not selected.frag_url:
         return False
     entry = db.lookup_detail_cache(_canonical_fg_url(selected.frag_url))
     if not entry or entry.get("quality_status") != "complete":
@@ -3256,8 +3298,8 @@ def _apply_fg_detail_cache(
     Fragrantica data always wins: if details.frag_cards is already populated
     this is a no-op and returns False.
     """
-    # Live Fragrantica data present -> never touch it.
-    if details.frag_cards:
+    # Complete Fragrantica metrics present -> nothing to backfill.
+    if _fg_metrics_complete(details):
         return False
     if not _ALLOW_BUNDLED_FG_DETAIL_CACHE:
         return False
@@ -3461,7 +3503,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
         if _apply_fg_detail_cache_db(selected, stored_detail):
             fragrantica_cache_source = "db"
         enrichment_status: str | None
-        if stored_detail.frag_cards:
+        if _fg_metrics_complete(stored_detail):
             enrichment_status = "completed"
         else:
             enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
@@ -3505,7 +3547,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
         enrichment_status = "completed"
     elif fragrantica_cache_source == "json":
         enrichment_status = "bundled_cache"
-    elif not detail_bundle.frag_cards:
+    elif not _fg_metrics_complete(detail_bundle):
         enrichment_status = "pending" if _enqueue_enrichment_job(selected, req) else "unavailable"
 
     _persist_detail_record(selected, detail_bundle)

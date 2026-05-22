@@ -488,6 +488,34 @@ def resolve_candidate(
     raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
 
 
+_FG_METRIC_GROUPS = (
+    "performance_score",
+    "value_score",
+    "community_interest_score",
+    "wear_profile",
+)
+
+
+def _worker_metrics_complete(details: Any) -> bool:
+    """True when all 4 Fragrantica status-derived metric groups parsed.
+
+    Mirrors api._fg_metrics_complete: a partial fetch (encrypted status payload
+    did not decode) must not be stored as a trustworthy 'complete' cache entry,
+    otherwise api._apply_fg_detail_cache_db would hydrate from it and the job
+    would never be re-enqueued for a retry.
+    """
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        dm = build_derived_metrics(details)
+    except Exception:
+        return False
+    if not isinstance(dm, dict):
+        return False
+    cov = dm.get("source_coverage") or {}
+    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+
 def fetch_payload(
     scraper,
     candidate: engine.UnifiedFragrance,
@@ -566,7 +594,10 @@ def fetch_payload(
         "pros_cons": list(details.pros_cons or []),
         "reviews": _reviews_payload(details.reviews or []),
         "raw_identity": raw_identity,
-        "quality_status": "complete",
+        # "complete" only when all 4 status-derived metric groups parsed. A
+        # "partial" entry is ignored by api._apply_fg_detail_cache_db, so the
+        # job is naturally re-enqueued and retried on the next /details call.
+        "quality_status": "complete" if _worker_metrics_complete(details) else "partial",
     }
 
 
