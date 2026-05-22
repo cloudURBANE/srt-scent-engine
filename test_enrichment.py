@@ -236,6 +236,77 @@ def test_mobile_new_device_session_binding() -> None:
         mobile.verify_pin = saved["verify_pin"]
 
 
+def test_hydration_dedup() -> None:
+    print("Detail hydration checks (no DATABASE_URL required):")
+
+    def make_entry() -> dict[str, object]:
+        return {
+            "frag_cards": {
+                "Community Interest": [{"label": "Have", "count": "12"}],
+                "Performance": [{"label": "Longevity", "count": "8"}],
+            },
+            "notes": {
+                "has_pyramid": True,
+                "top": ["bergamot"],
+                "heart": ["rose"],
+                "base": ["musk"],
+                "flat": [],
+            },
+            "pros_cons": ["long lasting", "great projection"],
+            "reviews": [
+                {"text": "A modern classic.", "source": "fragrantica"},
+                {"text": "A touch sharp on me.", "source": "fragrantica"},
+            ],
+        }
+
+    # Re-hydrating the same bundle twice must not accumulate duplicate rows --
+    # _hydrate_details_from_entry can run more than once over one bundle.
+    details = api.engine.UnifiedDetails(notes=api.engine.NotesList())
+    first = api._hydrate_details_from_entry(details, make_entry())
+    check("first hydration applies cached Fragrantica data", first is True)
+    pros_after_first = list(details.pros_cons)
+    reviews_after_first = len(details.reviews)
+    api._hydrate_details_from_entry(details, make_entry())
+    check(
+        "re-hydration does not duplicate pros_cons",
+        details.pros_cons == pros_after_first,
+        f"{details.pros_cons}",
+    )
+    check(
+        "re-hydration does not duplicate reviews",
+        len(details.reviews) == reviews_after_first,
+        f"{len(details.reviews)} review(s)",
+    )
+
+    # A complete cache entry backfills a partial bundle: live rows are kept
+    # exactly once, and only genuinely new cached rows are appended.
+    partial = api.engine.UnifiedDetails(
+        notes=api.engine.NotesList(top=["lemon"]),
+        pros_cons=["long lasting"],
+    )
+    partial.reviews.append(api.engine.Review(text="A modern classic.", source="live"))
+    applied = api._hydrate_details_from_entry(partial, make_entry())
+    check("hydration applies to a partial bundle", applied is True)
+    check(
+        "live pros_cons row kept exactly once after overlay",
+        partial.pros_cons.count("long lasting") == 1,
+        f"{partial.pros_cons}",
+    )
+    check(
+        "new cached pros_cons row is appended",
+        "great projection" in partial.pros_cons,
+    )
+    check(
+        "complete cache entry backfills missing frag_cards",
+        "Performance" in (partial.frag_cards or {}),
+    )
+    check(
+        "same review text with a different source stays distinct",
+        sum(1 for r in partial.reviews if r.text == "A modern classic.") == 2,
+        f"{[(r.text, r.source) for r in partial.reviews]}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB-backed checks (only when DATABASE_URL is set)
 # ---------------------------------------------------------------------------
@@ -263,7 +334,7 @@ def test_db_lifecycle() -> None:
     _cleanup()
     try:
         # Enqueue, then enqueue again -> upsert, requested_count bumps to 2.
-        for _ in range(2):
+        enqueue_counts = [
             db.enqueue_job(
                 job_key=_TEST_JOB_KEY,
                 query="enrichment selftest",
@@ -273,6 +344,13 @@ def test_db_lifecycle() -> None:
                 bn_url=None,
                 fg_url=_TEST_JOB_KEY,
             )
+            for _ in range(2)
+        ]
+        check(
+            "enqueue_job returns the incrementing requested_count",
+            enqueue_counts == [1, 2],
+            str(enqueue_counts),
+        )
         jobs = [j for j in db.list_jobs("pending", 100) if j["job_key"] == _TEST_JOB_KEY]
         check("enqueue creates exactly one pending job", len(jobs) == 1)
         job = jobs[0]
@@ -381,6 +459,19 @@ def test_db_lifecycle() -> None:
             "aggregate failure still leaves fg_detail_cache updated",
             bool(cached and cached.get("name") == "Enrichment Selftest Recovered"),
         )
+
+        # Legacy-complete decision: a cache_row that omits quality_status falls
+        # back to 'complete' (matches the fg_detail_cache column DEFAULT). This
+        # is the behaviour legacy rows -- written before the column existed --
+        # inherit via the ADD COLUMN migration in db.py.
+        legacy_row = {k: v for k, v in cache_row.items() if k != "quality_status"}
+        legacy_row["name"] = "Enrichment Selftest Legacy"
+        db.complete_job(job["id"], legacy_row)
+        cached = db.lookup_detail_cache(_TEST_JOB_KEY)
+        check(
+            "cache_row without quality_status defaults to complete",
+            bool(cached and cached.get("quality_status") == "complete"),
+        )
     finally:
         _cleanup()
 
@@ -388,6 +479,7 @@ def test_db_lifecycle() -> None:
 def main() -> int:
     test_no_db_contract()
     test_mobile_new_device_session_binding()
+    test_hydration_dedup()
     if db.ENABLED:
         test_db_lifecycle()
     else:
