@@ -3684,7 +3684,10 @@ def details(req: DetailRequest) -> dict[str, Any]:
             fragrantica_cache_source = "db"
         enrichment_status: str | None
         enrichment_requested_count: int | None = None
-        if _fg_metrics_complete(stored_detail):
+        if fragrantica_cache_source == "db" or bool(stored_detail.frag_cards) or _fg_metrics_complete(stored_detail):
+            # Worker already wrote a result; do not re-enqueue even if FG itself
+            # never publishes all 4 metric groups. fragrantica_metrics_complete in
+            # source_coverage is the truthful signal for "all 4 groups present".
             enrichment_status = "completed"
         else:
             enqueued = _enqueue_enrichment_job(selected, req)

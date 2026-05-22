@@ -37,6 +37,7 @@ import signal
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,7 +63,14 @@ DEFAULT_LIMIT = 10
 DEFAULT_DETAIL_TIMEOUT = 15.0
 SCHEMA_VERSION = 1
 MAX_LIST_LIMIT = 100
-HTTP_TIMEOUT = 30.0
+# Dashboard/list reads fail fast; complete/fail uploads get more headroom.
+HTTP_CONNECT_TIMEOUT = 3.0
+HTTP_READ_TIMEOUT = 12.0
+HTTP_WRITE_TIMEOUT = 45.0
+# Cap job-list scans used only for attention counters (not full queue dumps).
+DASHBOARD_ATTENTION_LIMIT = 25
+# Phone remote control heartbeat — not every 5s dashboard tick.
+PHONE_HEARTBEAT_INTERVAL = 30.0
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -131,15 +139,17 @@ class ApiClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         auth: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         wire_json = _json_for_request(json)
+        read_timeout = HTTP_READ_TIMEOUT if timeout is None else max(1.0, float(timeout))
         try:
             response = self.session.request(
                 method,
                 self._url(path, params),
                 json=wire_json,
                 headers=self._headers(auth),
-                timeout=HTTP_TIMEOUT,
+                timeout=(HTTP_CONNECT_TIMEOUT, read_timeout),
             )
         except requests.Timeout as exc:
             raise WorkerError("network_timeout", retryable=True) from exc
@@ -186,13 +196,19 @@ class ApiClient:
         return self._request("POST", f"/api/enrichment/jobs/{job_id}/claim")
 
     def complete_job(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", f"/api/enrichment/jobs/{job_id}/complete", json=payload)
+        return self._request(
+            "POST",
+            f"/api/enrichment/jobs/{job_id}/complete",
+            json=payload,
+            timeout=HTTP_WRITE_TIMEOUT,
+        )
 
     def fail_job(self, job_id: str, error: str, retryable: bool) -> dict[str, Any]:
         return self._request(
             "POST",
             f"/api/enrichment/jobs/{job_id}/fail",
             json={"error": error, "retryable": bool(retryable)},
+            timeout=HTTP_WRITE_TIMEOUT,
         )
 
     def requeue_job(self, job_id: str, *, priority: int = 10) -> dict[str, Any]:
@@ -1058,9 +1074,11 @@ def _log_event(message: str, kind: str = "info") -> None:
 
 
 def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
-    """One status call (always) plus two targeted job-list calls for the
-    actionable "needs attention" metrics. The job-list calls require a worker
-    token; without one they fail quietly and those metrics render as unknown."""
+    """Status plus lightweight attention metrics.
+
+    Uses aggregate counts to skip unnecessary list calls, caps list scans, and
+    runs the remaining list fetches in parallel so a slow Railway cold start does
+    not block the dashboard for 90+ seconds."""
     status = _status_counts(client)
     snapshot: dict[str, Any] = {
         "enabled": status.get("enabled"),
@@ -1071,24 +1089,53 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
     }
     if snapshot["error"]:
         return snapshot
-    try:
-        # Pending with prior failures plus terminal failed rows (requeued on retry).
-        pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
-        pending_retries = sum(1 for j in pending if int(j.get("failure_count") or 0) > 0)
-        terminal_failed = int((snapshot.get("counts") or {}).get("failed") or 0)
-        snapshot["retryable_failures"] = pending_retries + terminal_failed
-    except WorkerError:
-        pass
-    try:
-        processing = client.list_jobs("processing", limit=MAX_LIST_LIMIT)
+
+    counts = snapshot.get("counts") or {}
+    pending_n = int(counts.get("pending") or 0)
+    processing_n = int(counts.get("processing") or 0)
+    terminal_failed = int(counts.get("failed") or 0)
+
+    if pending_n <= 0:
+        snapshot["retryable_failures"] = terminal_failed
+    if processing_n <= 0:
+        snapshot["stale_processing"] = 0
+
+    def _pending_retries() -> int:
+        limit = min(DASHBOARD_ATTENTION_LIMIT, max(5, pending_n))
+        pending = client.list_jobs("pending", limit=limit)
+        return sum(1 for j in pending if int(j.get("failure_count") or 0) > 0)
+
+    def _stale_count() -> int:
+        limit = min(DASHBOARD_ATTENTION_LIMIT, max(5, processing_n))
+        processing = client.list_jobs("processing", limit=limit)
         now = datetime.now(timezone.utc)
-        snapshot["stale_processing"] = sum(
+        return sum(
             1
             for j in processing
             if (_parse_iso(j.get("claim_expires_at")) or now) < now
         )
-    except WorkerError:
-        pass
+
+    futures: dict[Any, str] = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        if pending_n > 0:
+            futures[pool.submit(_pending_retries)] = "retryable"
+        if processing_n > 0:
+            futures[pool.submit(_stale_count)] = "stale"
+        for fut in as_completed(futures):
+            kind = futures[fut]
+            try:
+                result = fut.result()
+            except WorkerError:
+                continue
+            if kind == "retryable":
+                snapshot["retryable_failures"] = int(result) + terminal_failed
+            else:
+                snapshot["stale_processing"] = int(result)
+
+    if snapshot["retryable_failures"] is None:
+        snapshot["retryable_failures"] = terminal_failed if pending_n <= 0 else None
+    if snapshot["stale_processing"] is None:
+        snapshot["stale_processing"] = 0 if processing_n <= 0 else None
     return snapshot
 
 
@@ -1222,11 +1269,24 @@ def _render_dashboard(
     )
 
 
+def _pick_stale_processing_job(client: ApiClient) -> dict[str, Any] | None:
+    """Return the oldest stale processing row, if any."""
+    try:
+        jobs = client.list_jobs("processing", limit=DASHBOARD_ATTENTION_LIMIT)
+    except WorkerError:
+        return None
+    now = datetime.now(timezone.utc)
+    stale = [j for j in jobs if (_parse_iso(j.get("claim_expires_at")) or now) < now]
+    return stale[0] if stale else None
+
+
 def _run_auto_approve(
     client: ApiClient,
     config: WorkerConfig,
     stop: StopController,
     auto_state: dict[str, Any],
+    *,
+    render_ctx: dict[str, Any] | None = None,
 ) -> None:
     """Claim and complete the single oldest pending enrichment.
 
@@ -1235,20 +1295,37 @@ def _run_auto_approve(
     returns. The engine scraper/args are built once and cached on auto_state so
     repeated ticks stay cheap.
     """
-    try:
-        jobs = client.list_jobs("pending", limit=1)
-    except WorkerError as exc:
-        _log_event(f"auto: cannot read queue ({exc.code})", "err")
-        return
-    if not jobs:
-        _log_event("auto: queue empty — nothing to approve", "info")
-        return
+    reclaiming = False
+    job = _pick_stale_processing_job(client)
+    if job:
+        reclaiming = True
+    else:
+        try:
+            jobs = client.list_jobs("pending", limit=1)
+        except WorkerError as exc:
+            _log_event(f"auto: cannot read queue ({exc.code})", "err")
+            return
+        if not jobs:
+            _log_event("auto: queue empty — nothing to approve", "info")
+            return
+        job = jobs[0]
+
     if auto_state.get("scraper") is None:
         auto_state["scraper"] = engine.get_scraper()
         auto_state["args"] = _build_engine_args()
-    job = jobs[0]
     target = job.get("name") or job.get("brand") or job.get("id") or "next job"
-    _log_event(f"auto: processing {target}", "info")
+    if reclaiming:
+        _log_event(f"auto: reclaiming stale {target}", "warn")
+    else:
+        _log_event(f"auto: processing {target}", "info")
+    if render_ctx:
+        _render_dashboard(
+            render_ctx["snapshot"],
+            render_ctx["baseline"],
+            config,
+            int(render_ctx["interval"]),
+            bool(render_ctx["auto_approve"]),
+        )
     # process_job() prints progress to stdout; swallow it so the dashboard
     # frame stays intact and only our LIVE_STREAM lines surface to the user.
     # It also catches its own scraping errors and returns False rather than
@@ -1348,6 +1425,11 @@ def _poll_phone_commands(
     via LIVE_STREAM but never break the dashboard tick."""
     if not config.auth_configured:
         return
+    now = time.monotonic()
+    last = float(runtime.get("last_phone_poll") or 0.0)
+    if now - last < PHONE_HEARTBEAT_INTERVAL:
+        return
+    runtime["last_phone_poll"] = now
     try:
         client.heartbeat()
     except WorkerError as exc:
@@ -1408,6 +1490,7 @@ def run_live_dashboard(
         else:
             _log_event("auto_approve not started: set ENRICHMENT_WORKER_TOKEN first", "err")
     auto_state: dict[str, Any] = {"scraper": None, "args": None}
+    last_snapshot: dict[str, Any] = {"counts": {}}
     c = _colors()
     while not stop.stop_requested:
         auto_approve = bool(runtime["auto_approve"])
@@ -1419,6 +1502,7 @@ def run_live_dashboard(
             snapshot = _gather_dashboard_snapshot(client)
             if baseline is None and not snapshot.get("error"):
                 baseline = dict(snapshot.get("counts") or {})
+            last_snapshot = snapshot
             _render_dashboard(snapshot, baseline or {}, config, interval, auto_approve)
             refresh_now = False
 
@@ -1459,7 +1543,18 @@ def run_live_dashboard(
             # The cadence elapsed with no key. In auto-approve mode that means
             # it is time to process one job; otherwise just refresh the view.
             if auto_approve:
-                _run_auto_approve(client, config, stop, auto_state)
+                _run_auto_approve(
+                    client,
+                    config,
+                    stop,
+                    auto_state,
+                    render_ctx={
+                        "snapshot": last_snapshot,
+                        "baseline": baseline or {},
+                        "interval": interval,
+                        "auto_approve": True,
+                    },
+                )
             refresh_now = True
             continue
         if key == "q":
