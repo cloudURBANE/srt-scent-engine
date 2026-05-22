@@ -307,6 +307,98 @@ def test_hydration_dedup() -> None:
     )
 
 
+def test_stored_detail_completion_logic() -> None:
+    print("Stored detail completion logic checks (no DATABASE_URL required):")
+
+    saved_enabled = db.ENABLED
+    saved_lookup_rec = db.lookup_fragrance_record
+    saved_lookup_cache = db.lookup_detail_cache
+    saved_enqueue = db.enqueue_job
+    saved_upsert = db.upsert_fragrance_details
+
+    enqueue_calls = []
+
+    # A record representing a completed worker job but with missing metrics (wear_profile missing):
+    mock_frag_record_partial = {
+        "record_key": "fg:https://www.fragrantica.com/perfume/Test-Brand/Test-Fragrance-9999.html",
+        "canonical_fg_url": "https://www.fragrantica.com/perfume/Test-Brand/Test-Fragrance-9999.html",
+        "bn_url": None,
+        "name": "Test Fragrance",
+        "house": "Test Brand",
+        "year": 2026,
+        "gender": "Unisex",
+        "image_url": None,
+        "search": {},
+        # No wear_profile
+        "fg_raw": {
+            "frag_cards": {
+                "Community Interest": [{"label": "Have", "count": "10"}],
+                "Performance": [{"label": "Longevity", "count": "5"}],
+                "Price Value": [{"label": "Good Value", "count": "3"}],
+            }
+        },
+        "bn_raw": {},
+        "derived_metrics": None,
+    }
+
+    try:
+        db.ENABLED = True
+
+        def fake_lookup_fragrance_record(canonical_fg_url, bn_url):
+            return mock_frag_record_partial
+
+        def fake_lookup_detail_cache(canonical_fg_url):
+            return {
+                "canonical_fg_url": canonical_fg_url,
+                "name": "Test Fragrance",
+                "house": "Test Brand",
+                "quality_status": "complete",
+                "frag_cards": mock_frag_record_partial["fg_raw"]["frag_cards"],
+            }
+
+        def fake_enqueue_job(*args, **kwargs):
+            enqueue_calls.append((args, kwargs))
+            return 1
+
+        def fake_upsert_fragrance_details(*args, **kwargs):
+            pass
+
+        db.lookup_fragrance_record = fake_lookup_fragrance_record
+        db.lookup_detail_cache = fake_lookup_detail_cache
+        db.enqueue_job = fake_enqueue_job
+        db.upsert_fragrance_details = fake_upsert_fragrance_details
+
+        client = TestClient(api.app)
+
+        res1 = client.post(
+            "/api/fragrances/details",
+            json={"id": "source:https://www.fragrantica.com/perfume/Test-Brand/Test-Fragrance-9999.html"}
+        )
+        check("details response 200 on first call", res1.status_code == 200)
+        data1 = res1.json()
+
+        check("enrichment block is present", "enrichment" in data1)
+        if "enrichment" in data1:
+            check("enrichment.status is completed", data1["enrichment"]["status"] == "completed")
+            check("enrichment.requires_worker is false", data1["enrichment"]["requires_worker"] is False)
+
+        check("source_coverage is present", "source_coverage" in data1)
+        if "source_coverage" in data1:
+            check(
+                "fragrantica_metrics_complete is false (since metrics are incomplete)",
+                data1["source_coverage"]["fragrantica_metrics_complete"] is False
+            )
+
+        check("no enqueue job calls were made", len(enqueue_calls) == 0, f"calls={enqueue_calls}")
+
+    finally:
+        db.ENABLED = saved_enabled
+        db.lookup_fragrance_record = saved_lookup_rec
+        db.lookup_detail_cache = saved_lookup_cache
+        db.enqueue_job = saved_enqueue
+        db.upsert_fragrance_details = saved_upsert
+
+
 # ---------------------------------------------------------------------------
 # DB-backed checks (only when DATABASE_URL is set)
 # ---------------------------------------------------------------------------
@@ -480,6 +572,7 @@ def main() -> int:
     test_no_db_contract()
     test_mobile_new_device_session_binding()
     test_hydration_dedup()
+    test_stored_detail_completion_logic()
     if db.ENABLED:
         test_db_lifecycle()
     else:

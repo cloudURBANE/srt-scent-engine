@@ -212,23 +212,36 @@ class Deadline:
         return remaining is not None and remaining <= 0
 
 class StageTimer:
-    def __init__(self, enabled: bool = False):
+    """Per-stage wall-clock timer for the search pipeline.
+
+    `enabled` controls only stdout printing. When a `sink` dict is supplied,
+    every mark is also recorded into it (label -> elapsed seconds, or the
+    string "skipped") regardless of `enabled`, so the API layer can surface a
+    per-stage `diagnostics.timing` block without scraping stdout.
+    """
+
+    def __init__(self, enabled: bool = False, sink: dict[str, Any] | None = None):
         self.enabled = enabled
+        self.sink = sink
         self.total_start = time.monotonic()
         self.last = self.total_start
-        
+
     def mark(self, label: str, skipped: bool = False) -> None:
-        if not self.enabled:
-            return
         now = time.monotonic()
         elapsed = now - self.last
         self.last = now
-        status = "skipped" if skipped else f"{elapsed:.2f}s"
-        print(f"{D}[TIME] {label}: {status}{Z}")
-        
-    def total(self, label: str = "total_search") -> None:
+        if self.sink is not None:
+            self.sink[label] = "skipped" if skipped else round(elapsed, 3)
         if self.enabled:
-            print(f"{D}[TIME] {label}: {time.monotonic() - self.total_start:.2f}s{Z}")
+            status = "skipped" if skipped else f"{elapsed:.2f}s"
+            print(f"{D}[TIME] {label}: {status}{Z}")
+
+    def total(self, label: str = "total_search") -> None:
+        elapsed = time.monotonic() - self.total_start
+        if self.sink is not None:
+            self.sink[label] = round(elapsed, 3)
+        if self.enabled:
+            print(f"{D}[TIME] {label}: {elapsed:.2f}s{Z}")
 
 @dataclass
 class ResolverTraceEvent:
@@ -3983,6 +3996,9 @@ class IdentityCache:
         self.path = Path(path or default_path)
         self.data: dict[str, dict[str, Any]] = {}
         self.dirty = False
+        # Guards data/dirty mutation so the concurrent designer_catalog and
+        # bn_crosswalk passes (1-B) cannot race put() against save()'s snapshot.
+        self._lock = threading.RLock()
         self.load()
         
     def load(self) -> None:
@@ -4015,31 +4031,39 @@ class IdentityCache:
         key = frag.cache_key
         if not key or key == "||":
             return
-        self.data[key] = {
-            "brand": TextSanitizer.clean(frag.brand),
-            "name": TextSanitizer.clean(frag.name),
-            "year": TextSanitizer.clean(frag.year),
-            "url": frag.frag_url,
-            "source": source or frag.resolver_source or "unknown",
-            "updated_at": int(time.time()),
-        }
-        yearless = IdentityTools.cache_key(frag.brand, frag.name, "")
-        self.data.setdefault(yearless, dict(self.data[key]))
-        self.dirty = True
-        
+        with self._lock:
+            self.data[key] = {
+                "brand": TextSanitizer.clean(frag.brand),
+                "name": TextSanitizer.clean(frag.name),
+                "year": TextSanitizer.clean(frag.year),
+                "url": frag.frag_url,
+                "source": source or frag.resolver_source or "unknown",
+                "updated_at": int(time.time()),
+            }
+            yearless = IdentityTools.cache_key(frag.brand, frag.name, "")
+            self.data.setdefault(yearless, dict(self.data[key]))
+            self.dirty = True
+
     def save(self) -> None:
-        if not self.dirty:
-            return
+        # Snapshot under the lock so a concurrent put() cannot mutate `data`
+        # mid-serialization ("dictionary changed size during iteration").
+        with self._lock:
+            if not self.dirty:
+                return
+            snapshot = {key: dict(row) for key, row in self.data.items()}
+            self.dirty = False
         tmp_path = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path_str = tempfile.mkstemp(prefix=self.path.name, suffix=".tmp", dir=str(self.path.parent))
             tmp_path = Path(tmp_path_str)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self.data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dump(snapshot, handle, ensure_ascii=False, indent=2, sort_keys=True)
             os.replace(tmp_path, self.path)
-            self.dirty = False
         except Exception:
+            # Write failed -- re-arm dirty so a later save() retries.
+            with self._lock:
+                self.dirty = True
             if tmp_path and tmp_path.exists():
                 try:
                     tmp_path.unlink()
@@ -7480,19 +7504,26 @@ def print_results_table(results: list[UnifiedFragrance], search_time: float, deb
         print(f"{C}│{Z}" + f"{C}│{Z}".join(f" {fit_cell(v, w)} " for v, w in row) + f"{C}│{Z}")
     print(f"{B}{C}╰{bot}╯{Z}")
 
-def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list[UnifiedFragrance], list[UnifiedFragrance], list[UnifiedFragrance]]:
-    timer = StageTimer(enabled=args.debug_timing)
+def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[str, Any] | None = None) -> tuple[list[UnifiedFragrance], list[UnifiedFragrance], list[UnifiedFragrance]]:
+    timer = StageTimer(enabled=args.debug_timing, sink=timing)
     trace = ResolverTrace(enabled=args.debug_timing)
     cache = IdentityCache(args.fg_cache)
-    shared_deadline = Deadline(args.initial_timeout)
+    # 1-C: BN and FG run under independent soft-deadlines instead of one shared
+    # ceiling. BN keeps the full first-pass budget; FG/Serper is capped tighter
+    # -- it is the slower, lower-yield leg and its misses are backstopped by the
+    # FG cache and the shipped backfill, so a slow FG no longer pins the whole
+    # first pass at the ceiling. bounded_parallel still caps the pair at
+    # initial_timeout (the larger of the two).
+    bn_deadline = Deadline(args.initial_timeout)
+    fg_deadline = Deadline(min(getattr(args, "fg_timeout", args.initial_timeout), args.initial_timeout))
     def fg_search_job() -> list[UnifiedFragrance]:
-        token = trace.start("raw_search", query=query, deadline=shared_deadline)
+        token = trace.start("raw_search", query=query, deadline=fg_deadline)
         # When Serper is env-gated on, structured URL discovery replaces the
         # dead native Fragrantica SERP scrape for the first pass.
         if SerperClient.enabled():
             rows = SerperClient.discover_fragrances(
                 query,
-                deadline=shared_deadline,
+                deadline=fg_deadline,
                 max_results=args.max_frag_results,
             )
             skipped_reason = "" if rows else "serper_no_perfume_links"
@@ -7501,15 +7532,15 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
                 scraper,
                 query,
                 max_results=args.max_frag_results,
-                deadline=shared_deadline,
+                deadline=fg_deadline,
                 native_search_enabled=getattr(args, "native_fragrantica_search", False),
             )
             skipped_reason = "" if rows else "no_perfume_links_found"
-        trace.finish(token, result_count=len(rows), linked_count=sum(1 for item in rows if item.frag_url), skipped_reason=skipped_reason, deadline=shared_deadline)
+        trace.finish(token, result_count=len(rows), linked_count=sum(1 for item in rows if item.frag_url), skipped_reason=skipped_reason, deadline=fg_deadline)
         return rows
     initial = bounded_parallel(
         {
-            "bn": lambda: BasenotesEngine.extract_search_data(scraper, query, deadline=shared_deadline),
+            "bn": lambda: BasenotesEngine.extract_search_data(scraper, query, deadline=bn_deadline),
             "fg": fg_search_job,
         },
         seconds=args.initial_timeout,
@@ -7544,44 +7575,71 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     if args.debug_timing and cache_hits:
         print(f"{D}[SYS] FG cache linked {cache_hits} candidate(s).{Z}")
     timer.mark("fg_cache_lookup")
-    catalog_hits = SearchSniper.attach_from_designer_catalog(
-        scraper,
-        candidates,
-        cache,
-        budget_seconds=args.catalog_budget,
-        max_workers=args.catalog_workers,
-        slug_limit=args.catalog_slug_limit,
-        trace=trace,
-    )
-    if args.debug_timing and catalog_hits:
-        print(f"{D}[SYS] Designer catalog linked {catalog_hits} candidate(s).{Z}")
-    timer.mark("designer_catalog_resolve")
-    bn_crosswalk_hits = SearchSniper.attach_from_bn_crosswalk(
-        scraper,
-        candidates,
-        cache,
-        budget_seconds=min(4.0, args.catalog_budget),
-        trace=trace,
-    )
-    if args.debug_timing and bn_crosswalk_hits:
-        print(f"{D}[SYS] BN crosswalk linked {bn_crosswalk_hits} candidate(s).{Z}")
-    timer.mark("bn_crosswalk_resolve")
-    if args.related_budget > 0:
-        related_hits = SearchSniper.attach_related_from_known_pages(
-            scraper,
-            candidates,
-            cache,
-            budget_seconds=args.related_budget,
-            page_timeout=args.related_page_timeout,
-            max_pages=args.related_max_pages,
-            trace=trace,
-        )
-        if args.debug_timing and related_hits:
-            print(f"{D}[SYS] Related known pages linked {related_hits} candidate(s).{Z}")
-        timer.mark("related_known_pages")
-    else:
-        trace.add_skip("related_page_crawl", "budget_exhausted" if args.related_budget <= 0 else "disabled")
+    # 1-B: designer_catalog / bn_crosswalk / related exist only to attach FG
+    # links to candidates the cache missed. When the cache already linked every
+    # candidate, skip all three -- each otherwise burns its own resolver budget
+    # for zero gain.
+    if all(item.frag_url for item in candidates):
+        catalog_hits = bn_crosswalk_hits = 0
+        trace.add_skip("designer_catalog", "all_candidates_linked")
+        trace.add_skip("bn_crosswalk", "all_candidates_linked")
+        trace.add_skip("related_page_crawl", "all_candidates_linked")
+        timer.mark("link_attach", skipped=True)
         timer.mark("related_known_pages", skipped=True)
+    else:
+        # designer_catalog and bn_crosswalk are independent passes over the same
+        # unlinked candidates -> run them concurrently under one budget instead
+        # of paying each budget serially. IdentityCache is thread-safe; the
+        # passes only set frag_url on candidates that are still missing one, so
+        # a concurrent double-attach resolves to the same accept-thresholded URL.
+        link_jobs = bounded_parallel(
+            {
+                "designer_catalog": lambda: SearchSniper.attach_from_designer_catalog(
+                    scraper,
+                    candidates,
+                    cache,
+                    budget_seconds=args.catalog_budget,
+                    max_workers=args.catalog_workers,
+                    slug_limit=args.catalog_slug_limit,
+                    trace=trace,
+                ),
+                "bn_crosswalk": lambda: SearchSniper.attach_from_bn_crosswalk(
+                    scraper,
+                    candidates,
+                    cache,
+                    budget_seconds=min(4.0, args.catalog_budget),
+                    trace=trace,
+                ),
+            },
+            seconds=args.catalog_budget + 0.5,
+            max_workers=2,
+        )
+        catalog_hits = link_jobs.get("designer_catalog") or 0
+        bn_crosswalk_hits = link_jobs.get("bn_crosswalk") or 0
+        if args.debug_timing and catalog_hits:
+            print(f"{D}[SYS] Designer catalog linked {catalog_hits} candidate(s).{Z}")
+        if args.debug_timing and bn_crosswalk_hits:
+            print(f"{D}[SYS] BN crosswalk linked {bn_crosswalk_hits} candidate(s).{Z}")
+        timer.mark("link_attach")
+        if args.related_budget > 0 and any(not item.frag_url for item in candidates):
+            related_hits = SearchSniper.attach_related_from_known_pages(
+                scraper,
+                candidates,
+                cache,
+                budget_seconds=args.related_budget,
+                page_timeout=args.related_page_timeout,
+                max_pages=args.related_max_pages,
+                trace=trace,
+            )
+            if args.debug_timing and related_hits:
+                print(f"{D}[SYS] Related known pages linked {related_hits} candidate(s).{Z}")
+            timer.mark("related_known_pages")
+        else:
+            if args.related_budget > 0:
+                trace.add_skip("related_page_crawl", "all_candidates_linked")
+            else:
+                trace.add_skip("related_page_crawl", "budget_exhausted")
+            timer.mark("related_known_pages", skipped=True)
     if args.external_search:
         sniper_hits = SearchSniper.attach_external_search(
             scraper,
@@ -7614,14 +7672,18 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool) -> tuple[list
     trace.print_summary(candidates)
     return candidates, bn_results, frag_results
 
-def search_once(scraper, query: str, args) -> list[UnifiedFragrance]:
-    candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True)
+def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None) -> list[UnifiedFragrance]:
+    # `timing`, when supplied, is filled in place with per-stage wall-clock
+    # marks from the run that produced the returned candidates. A spell-repair
+    # re-run overwrites the first pass's marks, so the dict reflects the final
+    # pipeline; total_search then covers only that final pass.
+    candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True, timing=timing)
     if QueryRepair.needs_repair(bn_results, candidates):
         if args.spell_repair_budget > 0:
             suggestion = QueryRepair.suggest(scraper, query, seconds=args.spell_repair_budget)
             if suggestion:
                 print(f"{Y}[SYS] Search corrected: {query!r} → {suggestion!r}{Z}")
-                repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False)
+                repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False, timing=timing)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
         catalog_labels = IdentityTools.catalog_brand_keys("", query)
@@ -7708,7 +7770,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frag-results", type=int, default=25, help="Max native Fragrantica search cards to parse.")
     parser.add_argument("--max-results", type=int, default=15, help="Max merged candidates to display.")
     parser.add_argument("--native-fragrantica-search", action="store_true", help="Opt into Fragrantica's static search page during first-pass search.")
-    parser.add_argument("--initial-timeout", type=float, default=6.0, help="Shared deadline for first-pass search.")
+    parser.add_argument("--initial-timeout", type=float, default=6.0, help="First-pass ceiling and Basenotes soft-deadline.")
+    parser.add_argument("--fg-timeout", type=float, default=3.0, help="Fragrantica/Serper first-pass soft-deadline; capped at --initial-timeout.")
     parser.add_argument("--detail-timeout", type=float, default=6.0, help="Shared deadline for selected detail fetch.")
     parser.add_argument("--metrics-budget", type=float, default=0.9, help="Shared budget for rating metrics. Use 0 to skip.")
     parser.add_argument("--metrics-workers", type=int, default=5)
