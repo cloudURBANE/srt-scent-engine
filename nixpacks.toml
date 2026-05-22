@@ -17,5 +17,10 @@ nixPkgs = ["python311", "gcc", "chromium", "xvfb-run"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
+# Railway's web service should not spawn Chromium while serving traffic. Failed
+# Cloudflare-clearance mints can leave browser helper processes behind and push
+# memory to the limit; offline workers/local runs can opt back in by overriding
+# this variable.
+DISABLE_CHROMIUM_MINT = "1"
 # BASENOTES_CHROMIUM_PATH intentionally unset: the engine's mint helpers fall
 # back to shutil.which("chromium") which resolves to the nixPkgs binary.

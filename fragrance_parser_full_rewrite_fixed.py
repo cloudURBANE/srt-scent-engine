@@ -2547,6 +2547,14 @@ _FRAGRANTICA_LAST_MINT_ERROR: str | None = None
 _FRAGRANTICA_NEXT_MINT_AFTER = 0.0
 
 
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _chromium_mint_disabled() -> bool:
+    return _env_truthy("DISABLE_CHROMIUM_MINT") or _env_truthy("SRT_DISABLE_CHROMIUM_MINT")
+
+
 def _clearance_mint_cooldown_seconds() -> float:
     try:
         raw = (
@@ -2594,30 +2602,70 @@ def _load_clearance_from_env(prefix: str) -> tuple[str, dict[str, str]] | None:
 def _kill_chromiums_for_user_data_dir(user_data_dir: str) -> None:
     if not user_data_dir or os.name == "nt":
         return
-    pgrep = shutil.which("pgrep")
-    if not pgrep:
+    try:
+        import signal
+
+        my_pid = os.getpid()
+        proc_root = Path("/proc")
+        if not proc_root.exists():
+            return
+        matched_pids: list[int] = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == my_pid:
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ")
+            except Exception:
+                continue
+            if user_data_dir.encode("utf-8", errors="ignore") in cmdline:
+                matched_pids.append(pid)
+        for pid in matched_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        if matched_pids:
+            time.sleep(0.5)
+        for pid in matched_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _terminate_process_tree(proc: Any, *, timeout: float = 3.0) -> None:
+    if proc is None:
         return
     try:
         import signal
         import subprocess
 
-        proc = subprocess.run(
-            [pgrep, "-f", user_data_dir],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        my_pid = os.getpid()
-        for raw_pid in proc.stdout.split():
-            if not raw_pid.isdigit():
-                continue
-            pid = int(raw_pid)
-            if pid == my_pid:
-                continue
+        if os.name != "nt":
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
-                pass
+                proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+                return
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+                proc.wait(timeout=2)
+                return
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
     except Exception:
         pass
 
@@ -2709,11 +2757,13 @@ def _mint_clearance_with_raw_cdp(
     proc: subprocess.Popen[bytes] | None = None
     ws = None
     try:
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(args, **popen_kwargs)
         deadline = time.time() + 12
         version_payload = None
         session = requests.Session()
@@ -2890,15 +2940,7 @@ def _mint_clearance_with_raw_cdp(
             except Exception:
                 pass
         if proc is not None:
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-            except Exception:
-                pass
+            _terminate_process_tree(proc)
 
 
 def _response_has_challenge(res: Any) -> bool:
@@ -2962,6 +3004,9 @@ def _validate_basenotes_session(session: Any) -> bool:
 
 def _mint_basenotes_clearance():
     global _BASENOTES_LAST_MINT_ERROR
+    if _chromium_mint_disabled():
+        _BASENOTES_LAST_MINT_ERROR = "Chromium mint disabled by DISABLE_CHROMIUM_MINT."
+        return None
     if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
         return None
 
@@ -3176,6 +3221,9 @@ def _validate_fragrantica_session(session: Any) -> bool:
 
 def _mint_fragrantica_clearance():
     global _FRAGRANTICA_LAST_MINT_ERROR
+    if _chromium_mint_disabled():
+        _FRAGRANTICA_LAST_MINT_ERROR = "Chromium mint disabled by DISABLE_CHROMIUM_MINT."
+        return None
     if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
         return None
 
@@ -3356,7 +3404,11 @@ class RoutedScraper:
 
         host = (urlparse(url).netloc or "").lower()
         if host.endswith("fragrantica.com"):
-            mint_clearance = _FRAGRANTICA_SESSION is None and time.monotonic() >= _FRAGRANTICA_NEXT_MINT_AFTER
+            mint_clearance = (
+                not _chromium_mint_disabled()
+                and _FRAGRANTICA_SESSION is None
+                and time.monotonic() >= _FRAGRANTICA_NEXT_MINT_AFTER
+            )
             if mint_clearance:
                 _FRAGRANTICA_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
             self._fragrantica_scraper = get_fragrantica_scraper(
@@ -3365,7 +3417,11 @@ class RoutedScraper:
             )
             return self._fragrantica_scraper or self.default_scraper
         if host.endswith("basenotes.com"):
-            mint_clearance = _BASENOTES_SESSION is None and time.monotonic() >= _BASENOTES_NEXT_MINT_AFTER
+            mint_clearance = (
+                not _chromium_mint_disabled()
+                and _BASENOTES_SESSION is None
+                and time.monotonic() >= _BASENOTES_NEXT_MINT_AFTER
+            )
             if mint_clearance:
                 _BASENOTES_NEXT_MINT_AFTER = time.monotonic() + _clearance_mint_cooldown_seconds()
             self._basenotes_scraper = get_basenotes_scraper(
