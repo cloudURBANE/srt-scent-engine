@@ -892,6 +892,7 @@ def _details_to_dict(
     as complete. `fragrantica_cached` flags when the Fragrantica contribution
     was hydrated from fg_detail_cache_v1.json. See `_source_coverage`.
     """
+    engine.heal_missing_gender_and_year(selected, details)
     notes = details.notes
     payload = {
         # Required top-level fields.
@@ -3694,6 +3695,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
             enrichment_status = "pending" if enqueued is not None else "unavailable"
             if isinstance(enqueued, int) and enqueued > 0:
                 enrichment_requested_count = enqueued
+        engine.heal_missing_gender_and_year(selected, stored_detail)
         _persist_detail_record(selected, stored_detail)
         return _details_to_dict(
             selected,
@@ -3742,6 +3744,7 @@ def details(req: DetailRequest) -> dict[str, Any]:
         if isinstance(enqueued, int) and enqueued > 0:
             enrichment_requested_count = enqueued
 
+    engine.heal_missing_gender_and_year(selected, detail_bundle)
     _persist_detail_record(selected, detail_bundle)
 
     return _details_to_dict(
@@ -3790,6 +3793,7 @@ class CompleteJobRequest(BaseModel):
     name: str | None = None
     house: str | None = None
     year: int | str | None = None
+    gender: str | None = None
     image_url: str | None = None
     schema_version: int = 1
     captured_at: str | None = None
@@ -3998,11 +4002,36 @@ def complete_enrichment_job(
         )
 
     identity = _payload_identity(payload, job, canonical)
+    temp_selected = engine.UnifiedFragrance(
+        name=identity["name"] or "",
+        brand=identity["house"] or "",
+        year=str(identity["year"] or ""),
+        frag_url=canonical,
+    )
+    p_notes = payload.notes or {}
+    temp_details = engine.UnifiedDetails(
+        notes=engine.NotesList(
+            has_pyramid=bool(p_notes.get("has_pyramid")),
+            top=list(p_notes.get("top") or []),
+            heart=list(p_notes.get("heart") or []),
+            base=list(p_notes.get("base") or []),
+            flat=list(p_notes.get("flat") or []),
+        ),
+        gender=payload.gender or "Unisex / Unspecified",
+        description="",
+        frag_cards=payload.frag_cards or {},
+        pros_cons=payload.pros_cons or [],
+    )
+    engine.heal_missing_gender_and_year(temp_selected, temp_details)
+    gender = temp_details.gender
+    year = _coerce_year(temp_selected.year)
+
     cache_row = {
         "canonical_fg_url": canonical,
         "name": identity["name"],
         "house": identity["house"],
-        "year": identity["year"],
+        "year": year,
+        "gender": gender,
         "image_url": identity["image_url"],
         "schema_version": payload.schema_version,
         "source": payload.source or "worker",

@@ -363,6 +363,40 @@ def _restore_serper_env(saved: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def test_pick_launch_year_ignores_house_founding_year() -> None:
+    print("Designer catalog launch-year checks:")
+    label = "Casamorati 1888 Tempio D Acqua 2026"
+    year = engine.TextSanitizer.pick_launch_year(label, brand="Casamorati 1888", name="Tempio D Acqua")
+    check("house founding year is not stored as launch year", year == "2026", year)
+
+
+def test_casamorati_tempio_catalog_identity_score() -> None:
+    print("Casamorati Tempio catalog identity checks:")
+    item = engine.UnifiedFragrance(name="Tempio D Acqua", brand="Casamorati 1888", year="2026")
+    catalog = engine.CatalogItem(
+        "Tempio D Acqua",
+        "Casamorati 1888",
+        engine.TextSanitizer.pick_launch_year(
+            "Casamorati 1888 Tempio D Acqua 2026",
+            brand="Casamorati 1888",
+            name="Tempio D Acqua",
+        ),
+        "https://www.fragrantica.com/perfume/Casamorati-1888/Tempio-d-Acqua-128356.html",
+    )
+    score = engine.Orchestrator.identity_score(item, catalog)
+    check("catalog row links at accept threshold", score >= engine.Orchestrator.CATALOG_ACCEPT, f"{score:.3f}")
+
+
+def test_serper_enabled_with_key_only() -> None:
+    print("Serper key-only enablement checks:")
+    saved = _set_serper_env(enabled=False)
+    os.environ["SERPER_API_KEY"] = "test-key-not-real"
+    try:
+        check("SerperClient.enabled() with key only", engine.SerperClient.enabled() is True, "")
+    finally:
+        _restore_serper_env(saved)
+
+
 def test_serper_disabled_without_env() -> None:
     print("Serper env-gating checks:")
     engine.SerperClient._cache.clear()
@@ -479,7 +513,10 @@ def main() -> int:
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_fragrantica_native_search_bypassed_by_default()
+    test_pick_launch_year_ignores_house_founding_year()
+    test_casamorati_tempio_catalog_identity_score()
     test_serper_disabled_without_env()
+    test_serper_enabled_with_key_only()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
     test_search_serialization_recovers_fragrantica_identity()

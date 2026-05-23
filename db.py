@@ -275,16 +275,17 @@ def _upsert_completed_fragrance_record(
         """
         INSERT INTO fragrance_records
             (record_key, canonical_fg_url, bn_url, name, house, year,
-             image_url, fg_raw_json, source_captured_at,
+             gender, image_url, fg_raw_json, source_captured_at,
              first_seen_at, last_seen_at, updated_at)
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
         ON CONFLICT (record_key) DO UPDATE SET
             canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
             bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
             name             = COALESCE(EXCLUDED.name, fragrance_records.name),
             house            = COALESCE(EXCLUDED.house, fragrance_records.house),
             year             = COALESCE(EXCLUDED.year, fragrance_records.year),
+            gender           = COALESCE(EXCLUDED.gender, fragrance_records.gender),
             image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
             fg_raw_json      = EXCLUDED.fg_raw_json,
             derived_metrics_json = NULL,
@@ -300,6 +301,7 @@ def _upsert_completed_fragrance_record(
             _clean_text(cache_row.get("name")),
             _clean_text(cache_row.get("house")),
             cache_row.get("year"),
+            _clean_text(cache_row.get("gender")),
             _clean_text(cache_row.get("image_url")),
             Json(fg_raw),
         ),

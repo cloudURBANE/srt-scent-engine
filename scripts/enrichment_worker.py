@@ -590,6 +590,7 @@ def fetch_payload(
         print(f"  [diag] parser_empty_frag_cards fg_url={candidate.frag_url!r} {' '.join(parts)}")
         raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
+    engine.heal_missing_gender_and_year(candidate, details)
     identity = _specific_identity(candidate)
     image_url = _extract_image_url(scraper, candidate.frag_url, debug=debug)
     raw_identity = _raw_identity(candidate, job)
@@ -601,6 +602,7 @@ def fetch_payload(
         "name": identity["name"],
         "house": identity["house"],
         "year": identity["year"],
+        "gender": details.gender,
         "image_url": image_url or None,
         "schema_version": SCHEMA_VERSION,
         "captured_at": _now_iso(),
@@ -1761,6 +1763,7 @@ def launch_dashboard(
     If ``initial_auto_approve`` is None, reads ENRICHMENT_DASHBOARD_AUTO_APPROVE (1/true/on).
     If ``debug`` is None, reads ENRICHMENT_WORKER_DEBUG (1/true/on).
     """
+    engine.load_local_env()
     base = (api_base_url or os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
     dbg = bool(debug) if debug is not None else _env_bool("ENRICHMENT_WORKER_DEBUG", False)
     config = WorkerConfig(
@@ -1861,6 +1864,7 @@ def build_config(opts: argparse.Namespace) -> WorkerConfig:
 
 
 def main() -> int:
+    engine.load_local_env()
     opts = parse_args()
     if opts.auto_approve and not opts.dashboard:
         raise SystemExit("--auto-approve only applies with --dashboard.")
