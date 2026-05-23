@@ -477,6 +477,7 @@ class IdentityTools:
     FRAGRANTICA_LINE_ALIASES: dict[str, tuple[str, ...]] = {
         "casamorati": ("Casamorati 1888",),
         "casamorati 1888": ("Casamorati 1888",),
+        "replica": ("Maison Margiela",),
     }
     
     @staticmethod
@@ -7294,6 +7295,16 @@ class Orchestrator:
                 bn_brand_clean = (bn.brand or "").strip().lower()
                 if (not bn_brand_clean or bn_brand_clean == "unknown") and match.brand:
                     bn.brand = match.brand
+                elif match.brand and bn_brand_clean:
+                    # BN may index under a product-line name (e.g. "Replica")
+                    # rather than the parent house ("Maison Margiela"). When the
+                    # FG URL's canonical brand slug is the parent house and the
+                    # BN brand equals the FG item's sub-line prefix, correct it.
+                    url_brand = FragranticaEngine.brand_from_url(match.frag_url) if match.frag_url else match.brand
+                    if url_brand and not IdentityTools.compatible_brand(bn.brand, url_brand):
+                        sub = IdentityTools.sub_brand_label(match.name, url_brand)
+                        if TextSanitizer.normalize_identity(sub) == bn_brand_clean:
+                            bn.brand = url_brand
                 used_frag.add(best_index)
             merged.append(bn)
         return merged
@@ -7557,7 +7568,7 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     candidates.sort(key=lambda item: (item.query_score, bool(item.frag_url), item.resolver_score), reverse=True)
     timer.mark("build_candidates")
     if allow_repair and QueryRepair.needs_repair(bn_results, candidates):
-        trace.add_skip("raw_search", "raw_search_rejected_default_section", query=query, deadline=shared_deadline)
+        trace.add_skip("raw_search", "raw_search_rejected_default_section", query=query, deadline=bn_deadline)
         timer.mark("repair_check")
         trace.add_skip("external_search", "disabled")
         trace.add_skip("browser_catalog", "disabled")
