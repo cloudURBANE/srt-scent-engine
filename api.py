@@ -52,6 +52,7 @@ from pydantic import BaseModel
 import db
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
+import parfinity
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +283,23 @@ def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]
     name = (item.name or "").strip()
     house = (item.brand or "").strip()
 
-    if item.frag_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
+    if (
+        item.frag_url
+        and parfinity.is_parfinity_url(item.frag_url)
+        and (_identity_needs_recovery(name) or _identity_needs_recovery(house))
+    ):
+        pf_entry = parfinity.lookup_detail(item.frag_url)
+        if pf_entry:
+            if _identity_needs_recovery(name):
+                name = str(pf_entry.get("name") or "").strip() or name
+            if _identity_needs_recovery(house):
+                house = str(pf_entry.get("house") or "").strip() or house
+
+    if (
+        item.frag_url
+        and not parfinity.is_parfinity_url(item.frag_url)
+        and (_identity_needs_recovery(name) or _identity_needs_recovery(house))
+    ):
         if _identity_needs_recovery(name):
             url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
             if url_name:
@@ -749,26 +766,40 @@ def _source_coverage(
     `*_linked` = a source URL was present on the candidate at all.
     `basenotes` / `fragrantica` = that source actually contributed detail data,
     judged by its unambiguous per-source field (`bn_consensus` for BN,
-    `frag_cards` for FG). `fragrantica_cached` = the Fragrantica contribution
-    came from fg_detail_cache_v1.json rather than a live fetch -- cached data is
-    real parsed parser output, but it is labelled honestly as not-live.
+    `frag_cards` for FG). Parfinity is catalog-backed, so it is marked by URL
+    presence and its actual payload is judged from notes/description/
+    concentration. `fragrantica_cached` = the Fragrantica contribution came
+    from fg_detail_cache_v1.json rather than a live fetch -- cached data is real
+    parsed parser output, but it is labelled honestly as not-live.
     `derived_metrics` is "full" only when both sources contributed; "partial"
     when one did; "none" when the adapter returned null.
     """
     bn_linked = bool(selected.bn_url)
-    fg_linked = bool(selected.frag_url)
+    parfinity_linked = bool(
+        selected.frag_url and parfinity.is_parfinity_url(selected.frag_url)
+    )
+    fg_linked = bool(selected.frag_url) and not parfinity_linked
     bn_has_data = bn_linked and bool(details.bn_consensus)
     fg_has_data = fg_linked and bool(details.frag_cards)
+    pf_has_data = parfinity_linked and bool(
+        details.description
+        or getattr(details, "concentration", None)
+        or details.notes.top
+        or details.notes.heart
+        or details.notes.base
+        or details.notes.flat
+    )
     fg_complete = fg_has_data and _fg_metrics_complete(details)
     if details.derived_metrics is None:
         derived = "none"
-    elif bn_has_data and fg_complete:
+    elif bn_has_data and (fg_complete or pf_has_data):
         derived = "full"
     else:
         derived = "partial"
     return {
         "basenotes": bn_has_data,
         "fragrantica": fg_has_data,
+        "parfinity": parfinity_linked,
         "fragrantica_cached": fragrantica_cached,
         # True only when all 4 Fragrantica status-derived metric groups made it
         # through -- the frontend keys off this to decide whether to keep
@@ -779,8 +810,9 @@ def _source_coverage(
         "fragrantica_cache_source": fragrantica_cache_source,
         "basenotes_linked": bn_linked,
         "fragrantica_linked": fg_linked,
+        "parfinity_linked": parfinity_linked,
         "derived_metrics": derived,
-        "complete": bn_has_data and fg_has_data,
+        "complete": bn_has_data and (fg_has_data or pf_has_data),
     }
 
 
@@ -909,6 +941,7 @@ def _details_to_dict(
     """
     engine.heal_missing_gender_and_year(selected, details)
     notes = details.notes
+    concentration = getattr(details, "concentration", None)
     payload = {
         # Required top-level fields.
         "name": selected.name,
@@ -916,6 +949,7 @@ def _details_to_dict(
         "year": _coerce_year(selected.year),
         "image_url": getattr(selected, "image_url", None),
         "gender": details.gender,
+        "concentration": concentration,
         "derived_metrics": details.derived_metrics,
         "source_coverage": _source_coverage(
             selected, details, fragrantica_cached, fragrantica_cache_source
@@ -923,6 +957,7 @@ def _details_to_dict(
         # Raw fields, included for convenience (do not remove derived_metrics).
         "raw": {
             "description": details.description,
+            "concentration": concentration,
             "bn_consensus": {
                 k: list(v) for k, v in (details.bn_consensus or {}).items()
             },
@@ -3520,15 +3555,29 @@ def _candidate_from_source_url(source_url: str) -> engine.UnifiedFragrance:
     if parsed.scheme not in {"http", "https"} or not host:
         raise HTTPException(
             status_code=400,
-            detail="source_url must be an http(s) Basenotes or Fragrantica URL.",
+            detail="source_url must be an http(s) Basenotes, Fragrantica, or Parfinity URL.",
         )
     is_basenotes = host == "basenotes.com" or host.endswith(".basenotes.com")
     is_fragrantica = host == "fragrantica.com" or host.endswith(".fragrantica.com")
-    if not (is_basenotes or is_fragrantica):
+    is_parfinity = parfinity.is_parfinity_url(url)
+    if not (is_basenotes or is_fragrantica or is_parfinity):
         raise HTTPException(
             status_code=400,
-            detail="source_url must identify a Basenotes or Fragrantica fragrance page.",
+            detail="source_url must identify a Basenotes, Fragrantica, or Parfinity fragrance page.",
         )
+    if is_parfinity:
+        frag_url = parfinity.canonical_parfinity_url(url)
+        entry = parfinity.lookup_detail(frag_url)
+        selected = engine.UnifiedFragrance(
+            name=str(entry.get("name") or "") if entry else "",
+            brand=str(entry.get("house") or "") if entry else "",
+            year="",
+            bn_url="",
+            frag_url=frag_url,
+        )
+        if entry and entry.get("image_url"):
+            setattr(selected, "image_url", str(entry.get("image_url") or ""))
+        return selected
     bn_url = url if is_basenotes else ""
     frag_url = url if is_fragrantica else ""
     selected = engine.UnifiedFragrance(
@@ -3625,6 +3674,8 @@ def _enqueue_enrichment_job(
     prior bool contract while letting `/details` surface the retry counter the
     frontend's MAX_ENRICHMENT_ATTEMPTS cap reads.
     """
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return 0
     try:
         job_key = (
             _canonical_fg_url(selected.frag_url)
@@ -3658,6 +3709,8 @@ def _requeue_enrichment_job(
     selected: engine.UnifiedFragrance, req: RequeueDetailRequest
 ) -> dict[str, Any] | None:
     """Create or force-refresh the durable job for a detail identity."""
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return None
     try:
         job_key = (
             _canonical_fg_url(selected.frag_url)
@@ -3685,6 +3738,43 @@ def _requeue_enrichment_job(
         return None
 
 
+def _fetch_parfinity_detail_bundle(
+    selected: engine.UnifiedFragrance,
+    detail_timeout: float,
+) -> engine.UnifiedDetails:
+    details = engine.UnifiedDetails(notes=engine.NotesList())
+    deadline = engine.Deadline(detail_timeout)
+
+    if selected.bn_url:
+        try:
+            scraper = engine.get_scraper()
+            engine.BasenotesEngine.fetch_details(
+                scraper, selected.bn_url, details, deadline=deadline
+            )
+        except Exception:
+            pass
+
+    pf_entry = parfinity.lookup_detail(selected.frag_url)
+    if pf_entry:
+        if _identity_needs_recovery(selected.name):
+            selected.name = str(pf_entry.get("name") or "").strip()
+        if _identity_needs_recovery(selected.brand):
+            selected.brand = str(pf_entry.get("house") or "").strip()
+        image_url = str(pf_entry.get("image_url") or "").strip()
+        if image_url and not getattr(selected, "image_url", ""):
+            setattr(selected, "image_url", image_url)
+    parfinity.overlay_onto_details(details, pf_entry or {})
+    engine.normalize_notes(details.notes)
+    details.reviews = engine.dedupe_reviews(details.reviews)
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        details.derived_metrics = build_derived_metrics(details)
+    except Exception:
+        details.derived_metrics = None
+    return details
+
+
 @app.post("/api/fragrances/details")
 def details(req: DetailRequest) -> dict[str, Any]:
     """Fetch the full detail bundle for a fragrance returned by /search.
@@ -3698,6 +3788,17 @@ def details(req: DetailRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=400,
             detail="Request resolved to no source URL; provide a valid 'id'.",
+        )
+
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        detail_bundle = _fetch_parfinity_detail_bundle(selected, _ARGS.detail_timeout)
+        return _details_to_dict(
+            selected,
+            detail_bundle,
+            fragrantica_cached=False,
+            fragrantica_cache_source=None,
+            enrichment_status="catalog",
+            enrichment_requested_count=None,
         )
 
     stored_detail = _lookup_stored_detail(selected)
@@ -3782,13 +3883,15 @@ def details(req: DetailRequest) -> dict[str, Any]:
 @app.post("/api/fragrances/details/requeue")
 def requeue_details(req: RequeueDetailRequest) -> dict[str, Any]:
     """Force-refresh a detail enrichment job for the same payload as /details."""
-    _require_db()
     selected = _candidate_from_request(req)
     if not selected.bn_url and not selected.frag_url and not _identity_job_key(selected):
         raise HTTPException(
             status_code=400,
             detail="Request resolved to no usable source or identity.",
         )
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return {"queued": False, "reason": "parfinity_catalog"}
+    _require_db()
     job = _requeue_enrichment_job(selected, req)
     if not job:
         raise HTTPException(status_code=500, detail="Could not requeue enrichment job.")
