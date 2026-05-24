@@ -652,6 +652,16 @@ def _strong_cache_search(
     return [], None
 
 
+def _can_skip_live_search_with_cache(candidates: list[engine.UnifiedFragrance]) -> bool:
+    """Only skip live resolution when cached rows preserve Fragrantica identity.
+
+    Aggregate DB rows can be Basenotes-only. Serving those as a precheck hit
+    turns a recoverable query into a degraded `live_search_skipped` response,
+    so BN-only cache hits must fall through to the live/Serper resolver.
+    """
+    return any(bool(item.frag_url) for item in candidates)
+
+
 # Background warm-cache revalidation. Bounded so a burst of warm hits cannot
 # spawn unbounded scraper threads on Railway (see the memory leak note: the
 # danger is orphaned processes, so we cap concurrency and dedupe by query).
@@ -1643,7 +1653,8 @@ def search(
     strong_results = [
         item for item in strong_results if _candidate_has_display_identity(item)
     ]
-    if strong_results:
+    cache_disqualified_reasons: list[str] = []
+    if strong_results and _can_skip_live_search_with_cache(strong_results):
         diagnostics = _search_diagnostics(strong_results)
         diagnostics["cache_source"] = strong_source
         diagnostics["cache_mode"] = "precheck"
@@ -1653,6 +1664,8 @@ def search(
             "results": [_search_result_to_dict(item) for item in strong_results],
             "diagnostics": diagnostics,
         }
+    if strong_results:
+        cache_disqualified_reasons.append("precheck_missing_fragrantica_url")
 
     # Warm-cache tier. No strong hit, but a slightly-below-strong cached row is
     # still a confident identity match. Serve it now -- no live wait -- and
@@ -1665,7 +1678,7 @@ def search(
     warm_results = [
         item for item in warm_results if _candidate_has_display_identity(item)
     ]
-    if warm_results:
+    if warm_results and _can_skip_live_search_with_cache(warm_results):
         refreshing = _spawn_warm_refresh(query)
         diagnostics = _search_diagnostics(warm_results)
         diagnostics["cache_source"] = warm_source
@@ -1679,6 +1692,8 @@ def search(
             "results": [_search_result_to_dict(item) for item in warm_results],
             "diagnostics": diagnostics,
         }
+    if warm_results:
+        cache_disqualified_reasons.append("warm_missing_fragrantica_url")
 
     scraper = engine.get_scraper()
     # `timing` is filled in place by the engine with per-stage wall-clock marks
@@ -1703,6 +1718,8 @@ def search(
         _persist_search_results(query, results)
 
     diagnostics = _search_diagnostics(results)
+    if cache_disqualified_reasons:
+        diagnostics["cache_fast_path_disqualified"] = cache_disqualified_reasons
     if timing:
         diagnostics["timing"] = timing
     if fallback_source:

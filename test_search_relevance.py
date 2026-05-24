@@ -173,6 +173,58 @@ def test_api_strong_cache_precheck_does_not_bypass_brand_only() -> None:
     check("brand-only query is not labelled precheck", diagnostics.get("cache_mode") != "precheck", str(diagnostics))
 
 
+def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
+    print("API BN-only cache safety checks:")
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    calls = {"live": 0}
+    try:
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "1861 Naxos",
+                "house": "Xerjoff",
+                "bn_url": "https://basenotes.com/fragrances/1861-naxos-by-xerjoff.26144159",
+                "canonical_fg_url": "",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            }
+        ]
+        api.db.search_detail_cache = lambda query, limit=15: []
+
+        def live_search(*args, **kwargs):
+            calls["live"] += 1
+            return [
+                engine.UnifiedFragrance(
+                    name="1861 Naxos",
+                    brand="Xerjoff",
+                    year="2015",
+                    frag_url="https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html",
+                )
+            ]
+
+        api.engine.search_once = live_search
+        response = api.search(q="xerjoff naxos")
+    finally:
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    results = response.get("results", [])
+    check("BN-only cache hit runs live search", calls["live"] == 1, str(calls))
+    check("BN-only cache hit is not labelled precheck", diagnostics.get("cache_mode") != "precheck", str(diagnostics))
+    check(
+        "live result can restore Fragrantica URL",
+        any(row.get("source_url", "").startswith("https://www.fragrantica.com/") for row in results),
+        str(results),
+    )
+    check(
+        "diagnostics record disqualified cache fast path",
+        "precheck_missing_fragrantica_url" in diagnostics.get("cache_fast_path_disqualified", []),
+        str(diagnostics),
+    )
+
+
 def test_fragrantica_native_search_bypassed_by_default() -> None:
     print("Native Fragrantica search bypass checks:")
     old_get = engine.Http.get
@@ -512,6 +564,7 @@ def main() -> int:
     test_api_cache_threshold_matches_engine()
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
+    test_api_bn_only_cache_hit_does_not_skip_live_search()
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()
