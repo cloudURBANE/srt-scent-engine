@@ -364,6 +364,35 @@ class TextSanitizer:
     ]
     
     @classmethod
+    def pick_launch_year(cls, text: object, *, brand: str = "", name: str = "") -> str:
+        """Pick a fragrance launch year from mixed label text.
+
+        Designer listing anchors often include the house founding year (e.g.
+        ``Casamorati 1888``) alongside the real launch year (``2026``). A naive
+        first-match scrape stores ``1888`` and identity scoring then hard-rejects
+        the candidate when the job side carries the correct launch year.
+        """
+        cleaned = cls.clean(text)
+        if not cleaned:
+            return ""
+        years = cls.YEAR_RE.findall(cleaned)
+        if not years:
+            return ""
+        brand_tokens = set(TextSanitizer.normalize_identity(brand).split()) if brand else set()
+        name_tokens = set(TextSanitizer.normalize_identity(name).split()) if name else set()
+        filtered: list[str] = []
+        for year in years:
+            if year in brand_tokens or year in name_tokens:
+                continue
+            filtered.append(year)
+        if not filtered:
+            return ""
+        try:
+            return max(filtered, key=int)
+        except ValueError:
+            return filtered[-1]
+
+    @classmethod
     def clean(cls, text: object) -> str:
         if text is None:
             return ""
@@ -2433,9 +2462,11 @@ class SerperClient:
 
     @staticmethod
     def enabled() -> bool:
-        provider = (os.environ.get("SERP_API_PROVIDER", "") or "").strip().lower()
         key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
-        return provider == "serper" and bool(key)
+        if not key:
+            return False
+        provider = (os.environ.get("SERP_API_PROVIDER", "") or "serper").strip().lower()
+        return provider == "serper"
 
     @staticmethod
     def _cache_key(query: str) -> str:
@@ -4206,12 +4237,11 @@ class SearchSniper:
                 if parsed_brand and not IdentityTools.compatible_brand(brand, parsed_brand):
                     continue
                 label_text = safe_get_text(a)
-                year_match = TextSanitizer.YEAR_RE.search(label_text)
                 catalog.append(
                     CatalogItem(
                         name=name,
                         brand=parsed_brand,
-                        year=year_match.group(0) if year_match else "",
+                        year=TextSanitizer.pick_launch_year(label_text, brand=parsed_brand, name=name),
                         url=href,
                     )
                 )
@@ -6019,6 +6049,42 @@ class FragranticaEngine:
         if rating_distribution:
             cards["Rating Distribution"] = rating_distribution
 
+        # 5. Gender distribution: true vote distribution from status.
+        gender_dist = status.get("gender")
+        if isinstance(gender_dist, dict):
+            gender_labels = {
+                "female": ("Female", 1),
+                "female_unisex": ("More Female", 2),
+                "unisex": ("Unisex", 3),
+                "male_unisex": ("More Male", 4),
+                "male": ("Male", 5),
+            }
+            gender_rows = []
+            for key, (label, val_num) in gender_labels.items():
+                gender_rows.append((key, label, val_num, safe_int(gender_dist.get(key, 0))))
+            
+            gender_total = safe_int(status.get("gender_sum"))
+            if gender_total <= 0:
+                gender_total = sum(count for _, _, _, count in gender_rows)
+                
+            if gender_total > 0:
+                _, dom_label, _, dom_count = max(gender_rows, key=lambda item: item[3])
+                cards["Gender"] = [
+                    {
+                        "label": label,
+                        "display": label,
+                        "value": val_num,
+                        "pct": round((count / gender_total) * 100.0, 2),
+                        "count": str(count),
+                        "source": "Fragrantica-Status",
+                        "dominant": label == dom_label,
+                        "dominant_label": dom_label,
+                        "dominant_count": str(dom_count),
+                        "total_votes": gender_total,
+                    }
+                    for key, label, val_num, count in gender_rows
+                ]
+
         return cards
 
 
@@ -7770,6 +7836,92 @@ def parse_local_fragrantica_html(path: str, max_results: int = 25) -> list[Unifi
         markup = handle.read()
     return FragranticaEngine.parse_search_html(markup, max_results=max_results)
 
+
+def heal_missing_gender_and_year(selected: UnifiedFragrance, details: UnifiedDetails) -> None:
+    """Safely resolve and heal missing gender and launch year from raw data.
+    
+    If details.gender is default, parses the dominant vote from the gender card
+    or description text. If selected.year is missing or 0, parses launch year
+    patterns or any 4-digit number between 1700 and 2099 from description.
+    """
+    # 1. Gender Healing
+    if not details.gender or details.gender == "Unisex / Unspecified":
+        gender_card = None
+        for card_name, metrics in details.frag_cards.items():
+            if card_name.lower() == "gender":
+                gender_card = metrics
+                break
+        
+        if gender_card:
+            def get_vote_value(m: dict[str, Any]) -> float:
+                cnt = m.get("count")
+                if cnt:
+                    try:
+                        if isinstance(cnt, (int, float)):
+                            return float(cnt)
+                        cleaned_cnt = str(cnt).strip().lower().replace(",", "")
+                        if cleaned_cnt.endswith("k"):
+                            return float(cleaned_cnt[:-1]) * 1000
+                        return float(cleaned_cnt)
+                    except ValueError:
+                        pass
+                pct = m.get("pct")
+                if pct is not None:
+                    try:
+                        return float(pct)
+                    except ValueError:
+                        pass
+                return 0.0
+
+            valid_metrics = [m for m in gender_card if m.get("label")]
+            if valid_metrics:
+                best_metric = max(valid_metrics, key=get_vote_value)
+                best_label = str(best_metric.get("label")).strip().lower()
+                
+                if best_label in ("female", "more female", "more feminine", "feminine"):
+                    details.gender = "Feminine"
+                elif best_label in ("male", "more male", "more masculine", "masculine"):
+                    details.gender = "Masculine"
+                elif best_label == "unisex":
+                    details.gender = "Unisex"
+
+        if not details.gender or details.gender == "Unisex / Unspecified":
+            desc = (details.description or "").lower()
+            if re.search(r"\bfragrance for women and men\b", desc) or re.search(r"\bfragrance for men and women\b", desc) or re.search(r"\bunisex fragrance\b", desc):
+                details.gender = "Unisex"
+            elif re.search(r"\bfragrance for women\b", desc) or re.search(r"\bfor women\b", desc):
+                details.gender = "Feminine"
+            elif re.search(r"\bfragrance for men\b", desc) or re.search(r"\bfor men\b", desc):
+                details.gender = "Masculine"
+
+        if not details.gender or details.gender == "Unisex / Unspecified":
+            # Last resort fallback: parse from the fragrance name
+            name_lower = (selected.name or "").lower()
+            if re.search(r"\b(for women|pour femme|for her|femme|for ladies|women)\b", name_lower):
+                details.gender = "Feminine"
+            elif re.search(r"\b(for men|pour homme|for him|homme|men)\b", name_lower):
+                details.gender = "Masculine"
+            elif re.search(r"\b(unisex|shared)\b", name_lower):
+                details.gender = "Unisex"
+
+    # 2. Year Healing
+    year_str = str(selected.year).strip() if selected.year is not None else ""
+    if not year_str or year_str == "0":
+        desc = details.description or ""
+        launch_match = re.search(r"(?:launched in|was launched in)\s*(\b(?:17|18|19|20)\d{2}\b)", desc, re.IGNORECASE)
+        if launch_match:
+            selected.year = launch_match.group(1)
+        else:
+            all_years = re.findall(r"\b((?:17|18|19|20)\d{2})\b", desc)
+            if all_years:
+                selected.year = all_years[0]
+            else:
+                # Last resort fallback: parse from the fragrance name
+                name_match = re.search(r"\b((?:17|18|19|20)\d{2})\b", selected.name or "")
+                if name_match:
+                    selected.year = name_match.group(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fast dual-source fragrance parser.")
     parser.add_argument("query", nargs="?", help="Fragrance search query, e.g. 'Dior Sauvage'.")
@@ -7803,7 +7955,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-source-urls", action="store_true", help="Show source URLs and resolver source in selected dashboard.")
     return parser
 
+def load_local_env() -> None:
+    """Load KEY=VALUE lines from nearby env files without overriding existing vars."""
+    root = Path(__file__).resolve().parent
+    for path in (root / ".env", root.parent / "huge_monorepo" / "ScentCast.env"):
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
 def main() -> None:
+    load_local_env()
     if getattr(sys.stdout, "encoding", None) and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8" and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     parser = build_parser()
