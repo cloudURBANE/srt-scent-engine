@@ -225,6 +225,26 @@ class ApiClient:
             json={"note": note or "ignored from local worker"},
         )
 
+    def patch_job(
+        self,
+        job_id: str,
+        *,
+        fg_url: str | None = None,
+        query: str | None = None,
+        name: str | None = None,
+        house: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if fg_url is not None:
+            body["fg_url"] = fg_url
+        if query is not None:
+            body["query"] = query
+        if name is not None:
+            body["name"] = name
+        if house is not None:
+            body["house"] = house
+        return self._request("PATCH", f"/api/enrichment/jobs/{job_id}", json=body)
+
     def claim_command(self) -> dict[str, Any] | None:
         payload = self._request("POST", "/api/enrichment/commands/claim")
         cmd = payload.get("command")
@@ -332,6 +352,15 @@ def _build_query(job: dict[str, Any]) -> str:
         return query
     name = str(job.get("name") or "").strip()
     house = str(job.get("house") or "").strip()
+    if house and name:
+        house_lower = house.lower()
+        name_lower = name.lower()
+        if name_lower.startswith(house_lower):
+            remainder = name[len(house) :].strip(" -–—|:")
+            return f"{house} {remainder}".strip() if remainder else name
+        if name_lower.endswith(house_lower):
+            trimmed = name[: -len(house)].strip(" -–—|:")
+            return f"{house} {trimmed}".strip() if trimmed else f"{house} {name}".strip()
     return " ".join(part for part in [house, name] if part).strip()
 
 
@@ -437,12 +466,57 @@ def _extract_image_url(scraper, fg_url: str, *, debug: bool = False) -> str:
     return ""
 
 
-def _build_engine_args() -> argparse.Namespace:
+def _build_engine_args(*, enhanced: bool = False) -> argparse.Namespace:
     args = engine.build_parser().parse_args([])
-    # Keep resolution conservative and close to API defaults; no open-web sniper.
+    # Default resolution stays conservative; enhanced mode enables open-web sniper.
     if hasattr(args, "external_search"):
-        args.external_search = False
+        args.external_search = bool(enhanced)
+    if enhanced and hasattr(args, "external_search_budget"):
+        args.external_search_budget = max(float(getattr(args, "external_search_budget", 0) or 0), 8.0)
     return args
+
+
+def _first_linked_result(results: list[engine.UnifiedFragrance]) -> engine.UnifiedFragrance | None:
+    for item in results:
+        if item.frag_url:
+            return engine.UnifiedFragrance(
+                name=item.name,
+                brand=item.brand,
+                year=item.year,
+                bn_url="",
+                frag_url=item.frag_url,
+                resolver_source=item.resolver_source,
+                resolver_score=item.resolver_score,
+                query_score=item.query_score,
+            )
+    return None
+
+
+def _normalize_fg_url_input(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    canonical = engine.FragranticaEngine.canonical_url(text)
+    if engine.FragranticaEngine.is_perfume_url(canonical):
+        return canonical.rstrip("/")
+    raise WorkerError("invalid_fg_url", "URL must be a Fragrantica perfume page", retryable=False)
+
+
+def _job_missing_fg_url(job: dict[str, Any]) -> bool:
+    return not _canonical_fg_url(str(job.get("fg_url") or ""))
+
+
+def _search_candidates(
+    scraper,
+    query: str,
+    args: argparse.Namespace,
+    *,
+    debug: bool = False,
+) -> list[engine.UnifiedFragrance]:
+    try:
+        return _run_engine_call(lambda: engine.search_once(scraper, query, args), debug=debug)
+    except Exception as exc:
+        raise WorkerError("engine_exception", f"search failed: {exc}", retryable=True) from exc
 
 
 def _run_engine_call(fn, *, debug: bool):
@@ -485,22 +559,22 @@ def resolve_candidate(
         raise WorkerError("fg_url_missing_after_resolution", "job has no fg_url or usable query", retryable=False)
 
     try:
-        results = _run_engine_call(lambda: engine.search_once(scraper, query, args), debug=debug)
-    except Exception as exc:
-        raise WorkerError("engine_exception", f"resolver failed: {exc}", retryable=True) from exc
+        results = _search_candidates(scraper, query, args, debug=debug)
+    except WorkerError:
+        raise
 
-    for item in results:
-        if item.frag_url:
-            return engine.UnifiedFragrance(
-                name=item.name,
-                brand=item.brand,
-                year=item.year,
-                bn_url="",
-                frag_url=item.frag_url,
-                resolver_source=item.resolver_source,
-                resolver_score=item.resolver_score,
-                query_score=item.query_score,
-            )
+    candidate = _first_linked_result(results)
+    if candidate:
+        return candidate
+
+    if not getattr(args, "external_search", False):
+        enhanced_args = _build_engine_args(enhanced=True)
+        print(f"  [resolve] retrying with enhanced search for {query!r}")
+        results = _search_candidates(scraper, query, enhanced_args, debug=debug)
+        candidate = _first_linked_result(results)
+        if candidate:
+            return candidate
+
     raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
 
 
@@ -904,7 +978,7 @@ def print_manager_header(client: ApiClient, config: WorkerConfig) -> None:
     print("3. Process next N jobs")
     print("4. Process jobs slowly with delay")
     print("5. Retry failed jobs")
-    print("6. Ignore job")
+    print("6. Resolve missing Fragrantica URL")
     print("7. Show cache stats")
     print("8. Warm from manual query list")
     print("9. Exit")
@@ -955,15 +1029,7 @@ def dispatch_management_action(
         retry_cfg = WorkerConfig(**{**config.__dict__, "limit": config.limit})
         process_pending(client, retry_cfg, only_retries=True, stop=stop)
     elif choice == "6":
-        ensure_token(config)
-        job_id = input("Job id to ignore: ").strip()
-        note = input("Note/reason: ").strip()
-        if job_id:
-            if config.dry_run:
-                print(f"Dry run: would ignore {job_id}")
-            else:
-                client.ignore_job(job_id, note)
-                print("Job ignored.")
+        resolve_missing_urls(client, config, stop=stop)
     elif choice == "7":
         print("Cache stats endpoint is unavailable in the current API contract.")
     elif choice == "8":
@@ -971,7 +1037,7 @@ def dispatch_management_action(
         path = input("Query list path: ").strip()
         if path:
             warm_list(client, config, path, stop=stop)
-    elif choice == "9":
+    elif choice == "9" or choice == "0":
         return "exit"
     else:
         print("Unknown option.")
@@ -1015,7 +1081,7 @@ DASHBOARD_ACTIONS: dict[str, str] = {
     "3": "Process next N jobs",
     "4": "Process slowly (with delay)",
     "5": "Retry failed jobs",
-    "6": "Ignore a job",
+    "6": "Resolve missing URL",
 }
 
 
@@ -1806,14 +1872,217 @@ def _prompt_int(label: str, default: int) -> int:
     raw = input(label).strip()
     if not raw:
         return default
-    return int(raw)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
 
 
 def _prompt_float(label: str, default: float) -> float:
     raw = input(label).strip()
     if not raw:
         return default
-    return float(raw)
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _pick_job_interactive(jobs: list[dict[str, Any]], *, title: str) -> dict[str, Any] | None:
+    if not jobs:
+        print("No matching jobs.")
+        return None
+    print(title)
+    _print_jobs(jobs)
+    choice = input("Pick job [#], paste job id, or Enter to cancel: ").strip()
+    if not choice:
+        return None
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(jobs):
+            return jobs[index - 1]
+        print("Invalid selection.")
+        return None
+    for job in jobs:
+        if str(job.get("id") or "") == choice:
+            return job
+    print("Job id not found in the list.")
+    return None
+
+
+def _patch_job_local(
+    job_id: str,
+    *,
+    fg_url: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any] | None:
+    """Direct DB patch when the remote API has not yet deployed the PATCH route."""
+    import db
+
+    db_url = (
+        os.environ.get("ENRICHMENT_DATABASE_URL", "").strip()
+        or os.environ.get("DATABASE_URL", "").strip()
+    )
+    if not db_url:
+        return None
+    prev = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    try:
+        import importlib
+
+        importlib.reload(db)
+        if not db.ENABLED:
+            return None
+        db.init_db()
+        return db.patch_job(job_id, fg_url=fg_url, query=query)
+    finally:
+        if prev is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = prev
+        import importlib
+
+        importlib.reload(db)
+
+
+def _assign_fg_url_to_job(
+    client: ApiClient,
+    config: WorkerConfig,
+    job: dict[str, Any],
+    fg_url: str,
+    *,
+    query: str | None = None,
+) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise WorkerError("invalid_job", "job has no id", retryable=False)
+    canonical = _normalize_fg_url_input(fg_url)
+    if config.dry_run:
+        print(f"Dry run: would set fg_url={canonical} on {job_id}")
+        return {**job, "fg_url": canonical}
+    try:
+        payload = client.patch_job(job_id, fg_url=canonical, query=query)
+    except WorkerError as exc:
+        if exc.code == "api_not_found":
+            updated = _patch_job_local(job_id, fg_url=canonical, query=query)
+            if updated:
+                print("(API PATCH unavailable — applied via DATABASE_URL direct patch)")
+                print(f"Set fg_url on {_job_label(updated)}:")
+                print(f"  {updated.get('fg_url')}")
+                return updated
+            raise WorkerError(
+                "patch_endpoint_unavailable",
+                "API patch endpoint not deployed — redeploy api.py with PATCH /api/enrichment/jobs/{id}, "
+                "or set DATABASE_URL so the worker can patch jobs directly.",
+                retryable=False,
+            ) from exc
+        raise
+    updated = payload.get("job") if isinstance(payload.get("job"), dict) else None
+    if not updated:
+        raise WorkerError("patch_failed", "server did not return updated job", retryable=False)
+    print(f"Set fg_url on {_job_label(updated)}:")
+    print(f"  {updated.get('fg_url')}")
+    return updated
+
+
+def resolve_missing_url_for_job(
+    client: ApiClient,
+    config: WorkerConfig,
+    job: dict[str, Any],
+    *,
+    stop: StopController | None = None,
+) -> bool:
+    """Interactive search-or-paste flow to attach a Fragrantica URL to one job."""
+    label = _job_label(job)
+    default_query = _build_query(job)
+    print()
+    print(f"Resolve URL for: {label}")
+    print(f"  id={job.get('id')}")
+    print(f"  fg_url={job.get('fg_url') or 'missing'}")
+    if default_query:
+        print(f"  search query={default_query!r}")
+    print()
+    print("[S] Enhanced search   [P] Paste URL   [Q] Custom query + search   [Enter] Cancel")
+    mode = input("Choice: ").strip().lower()
+
+    if not mode:
+        return False
+    if stop and stop.stop_requested:
+        return False
+
+    if mode in {"p", "paste", "url"}:
+        raw = input("Fragrantica perfume URL: ").strip()
+        if not raw:
+            return False
+        _assign_fg_url_to_job(client, config, job, raw)
+        return True
+
+    query = default_query
+    custom_query: str | None = None
+    if mode in {"q", "query"}:
+        custom_query = input(f"Search query [{default_query}]: ").strip() or default_query
+        query = custom_query
+    elif mode not in {"s", "search"}:
+        print("Unknown choice.")
+        return False
+
+    if not query:
+        print("No searchable query on this job — paste a URL with [P] instead.")
+        return False
+
+    scraper = engine.get_scraper()
+    engine_args = _build_engine_args(enhanced=True)
+    print(f"\nSearching (enhanced) for {query!r}…")
+    results = _search_candidates(scraper, query, engine_args, debug=config.debug)
+    linked = [item for item in results if item.frag_url]
+    if not linked:
+        print("No Fragrantica URLs found.")
+        paste = input("Paste a URL manually, or Enter to cancel: ").strip()
+        if paste:
+            _assign_fg_url_to_job(client, config, job, paste, query=custom_query)
+            return True
+        return False
+
+    engine.print_results_table(linked[: min(15, len(linked))], 0.0, debug=config.debug)
+    pick = input(
+        f"Pick [1-{min(15, len(linked))}], paste a URL, or Enter to cancel: "
+    ).strip()
+    if not pick:
+        return False
+    if pick.lower().startswith("http"):
+        _assign_fg_url_to_job(client, config, job, pick, query=custom_query)
+        return True
+    if pick.isdigit():
+        index = int(pick)
+        if 1 <= index <= min(15, len(linked)):
+            chosen = linked[index - 1]
+            _assign_fg_url_to_job(client, config, job, chosen.frag_url, query=custom_query)
+            return True
+    print("Invalid selection.")
+    return False
+
+
+def resolve_missing_urls(
+    client: ApiClient,
+    config: WorkerConfig,
+    *,
+    stop: StopController | None = None,
+) -> int:
+    """List pending jobs missing fg_url and resolve one interactively."""
+    ensure_token(config)
+    pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
+    missing = [j for j in pending if _job_missing_fg_url(j)]
+    if not missing:
+        print("No pending jobs with missing fg_url.")
+        job = _pick_job_interactive(pending, title="All pending jobs:")
+    else:
+        job = _pick_job_interactive(
+            missing,
+            title=f"Pending jobs missing fg_url ({len(missing)}):",
+        )
+    if not job:
+        return 0
+    return 1 if resolve_missing_url_for_job(client, config, job, stop=stop) else 0
 
 
 def parse_args() -> argparse.Namespace:
