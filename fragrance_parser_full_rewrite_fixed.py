@@ -7915,6 +7915,11 @@ def heal_missing_gender_and_year(selected: UnifiedFragrance, details: UnifiedDet
             all_years = re.findall(r"\b((?:17|18|19|20)\d{2})\b", desc)
             if all_years:
                 selected.year = all_years[0]
+            else:
+                # Last resort fallback: parse from the fragrance name
+                name_match = re.search(r"\b((?:17|18|19|20)\d{2})\b", selected.name or "")
+                if name_match:
+                    selected.year = name_match.group(1)
 
 
 def build_parser() -> argparse.ArgumentParser:
