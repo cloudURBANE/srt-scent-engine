@@ -3837,6 +3837,13 @@ class RequeueJobRequest(BaseModel):
     priority: int = 10
 
 
+class PatchJobRequest(BaseModel):
+    fg_url: str | None = None
+    query: str | None = None
+    name: str | None = None
+    house: str | None = None
+
+
 def _json_for_db_blob(obj: Any) -> Any:
     """Return strict JSON-native data for psycopg ``Json()`` payloads.
 
@@ -4100,6 +4107,40 @@ def ignore_enrichment_job(
     if not updated:
         raise HTTPException(status_code=404, detail="Job not found.")
     return {"ignored": True, "job": updated}
+
+
+@app.patch(
+    "/api/enrichment/jobs/{job_id}",
+    dependencies=[Depends(_require_worker_token)],
+)
+def patch_enrichment_job(job_id: str, payload: PatchJobRequest) -> dict[str, Any]:
+    """Protected: set fg_url or identity hints on a pending/failed job."""
+    _require_db()
+    fg_url = (payload.fg_url or "").strip() if payload.fg_url is not None else None
+    if fg_url is not None:
+        canonical = _canonical_fg_url(fg_url)
+        if not engine.FragranticaEngine.is_perfume_url(canonical):
+            raise HTTPException(
+                status_code=400,
+                detail="fg_url must be a Fragrantica perfume URL.",
+            )
+        fg_url = canonical
+    updated = db.patch_job(
+        job_id,
+        fg_url=fg_url,
+        query=(payload.query or "").strip() if payload.query is not None else None,
+        name=(payload.name or "").strip() if payload.name is not None else None,
+        house=(payload.house or "").strip() if payload.house is not None else None,
+    )
+    if not updated:
+        existing = db.get_job(job_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job status '{existing.get('status')}' cannot be patched.",
+        )
+    return {"patched": True, "job": updated}
 
 
 if __name__ == "__main__":

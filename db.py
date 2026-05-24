@@ -702,6 +702,73 @@ def ignore_job(job_id: str, note: str | None) -> dict[str, Any] | None:
         ctx.__exit__(None, None, None)
 
 
+def patch_job(
+    job_id: str,
+    *,
+    fg_url: str | None = None,
+    query: str | None = None,
+    name: str | None = None,
+    house: str | None = None,
+) -> dict[str, Any] | None:
+    """Update editable identity fields on a pending or failed job.
+
+    When fg_url is supplied on a failed row, the job is moved back to pending
+    and its failure counter is cleared so the worker can retry immediately.
+    Processing / completed / ignored rows are left untouched (returns None).
+    """
+    if not ENABLED:
+        return None
+    cleaned_fg = _clean_url(fg_url) if fg_url is not None else None
+    cleaned_query = _clean_text(query) if query is not None else None
+    cleaned_name = _clean_text(name) if name is not None else None
+    cleaned_house = _clean_text(house) if house is not None else None
+    if fg_url is not None and not cleaned_fg:
+        return None
+    if not any(v is not None for v in (cleaned_fg, cleaned_query, cleaned_name, cleaned_house)):
+        return get_job(job_id)
+
+    ctx, conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            UPDATE enrichment_jobs
+            SET fg_url = COALESCE(%s, fg_url),
+                query = COALESCE(%s, query),
+                name = COALESCE(%s, name),
+                house = COALESCE(%s, house),
+                status = CASE
+                    WHEN %s::text IS NOT NULL AND status = 'failed' THEN 'pending'
+                    ELSE status
+                END,
+                failure_count = CASE
+                    WHEN %s::text IS NOT NULL AND status = 'failed' THEN 0
+                    ELSE failure_count
+                END,
+                last_error = CASE
+                    WHEN %s::text IS NOT NULL AND status = 'failed' THEN NULL
+                    ELSE last_error
+                END,
+                last_requested_at = now()
+            WHERE id = %s
+              AND status IN ('pending', 'failed')
+            RETURNING *
+            """,
+            (
+                cleaned_fg,
+                cleaned_query,
+                cleaned_name,
+                cleaned_house,
+                cleaned_fg,
+                cleaned_fg,
+                cleaned_fg,
+                job_id,
+            ),
+        ).fetchone()
+        return _job_to_dict(row) if row else None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # fragrance_records -- write-through aggregate built by user traffic
 # ---------------------------------------------------------------------------

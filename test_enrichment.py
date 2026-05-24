@@ -94,6 +94,17 @@ def test_no_db_contract() -> None:
             str(r.status_code),
         )
 
+        r = client.patch(
+            "/api/enrichment/jobs/does-not-exist",
+            headers={"Authorization": "Bearer test-secret-token"},
+            json={"fg_url": "https://www.fragrantica.com/perfume/Brand/Name-1.html"},
+        )
+        check(
+            "patch job endpoint requires DB storage",
+            r.status_code in expected,
+            str(r.status_code),
+        )
+
         r = client.post(
             "/api/fragrances/details/requeue",
             json={"source_url": _TEST_JOB_KEY},
@@ -564,6 +575,33 @@ def test_db_lifecycle() -> None:
             "cache_row without quality_status defaults to complete",
             bool(cached and cached.get("quality_status") == "complete"),
         )
+
+        # patch_job: attach fg_url to a pending row missing one.
+        patch_key = "https://www.fragrantica.com/perfume/_test_/enrichment-patch-selftest.html"
+        _cleanup()
+        db.enqueue_job(
+            job_key="patch-selftest",
+            query=None,
+            name="For Tony Iommi",
+            house="Xerjoff",
+            year=2024,
+            bn_url=None,
+            fg_url=None,
+        )
+        patch_jobs = [j for j in db.list_jobs("pending", 100) if j.get("job_key") == "patch-selftest"]
+        check("patch enqueue creates pending job", len(patch_jobs) == 1)
+        patch_job_row = patch_jobs[0]
+        patched = db.patch_job(patch_job_row["id"], fg_url=patch_key)
+        check("patch_job sets fg_url", bool(patched and patched.get("fg_url") == patch_key))
+        check(
+            "patch_job deduped query builder input",
+            enrichment_worker._build_query(patch_job_row) == "Xerjoff For Tony Iommi",
+        )
+        conn_ctx, conn = db._conn()
+        try:
+            conn.execute("DELETE FROM enrichment_jobs WHERE job_key = %s", ("patch-selftest",))
+        finally:
+            conn_ctx.__exit__(None, None, None)
     finally:
         _cleanup()
 
