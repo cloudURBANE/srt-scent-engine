@@ -301,6 +301,9 @@ def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]
         if _identity_needs_recovery(house) and bn_candidate.brand:
             house = bn_candidate.brand
 
+    if name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
+
     return {"name": name, "house": house}
 
 
@@ -826,6 +829,8 @@ def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, 
             house = url_house
         elif house and url_house and house.strip().lower() == "unknown":
             house = url_house
+    if name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
     return {"name": name, "house": house, "year": year}
 
 
@@ -3926,6 +3931,9 @@ def _payload_identity(
             house = url_house
         elif house and url_house and house.lower() == "unknown":
             house = url_house
+
+    if name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
 
     return {"name": name or None, "house": house or None, "year": year, "image_url": image_url or None}
 

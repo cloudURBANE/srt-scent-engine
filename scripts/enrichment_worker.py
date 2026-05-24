@@ -418,6 +418,8 @@ def _specific_identity(candidate: engine.UnifiedFragrance) -> dict[str, Any]:
             name = url_name
         if url_house and (not house or house.lower() == "unknown"):
             house = url_house
+    if name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
     return {"name": name or None, "house": house or None, "year": _coerce_year(year) or None}
 
 
