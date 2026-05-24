@@ -243,6 +243,24 @@ def test_fragrantica_native_search_bypassed_by_default() -> None:
     check("native Fragrantica search does not call Http.get by default", calls["http"] == 0, str(calls))
 
 
+def test_strip_house_from_name() -> None:
+    print("House prefix stripping checks:")
+    strip = engine.IdentityTools.strip_house_from_name
+    check("Hermes Rocabar -> Rocabar", strip("Hermès Rocabar", "Hermes") == "Rocabar", "")
+    check("Hermes Bel Ami -> Bel Ami", strip("Hermes Bel Ami", "Hermes") == "Bel Ami", "")
+    check("bare name unchanged", strip("Bel Ami", "Hermes") == "Bel Ami", "")
+    check("Dior Sauvage -> Sauvage", strip("Dior Sauvage", "Dior") == "Sauvage", "")
+
+    card = engine.UnifiedFragrance(
+        name="Hermès Equipage",
+        brand="Hermes",
+        year="",
+        frag_url="https://www.fragrantica.com/perfume/Hermes/Equipage-28.html",
+    )
+    payload = api._search_result_to_dict(card)
+    check("search serialization strips duplicated house", payload["name"] == "Equipage", str(payload))
+
+
 def test_search_serialization_recovers_fragrantica_identity() -> None:
     print("Fragrantica identity recovery checks:")
     row = engine.UnifiedFragrance(
@@ -572,6 +590,7 @@ def main() -> int:
     test_serper_enabled_with_key_only()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
+    test_strip_house_from_name()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()

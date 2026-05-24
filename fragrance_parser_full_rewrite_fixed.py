@@ -128,6 +128,12 @@ class NotesList:
     base: list[str] = field(default_factory=list)
     flat: list[str] = field(default_factory=list)
 
+
+def notes_layers_populated(notes: NotesList) -> bool:
+    """True when any note layer already has content from a prior source."""
+    return bool(notes.flat or notes.top or notes.heart or notes.base)
+
+
 @dataclass
 class UnifiedDetails:
     notes: NotesList
@@ -543,6 +549,65 @@ class IdentityTools:
         forms = {normalized}
         forms |= IdentityTools.BRAND_ALIASES.get(normalized, set())
         return {item for item in forms if item}
+
+    @staticmethod
+    def strip_house_from_name(name: str, house: str) -> str:
+        """Remove a redundant leading/trailing house prefix from a perfume name.
+
+        Fragrantica search cards often put the full marketing title in the <h3>
+        (e.g. "Hermès Rocabar") while the brand sibling is already "Hermes".
+        """
+        cleaned_name = TextSanitizer.clean(name)
+        cleaned_house = TextSanitizer.clean(house)
+        if not cleaned_name or not cleaned_house:
+            return cleaned_name
+
+        tokens = cleaned_name.split()
+        if not tokens:
+            return cleaned_name
+
+        name_norm = TextSanitizer.normalize_identity(cleaned_name)
+        house_forms = sorted(
+            {cleaned_house, *IdentityTools.brand_forms(cleaned_house)},
+            key=lambda value: len(TextSanitizer.normalize_identity(value)),
+            reverse=True,
+        )
+
+        for form in house_forms:
+            form_norm = TextSanitizer.normalize_identity(form)
+            if not form_norm:
+                continue
+            form_token_count = len(form_norm.split())
+
+            if name_norm == form_norm:
+                return cleaned_name
+            if name_norm.startswith(form_norm + " "):
+                for i in range(1, min(len(tokens) + 1, form_token_count + 2)):
+                    if TextSanitizer.normalize_identity(" ".join(tokens[:i])) == form_norm:
+                        remainder = " ".join(tokens[i:]).strip(" -–—|:")
+                        if remainder:
+                            return remainder
+                        break
+                if form_token_count == 1:
+                    lead_norm = TextSanitizer.normalize_identity(tokens[0])
+                    if lead_norm in IdentityTools.brand_forms(cleaned_house):
+                        remainder = " ".join(tokens[1:]).strip(" -–—|:")
+                        if remainder:
+                            return remainder
+
+            by_suffix = f" by {form_norm}"
+            if name_norm.endswith(by_suffix):
+                suffix_tokens = form_token_count + 1
+                if (
+                    len(tokens) > suffix_tokens
+                    and tokens[-suffix_tokens].lower() == "by"
+                    and TextSanitizer.normalize_identity(" ".join(tokens[-form_token_count:])) == form_norm
+                ):
+                    prefix = " ".join(tokens[:-suffix_tokens]).strip(" -–—|:")
+                    if prefix:
+                        return prefix
+
+        return cleaned_name
 
     @staticmethod
     def canonical_brand_query(query: str) -> str:
@@ -4812,7 +4877,7 @@ class BasenotesEngine:
                         int(match.group(3)),
                     )
         
-        if not unified_details.notes.has_pyramid:
+        if not notes_layers_populated(unified_details.notes):
             ul_container = soup.find("ul", class_="fragrancenotes")
             if ul_container:
                 list_items = ul_container.find_all("li", recursive=False)
@@ -5384,6 +5449,8 @@ class FragranticaEngine:
             name = TextSanitizer.clean(FragranticaEngine.name_from_url(frag_url)) or name
         if not _identity_looks_real(brand):
             brand = TextSanitizer.clean(FragranticaEngine.brand_from_url(frag_url)) or brand
+        if name and brand:
+            name = IdentityTools.strip_house_from_name(name, brand)
         if not name or not brand:
             return None
         return UnifiedFragrance(name=name, brand=brand, year=year, frag_url=frag_url)
@@ -7812,12 +7879,15 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
 def fetch_selected_details(scraper, selected: UnifiedFragrance, detail_timeout: float) -> UnifiedDetails:
     details = UnifiedDetails(notes=NotesList())
     deadline = Deadline(detail_timeout)
-    jobs = {
-        "fg": lambda: FragranticaEngine.fetch_details(scraper, selected.frag_url, details, deadline=deadline),
-    }
+    # Fragrantica first — required source and canonical note identity. Parallel
+    # BN+FG detail fetch used to race and merge duplicate pyramids (e.g. BN
+    # "juniper berry" alongside FG "Juniper" on Hermes Rocabar / Bel Ami).
+    FragranticaEngine.fetch_details(scraper, selected.frag_url, details, deadline=deadline)
     if selected.bn_url:
-        jobs["bn"] = lambda: BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline)
-    bounded_parallel(jobs, seconds=detail_timeout, max_workers=len(jobs), raise_on={"fg"})
+        try:
+            BasenotesEngine.fetch_details(scraper, selected.bn_url, details, deadline=deadline)
+        except Exception:
+            pass  # Basenotes is supplemental; never fail the bundle on BN alone.
     normalize_notes(details.notes)
     details.reviews = dedupe_reviews(details.reviews)
     # FG + BN detail synchronization is complete; attach the normalized,
