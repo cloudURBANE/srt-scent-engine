@@ -488,6 +488,8 @@ class IdentityTools:
         "homme", "femme", "men", "women", "man", "woman", "male", "female",
         "unisex", "spray", "version", "original", "new", "intense",
     }
+    PARTIAL_HOUSE_REMAINDER_STARTERS = frozenset({"and", "de", "du", "di", "et", "van", "von"})
+    MIN_FUZZY_TOKEN_LEN = 3
     BRAND_ALIASES = {
         "dior": {"dior", "christian dior"},
         "christian dior": {"dior", "christian dior"},
@@ -505,7 +507,8 @@ class IdentityTools:
         "mfk": {"maison francis kurkdjian", "mfk"},
         "jean paul gaultier": {"jean paul gaultier", "jpg"},
         "jpg": {"jean paul gaultier", "jpg"},
-        "dolce and gabbana": {"dolce and gabbana", "d and g", "dg"},
+        "dolce and gabbana": {"dolce and gabbana", "dolce gabbana", "d and g", "dg"},
+        "dolce gabbana": {"dolce and gabbana", "dolce gabbana", "d and g", "dg"},
     }
     # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
     # Keys are normalized sub-line tokens; values are designer labels to crawl.
@@ -547,8 +550,37 @@ class IdentityTools:
     def brand_forms(brand: str) -> set[str]:
         normalized = TextSanitizer.normalize_identity(brand)
         forms = {normalized}
-        forms |= IdentityTools.BRAND_ALIASES.get(normalized, set())
+        direct = IdentityTools.BRAND_ALIASES.get(normalized, set())
+        forms |= {TextSanitizer.normalize_identity(item) for item in direct}
+        for canonical, aliases in IdentityTools.BRAND_ALIASES.items():
+            alias_forms = {canonical, *aliases}
+            normalized_aliases = {TextSanitizer.normalize_identity(item) for item in alias_forms}
+            if normalized in normalized_aliases:
+                forms |= normalized_aliases
         return {item for item in forms if item}
+
+    @staticmethod
+    def bad_partial_house_remainder(name: str, house: str) -> bool:
+        """True when a name looks like a leftover from a partial house strip."""
+        name_tokens = TextSanitizer.normalize_identity(name).split()
+        house_tokens = TextSanitizer.normalize_identity(house).split()
+        if not name_tokens or len(house_tokens) != 1:
+            return False
+        return name_tokens[0] in IdentityTools.PARTIAL_HOUSE_REMAINDER_STARTERS
+
+    @staticmethod
+    def _valid_house_strip_remainder(remainder: str, form_norm: str) -> str:
+        remainder = remainder.strip(" -–—|:")
+        if not remainder:
+            return ""
+        remainder_tokens = TextSanitizer.normalize_identity(remainder).split()
+        if (
+            len((form_norm or "").split()) == 1
+            and remainder_tokens
+            and remainder_tokens[0] in IdentityTools.PARTIAL_HOUSE_REMAINDER_STARTERS
+        ):
+            return ""
+        return remainder
 
     @staticmethod
     def strip_house_from_name(name: str, house: str) -> str:
@@ -584,14 +616,20 @@ class IdentityTools:
             if name_norm.startswith(form_norm + " "):
                 for i in range(1, min(len(tokens) + 1, form_token_count + 2)):
                     if TextSanitizer.normalize_identity(" ".join(tokens[:i])) == form_norm:
-                        remainder = " ".join(tokens[i:]).strip(" -–—|:")
+                        remainder = IdentityTools._valid_house_strip_remainder(
+                            " ".join(tokens[i:]),
+                            form_norm,
+                        )
                         if remainder:
                             return remainder
                         break
                 if form_token_count == 1:
                     lead_norm = TextSanitizer.normalize_identity(tokens[0])
                     if lead_norm in IdentityTools.brand_forms(cleaned_house):
-                        remainder = " ".join(tokens[1:]).strip(" -–—|:")
+                        remainder = IdentityTools._valid_house_strip_remainder(
+                            " ".join(tokens[1:]),
+                            form_norm,
+                        )
                         if remainder:
                             return remainder
 
@@ -615,7 +653,7 @@ class IdentityTools:
         if not normalized:
             return ""
         for canonical, forms in IdentityTools.BRAND_ALIASES.items():
-            all_forms = {canonical} | set(forms)
+            all_forms = {TextSanitizer.normalize_identity(item) for item in ({canonical} | set(forms))}
             if normalized in all_forms:
                 return canonical
         return normalized if normalized in IdentityTools.BRAND_ALIASES else ""
@@ -785,6 +823,9 @@ class IdentityTools:
 
     @staticmethod
     def relevance_score(query: str, item: "UnifiedFragrance") -> float:
+        if IdentityTools.bad_partial_house_remainder(item.name, item.brand):
+            return 0.0
+
         query_clean = TextSanitizer.clean(query).lower()
         name_clean = TextSanitizer.clean(item.name).lower()
         brand_clean = TextSanitizer.clean(item.brand).lower()
@@ -798,9 +839,9 @@ class IdentityTools:
 
         matched_score = 0.0
         for qt in q_tokens:
-            if qt in target_words or qt in target_full:
+            if qt in target_words:
                 matched_score += 1.0
-            else:
+            elif len(qt) >= IdentityTools.MIN_FUZZY_TOKEN_LEN:
                 best_word_match = max([SequenceMatcher(None, qt, t_word).ratio() for t_word in target_words] + [0.0])
                 matched_score += best_word_match
 
@@ -810,8 +851,9 @@ class IdentityTools:
             SequenceMatcher(None, query_clean, brand_clean).ratio(),
             SequenceMatcher(None, query_clean, target_full).ratio()
         )
+        alias_ratio = IdentityTools.fused_identity_score(query, item.name, item.brand)
 
-        return max(token_confidence, raw_ratio)
+        return max(token_confidence, raw_ratio, alias_ratio)
 
 class QueryRepair:
     _LAST_NATIVE_CANDIDATES: list = []

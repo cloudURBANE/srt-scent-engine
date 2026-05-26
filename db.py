@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -793,6 +794,19 @@ def _clean_url(value: Any) -> str | None:
     return text
 
 
+def _identity_search_term(query: str) -> tuple[str, str]:
+    """Return the SQL match mode and bound term for identity search.
+
+    One- and two-character fragrance names are real, but substring ILIKE would
+    make "Q" match "Acqua". For those tiny single-token queries, use a
+    case-insensitive regex with non-alphanumeric boundaries.
+    """
+    text = (query or "").strip()
+    if len(text) <= 2 and len(text.split()) == 1:
+        return "regex", rf"(^|[^[:alnum:]]){re.escape(text)}([^[:alnum:]]|$)"
+    return "ilike", f"%{text}%"
+
+
 def _fragrance_record_key(row: dict[str, Any]) -> str:
     fg_url = _clean_url(row.get("canonical_fg_url"))
     bn_url = _clean_url(row.get("bn_url"))
@@ -1028,9 +1042,31 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
     if not text:
         return []
     limit = max(1, min(int(limit or 15), 50))
-    like = f"%{text}%"
+    mode, term = _identity_search_term(text)
     ctx, conn = _conn()
     try:
+        if mode == "regex":
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM fragrance_records
+                WHERE name ~* %s
+                   OR house ~* %s
+                   OR concat_ws(' ', house, name) ~* %s
+                   OR concat_ws(' ', name, house) ~* %s
+                ORDER BY
+                    CASE
+                        WHEN concat_ws(' ', house, name) ~* %s THEN 0
+                        WHEN name ~* %s THEN 1
+                        WHEN house ~* %s THEN 2
+                        ELSE 3
+                    END,
+                    last_seen_at DESC
+                LIMIT %s
+                """,
+                (term, term, term, term, term, term, term, limit),
+            ).fetchall()
+            return [_fragrance_record_to_dict(row) for row in rows]
         rows = conn.execute(
             """
             SELECT *
@@ -1049,7 +1085,7 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
                 last_seen_at DESC
             LIMIT %s
             """,
-            (like, like, like, like, like, like, like, limit),
+            (term, term, term, term, term, term, term, limit),
         ).fetchall()
         return [_fragrance_record_to_dict(row) for row in rows]
     finally:
@@ -1104,31 +1140,55 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
     if not text:
         return []
     limit = max(1, min(int(limit or 15), 50))
-    like = f"%{text}%"
+    mode, term = _identity_search_term(text)
     ctx, conn = _conn()
     try:
-        rows = conn.execute(
-            """
-            SELECT * FROM fg_detail_cache
-            WHERE quality_status = 'complete'
-              AND (
-                  name ILIKE %s
-                  OR house ILIKE %s
-                  OR concat_ws(' ', house, name) ILIKE %s
-                  OR concat_ws(' ', name, house) ILIKE %s
-              )
-            ORDER BY
-                CASE
-                    WHEN concat_ws(' ', house, name) ILIKE %s THEN 0
-                    WHEN name ILIKE %s THEN 1
-                    WHEN house ILIKE %s THEN 2
-                    ELSE 3
-                END,
-                updated_at DESC
-            LIMIT %s
-            """,
-            (like, like, like, like, like, like, like, limit),
-        ).fetchall()
+        if mode == "regex":
+            rows = conn.execute(
+                """
+                SELECT * FROM fg_detail_cache
+                WHERE quality_status = 'complete'
+                  AND (
+                      name ~* %s
+                      OR house ~* %s
+                      OR concat_ws(' ', house, name) ~* %s
+                      OR concat_ws(' ', name, house) ~* %s
+                  )
+                ORDER BY
+                    CASE
+                        WHEN concat_ws(' ', house, name) ~* %s THEN 0
+                        WHEN name ~* %s THEN 1
+                        WHEN house ~* %s THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
+                LIMIT %s
+                """,
+                (term, term, term, term, term, term, term, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM fg_detail_cache
+                WHERE quality_status = 'complete'
+                  AND (
+                      name ILIKE %s
+                      OR house ILIKE %s
+                      OR concat_ws(' ', house, name) ILIKE %s
+                      OR concat_ws(' ', name, house) ILIKE %s
+                  )
+                ORDER BY
+                    CASE
+                        WHEN concat_ws(' ', house, name) ILIKE %s THEN 0
+                        WHEN name ILIKE %s THEN 1
+                        WHEN house ILIKE %s THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
+                LIMIT %s
+                """,
+                (term, term, term, term, term, term, term, limit),
+            ).fetchall()
         out: list[dict[str, Any]] = []
         for row in rows:
             out.append(
