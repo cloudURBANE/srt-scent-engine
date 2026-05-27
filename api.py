@@ -278,6 +278,80 @@ def _identity_needs_recovery(value: str) -> bool:
     return bool(callable(checker) and not checker(text))
 
 
+def _identity_compare_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in engine.TextSanitizer.normalize_identity(value).split()
+        if token and token != "and"
+    }
+
+
+def _stored_name_is_less_specific_than_url(stored: str, url_derived: str) -> bool:
+    stored_tokens = engine.TextSanitizer.normalize_identity(stored).split()
+    url_tokens = engine.TextSanitizer.normalize_identity(url_derived).split()
+    if not stored_tokens or not url_tokens or stored_tokens == url_tokens:
+        return False
+    return len(url_tokens) > len(stored_tokens)
+
+
+def _house_is_partial_url_house(house: str, url_house: str) -> bool:
+    house_tokens = _identity_compare_tokens(house)
+    url_house_tokens = _identity_compare_tokens(url_house)
+    return bool(house_tokens and url_house_tokens and house_tokens < url_house_tokens)
+
+
+def _name_looks_like_url_house_prefixed(name: str, url_name: str, url_house: str) -> bool:
+    name_norm = engine.TextSanitizer.normalize_identity(name)
+    url_name_norm = engine.TextSanitizer.normalize_identity(url_name)
+    if not name_norm or not url_name_norm or name_norm == url_name_norm:
+        return False
+    if not name_norm.endswith(f" {url_name_norm}"):
+        return False
+    prefix = name_norm[: -len(url_name_norm)].strip()
+    prefix_tokens = _identity_compare_tokens(prefix)
+    house_tokens = _identity_compare_tokens(url_house)
+    if not prefix_tokens or not house_tokens:
+        return False
+    return engine.IdentityTools.fuzzy_token_coverage(prefix_tokens, house_tokens) >= 0.82
+
+
+def _url_name_should_replace(
+    name: str,
+    house: str,
+    url_name: str,
+    url_house: str,
+) -> bool:
+    if _stored_name_is_less_specific_than_url(name, url_name):
+        return True
+    if (
+        house
+        and url_house
+        and not engine.IdentityTools.compatible_brand(house, url_house)
+        and _name_looks_like_url_house_prefixed(name, url_name, url_house)
+    ):
+        return True
+    return False
+
+
+def _search_identity_is_safe_to_store(
+    name: str,
+    house: str,
+    item: engine.UnifiedFragrance,
+) -> bool:
+    if not name or not house:
+        return False
+    if engine.IdentityTools.bad_partial_house_remainder(name, house):
+        return False
+    if item.frag_url and not parfinity.is_parfinity_url(item.frag_url):
+        url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
+        url_house = engine.FragranticaEngine.brand_from_url(item.frag_url)
+        name_norm = engine.TextSanitizer.normalize_identity(name)
+        url_name_norm = engine.TextSanitizer.normalize_identity(url_name)
+        if url_name and name_norm != url_name_norm:
+            return not _url_name_should_replace(name, house, url_name, url_house)
+    return True
+
+
 def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]:
     """Recover name/house from canonical source URLs when fields are weak."""
     name = (item.name or "").strip()
@@ -295,19 +369,23 @@ def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]
             if _identity_needs_recovery(house):
                 house = str(pf_entry.get("house") or "").strip() or house
 
-    if (
-        item.frag_url
-        and not parfinity.is_parfinity_url(item.frag_url)
-        and (_identity_needs_recovery(name) or _identity_needs_recovery(house))
-    ):
-        if _identity_needs_recovery(name):
-            url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
-            if url_name:
-                name = url_name
-        if _identity_needs_recovery(house):
-            url_house = engine.FragranticaEngine.brand_from_url(item.frag_url)
-            if url_house:
-                house = url_house
+    if item.frag_url and not parfinity.is_parfinity_url(item.frag_url):
+        url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
+        url_house = engine.FragranticaEngine.brand_from_url(item.frag_url)
+        if url_name and (
+            _identity_needs_recovery(name)
+            or _url_name_should_replace(name, house, url_name, url_house)
+        ):
+            name = url_name
+        if url_house and (
+            _identity_needs_recovery(house)
+            or (
+                house
+                and not engine.IdentityTools.compatible_brand(house, url_house)
+                and _house_is_partial_url_house(house, url_house)
+            )
+        ):
+            house = url_house
 
     if item.bn_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
         bn_candidate = engine.BasenotesEngine._parse_name_metadata(
@@ -373,12 +451,23 @@ def _candidate_from_fragrance_record(
     name = str(record.get("name") or "").strip()
     house = str(record.get("house") or "").strip()
     year = str(record.get("year") or "").strip()
-    if fg_url and (_identity_needs_recovery(name) or _identity_needs_recovery(house)):
-        if _identity_needs_recovery(name):
-            name = engine.FragranticaEngine.name_from_url(fg_url) or name
-        if _identity_needs_recovery(house):
-            house = engine.FragranticaEngine.brand_from_url(fg_url) or house
+    if fg_url:
+        identity = _recover_candidate_identity(
+            engine.UnifiedFragrance(
+                name=name,
+                brand=house,
+                year=year,
+                bn_url=bn_url,
+                frag_url=fg_url,
+            )
+        )
+        name = identity["name"] or name
+        house = identity["house"] or house
+    elif name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
     if not name or not house:
+        return None
+    if engine.IdentityTools.bad_partial_house_remainder(name, house):
         return None
     candidate = engine.UnifiedFragrance(
         name=name,
@@ -455,12 +544,16 @@ def _persist_search_results(query: str, results: list[engine.UnifiedFragrance]) 
     for item in results:
         try:
             identity = _recover_candidate_identity(item)
+            name = identity["name"] or item.name
+            house = identity["house"] or item.brand
+            if not _search_identity_is_safe_to_store(name, house, item):
+                continue
             db.upsert_fragrance_search(
                 {
                     "canonical_fg_url": _canonical_fg_url(item.frag_url),
                     "bn_url": item.bn_url or None,
-                    "name": identity["name"] or item.name,
-                    "house": identity["house"] or item.brand,
+                    "name": name,
+                    "house": house,
                     "year": _coerce_year(item.year),
                     "image_url": getattr(item, "image_url", None),
                     "search": _json_for_db_blob(

@@ -250,6 +250,26 @@ def test_strip_house_from_name() -> None:
     check("Hermes Bel Ami -> Bel Ami", strip("Hermes Bel Ami", "Hermes") == "Bel Ami", "")
     check("bare name unchanged", strip("Bel Ami", "Hermes") == "Bel Ami", "")
     check("Dior Sauvage -> Sauvage", strip("Dior Sauvage", "Dior") == "Sauvage", "")
+    check(
+        "partial Dolce strip does not leave conjunction garbage",
+        strip("Dolce and gabana Q", "Dolce") == "Dolce and gabana Q",
+        strip("Dolce and gabana Q", "Dolce"),
+    )
+    check(
+        "Dolce & Gabbana Q -> Q",
+        strip("Dolce & Gabbana Q", "Dolce & Gabbana") == "Q",
+        strip("Dolce & Gabbana Q", "Dolce & Gabbana"),
+    )
+    check(
+        "Dolce Gabbana Q -> Q",
+        strip("Dolce Gabbana Q", "Dolce Gabbana") == "Q",
+        strip("Dolce Gabbana Q", "Dolce Gabbana"),
+    )
+    check(
+        "multi-token house can keep legitimate De-name",
+        strip("Serge Lutens De Profundis", "Serge Lutens") == "De Profundis",
+        strip("Serge Lutens De Profundis", "Serge Lutens"),
+    )
 
     card = engine.UnifiedFragrance(
         name="Hermès Equipage",
@@ -259,6 +279,89 @@ def test_strip_house_from_name() -> None:
     )
     payload = api._search_result_to_dict(card)
     check("search serialization strips duplicated house", payload["name"] == "Equipage", str(payload))
+
+
+def test_q_relevance_is_word_based() -> None:
+    print("Single-letter query relevance checks:")
+    q = candidate("Dolce Gabbana", "Q")
+    acqua = candidate("Giorgio Armani", "Acqua Di Gio Pour Homme")
+    q_score = engine.IdentityTools.relevance_score("q", q)
+    acqua_score = engine.IdentityTools.relevance_score("q", acqua)
+    dg_score = engine.IdentityTools.relevance_score("Dolce and gabana Q", q)
+    short_alias_score = engine.IdentityTools.relevance_score("D&G Q", q)
+    check("single-letter exact word scores strongly", q_score >= 0.99, f"{q_score:.3f}")
+    check("single-letter substring inside Acqua does not pass", acqua_score < 0.4, f"{acqua_score:.3f}")
+    check("misspelled Dolce Gabbana query still matches Q", dg_score > 0.8, f"{dg_score:.3f}")
+    check("D&G shorthand query matches canonical house", short_alias_score > 0.85, f"{short_alias_score:.3f}")
+
+
+def test_dolce_gabbana_identity_recovery_and_persistence() -> None:
+    print("Dolce Gabbana poisoned-row prevention checks:")
+    row = engine.UnifiedFragrance(
+        name="Dolce and gabana Q",
+        brand="Dolce",
+        year="",
+        frag_url="https://www.fragrantica.com/perfume/Dolce-Gabbana/Q-83367.html",
+    )
+    payload = api._search_result_to_dict(row)
+    check("Fragrantica URL repairs misspelled query-echo name", payload["name"] == "Q", str(payload))
+    check("Fragrantica URL repairs partial Dolce house", payload["house"] == "Dolce Gabbana", str(payload))
+
+    old_enabled = api.db.ENABLED
+    old_upsert = api.db.upsert_fragrance_search
+    captured: list[dict] = []
+    try:
+        api.db.ENABLED = True
+        api.db.upsert_fragrance_search = lambda data: captured.append(data)
+        api._persist_search_results("Dolce and gabana Q", [row])
+    finally:
+        api.db.ENABLED = old_enabled
+        api.db.upsert_fragrance_search = old_upsert
+
+    check("persisted search row uses repaired name", bool(captured) and captured[0]["name"] == "Q", str(captured))
+    check(
+        "persisted search row uses repaired house",
+        bool(captured) and captured[0]["house"] == "Dolce Gabbana",
+        str(captured),
+    )
+
+
+def test_poisoned_db_records_are_filtered() -> None:
+    print("Poisoned DB record filtering checks:")
+    old_record_search = api.db.search_fragrance_records
+    try:
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "and gabana Q",
+                "house": "Dolce",
+                "bn_url": "",
+                "canonical_fg_url": "",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "name": "Q",
+                "house": "Dolce Gabbana",
+                "bn_url": "",
+                "canonical_fg_url": "https://www.fragrantica.com/perfume/Dolce-Gabbana/Q-83367.html",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            },
+        ]
+        rows = api._fragrance_record_search("Dolce and gabana Q", 10)
+    finally:
+        api.db.search_fragrance_records = old_record_search
+
+    identities = [(row.brand, row.name) for row in rows]
+    check("poisoned conjunction-leading record is dropped", ("Dolce", "and gabana Q") not in identities, str(identities))
+    check("healthy D&G Q record remains", ("Dolce Gabbana", "Q") in identities, str(identities))
+
+
+def test_short_db_search_uses_word_boundaries() -> None:
+    print("Short DB query predicate checks:")
+    mode, term = api.db._identity_search_term("Q")
+    long_mode, long_term = api.db._identity_search_term("Dior")
+    check("single-character DB query uses regex mode", mode == "regex", str((mode, term)))
+    check("short regex has non-alphanumeric boundaries", "[^[:alnum:]]" in term and "Q" in term, term)
+    check("normal DB query still uses ILIKE mode", (long_mode, long_term) == ("ilike", "%Dior%"), str((long_mode, long_term)))
 
 
 def test_search_serialization_recovers_fragrantica_identity() -> None:
@@ -591,6 +694,10 @@ def main() -> int:
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
     test_strip_house_from_name()
+    test_q_relevance_is_word_based()
+    test_dolce_gabbana_identity_recovery_and_persistence()
+    test_poisoned_db_records_are_filtered()
+    test_short_db_search_uses_word_boundaries()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()
