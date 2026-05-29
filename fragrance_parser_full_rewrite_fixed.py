@@ -488,6 +488,17 @@ class IdentityTools:
         "homme", "femme", "men", "women", "man", "woman", "male", "female",
         "unisex", "spray", "version", "original", "new", "intense",
     }
+    GENERIC_BRAND_SUFFIX_TOKENS = frozenset({
+        "beauty",
+        "cosmetics",
+        "fragrance",
+        "fragrances",
+        "parfum",
+        "parfums",
+        "paris",
+        "perfume",
+        "perfumes",
+    })
     PARTIAL_HOUSE_REMAINDER_STARTERS = frozenset({"and", "de", "du", "di", "et", "van", "von"})
     MIN_FUZZY_TOKEN_LEN = 3
     BRAND_ALIASES = {
@@ -521,6 +532,10 @@ class IdentityTools:
     @staticmethod
     def tokenized(text: str) -> set[str]:
         return IdentityTools.identity_tokens(TextSanitizer.normalize_identity(text))
+
+    @staticmethod
+    def tokenized_keep_stopwords(text: str) -> set[str]:
+        return {token for token in TextSanitizer.normalize_identity(text).split() if token}
         
     @staticmethod
     def brand_tokens(brand: str) -> set[str]:
@@ -528,11 +543,24 @@ class IdentityTools:
         for form in IdentityTools.brand_forms(brand):
             out |= IdentityTools.tokenized(form)
         return out
+
+    @staticmethod
+    def brand_tokens_keep_stopwords(brand: str) -> set[str]:
+        out: set[str] = set()
+        for form in IdentityTools.brand_forms(brand):
+            out |= IdentityTools.tokenized_keep_stopwords(form)
+        return out
         
     @staticmethod
     def name_tokens(name: str, brand: str = "") -> set[str]:
         tokens = IdentityTools.tokenized(name)
         brand_tokens = IdentityTools.brand_tokens(brand) if brand else set()
+        return {t for t in tokens if t not in brand_tokens}
+
+    @staticmethod
+    def name_tokens_keep_stopwords(name: str, brand: str = "") -> set[str]:
+        tokens = IdentityTools.tokenized_keep_stopwords(name)
+        brand_tokens = IdentityTools.brand_tokens_keep_stopwords(brand) if brand else set()
         return {t for t in tokens if t not in brand_tokens}
         
     @staticmethod
@@ -558,6 +586,18 @@ class IdentityTools:
             if normalized in normalized_aliases:
                 forms |= normalized_aliases
         return {item for item in forms if item}
+
+    @staticmethod
+    def brand_forms_without_generic_suffixes(brand: str) -> set[str]:
+        forms: set[str] = set()
+        for form in IdentityTools.brand_forms(brand):
+            tokens = TextSanitizer.normalize_identity(form).split()
+            while tokens and tokens[-1] in IdentityTools.GENERIC_BRAND_SUFFIX_TOKENS:
+                tokens.pop()
+            stripped = " ".join(tokens)
+            if stripped:
+                forms.add(stripped)
+        return forms
 
     @staticmethod
     def bad_partial_house_remainder(name: str, house: str) -> bool:
@@ -754,7 +794,12 @@ class IdentityTools:
     def compatible_brand(a: str, b: str) -> bool:
         a_forms = IdentityTools.brand_forms(a)
         b_forms = IdentityTools.brand_forms(b)
-        return bool(a_forms & b_forms) or TextSanitizer.normalize_identity(a) == TextSanitizer.normalize_identity(b)
+        if bool(a_forms & b_forms) or TextSanitizer.normalize_identity(a) == TextSanitizer.normalize_identity(b):
+            return True
+        return bool(
+            IdentityTools.brand_forms_without_generic_suffixes(a)
+            & IdentityTools.brand_forms_without_generic_suffixes(b)
+        )
         
     @staticmethod
     def token_overlap(a: set[str], b: set[str]) -> tuple[float, float]:
@@ -2566,6 +2611,9 @@ class SerperClient:
     _RESOLVER_SCORE = 0.9
     _cache: dict[str, list[str]] = {}
     _cache_lock = threading.Lock()
+    # Parfumo discovery cache is kept separate from the Fragrantica cache so the
+    # two site scopes never collide on a shared normalized-query key.
+    _parfumo_cache: dict[str, list[str]] = {}
 
     @staticmethod
     def enabled() -> bool:
@@ -2580,10 +2628,10 @@ class SerperClient:
         return TextSanitizer.normalize_identity(query)
 
     @classmethod
-    def _post(cls, query: str, timeout: float) -> dict:
+    def _post(cls, query: str, timeout: float, site: str = "fragrantica.com/perfume") -> dict:
         key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
         headers = {"X-API-KEY": key, "Content-Type": "application/json"}
-        body = {"q": f"{query} site:fragrantica.com/perfume"}
+        body = {"q": f"{query} site:{site}"}
         res = requests.post(cls.ENDPOINT, json=body, headers=headers, timeout=timeout)
         res.raise_for_status()
         return res.json() or {}
@@ -2667,6 +2715,59 @@ class SerperClient:
             if max_results and len(rows) >= max_results:
                 break
         return rows
+
+    @classmethod
+    def search_parfumo_urls(
+        cls,
+        house: str,
+        name: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> list[str]:
+        """Return canonical Parfumo perfume URLs for ``house`` / ``name``.
+
+        Parfumo fallback discovery (PARFUMO_FALLBACK_RESOLVER_DESIGN.md §3). Uses
+        the same SERPER_API_KEY as the Fragrantica path but scopes the query to
+        ``site:parfumo.com/Perfumes`` and quotes the house + name so the SERP
+        favors the exact perfume. Returns ``[]`` when disabled or on any error;
+        successful lookups are cached per normalized house+name (failures are
+        not cached). The cache is separate from the Fragrantica one.
+        """
+        house = (house or "").strip()
+        name = (name or "").strip()
+        if not (house or name) or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(f"{house} {name}")
+        with cls._cache_lock:
+            cached = cls._parfumo_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        budget = min(float(timeout), cls.MAX_TIMEOUT)
+        if deadline is not None:
+            if deadline.expired():
+                return []
+            budget = min(budget, deadline.timeout(budget))
+        urls: list[str] = []
+        try:
+            query = " ".join(f'"{part}"' for part in (house, name) if part)
+            payload = cls._post(query, budget, site="parfumo.com/Perfumes")
+            seen: set[str] = set()
+            for entry in payload.get("organic", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                canonical = ParfumoEngine.canonical_url(entry.get("link", "") or "")
+                if not canonical or not ParfumoEngine.is_perfume_url(canonical):
+                    continue
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                urls.append(canonical)
+        except Exception:
+            # Degraded-search style: never raise into the resolver.
+            return []
+        with cls._cache_lock:
+            cls._parfumo_cache[cache_key] = list(urls)
+        return urls
 
 
 _BASENOTES_CACHE_FILE = Path(
@@ -7485,6 +7586,23 @@ class Orchestrator:
         return merged
         
     @staticmethod
+    def _name_token_score(a_name: set[str], b_name: set[str]) -> float:
+        if not a_name or not b_name:
+            return 0.0
+        jaccard, coverage = IdentityTools.token_overlap(a_name, b_name)
+        exact_name = a_name == b_name
+
+        if exact_name:
+            return 0.96
+        if coverage >= 0.92:
+            return 0.90
+        if jaccard >= 0.75:
+            return 0.84
+        if jaccard >= 0.55 and coverage >= 0.70:
+            return 0.74
+        return 0.0
+
+    @staticmethod
     def identity_score(a: UnifiedFragrance | CatalogItem, b: UnifiedFragrance | CatalogItem) -> float:
         a_brand = TextSanitizer.clean(getattr(a, "brand", ""))
         b_brand = TextSanitizer.clean(getattr(b, "brand", ""))
@@ -7507,24 +7625,18 @@ class Orchestrator:
         
         score = 0.0
         if not a_name or not b_name:
-            ratio = IdentityTools.seq_ratio(a_name_raw, b_name_raw)
-            if ratio >= 0.80:
-                score = ratio
-            else:
-                return 0.0
+            keep_a_name = IdentityTools.name_tokens_keep_stopwords(a_name_raw, getattr(a, "brand", ""))
+            keep_b_name = IdentityTools.name_tokens_keep_stopwords(b_name_raw, getattr(b, "brand", ""))
+            score = Orchestrator._name_token_score(keep_a_name, keep_b_name)
+            if score == 0.0:
+                ratio = IdentityTools.seq_ratio(a_name_raw, b_name_raw)
+                if ratio >= 0.80:
+                    score = ratio
+                else:
+                    return 0.0
         else:
-            jaccard, coverage = IdentityTools.token_overlap(a_name, b_name)
-            exact_name = a_name == b_name
-            
-            if exact_name:
-                score = 0.96
-            elif coverage >= 0.92:
-                score = 0.90
-            elif jaccard >= 0.75:
-                score = 0.84
-            elif jaccard >= 0.55 and coverage >= 0.70:
-                score = 0.74
-            else:
+            score = Orchestrator._name_token_score(a_name, b_name)
+            if score == 0.0:
                 return 0.0  # Hard Gate: Names do not strongly match
 
         a_year = TextSanitizer.clean(getattr(a, "year", ""))
@@ -7544,6 +7656,356 @@ class Orchestrator:
                     return 0.0
 
         return max(0.0, min(score, 1.0))
+
+
+@dataclass
+class ParfumoRecord:
+    """Factual fields parsed from a public Parfumo perfume page. No review text."""
+    url: str
+    name: str = ""
+    house: str = ""
+    year: str = ""
+    gender: str = ""
+    rating: str = ""
+    rating_count: str = ""
+    accords: list[str] = field(default_factory=list)
+    notes_top: list[str] = field(default_factory=list)
+    notes_heart: list[str] = field(default_factory=list)
+    notes_base: list[str] = field(default_factory=list)
+    notes_flat: list[str] = field(default_factory=list)
+    perfumers: list[str] = field(default_factory=list)
+    status: str = ""
+    source: str = "parfumo"
+
+
+@dataclass
+class ParfumoVerdict:
+    decision: str            # accept | manual_review | reject | not_found
+    record: ParfumoRecord | None
+    score: float
+    runner_up: float
+    discovery: str
+    candidates_scored: int
+
+
+class ParfumoEngine:
+    """Fallback factual-field resolver for perfumes absent from Fragrantica.
+
+    See PARFUMO_FALLBACK_RESOLVER_DESIGN.md. Promoted from the verified POC
+    (scripts/diag_parfumo_resolve.py). Fetches only public ``/Perfumes`` /
+    ``/Parfums`` pages and public brand grids -- never ``/api/``,
+    ``/app_v5/api/``, ``/s_perfumes.php``, or logged-in endpoints. Degrades
+    cleanly: any non-200 / parse failure becomes "no Parfumo result" and never
+    raises into the worker. Discovery is Serper-first (one structured query),
+    with a capped, off-by-default single-house brand crawl as last resort.
+    """
+
+    HOST = "www.parfumo.com"
+    BASE_URL = "https://www.parfumo.com"
+    # Public perfume page path: /Perfumes/<Brand>/<slug> or the /Parfums alias.
+    PERFUME_PATH_RE = re.compile(r"^/(?:Perfumes|Parfums)/[^/]+/[^/?#]+$")
+
+    # Thresholds: Parfumo is a fallback, so favor precision -- slightly stricter
+    # than Orchestrator.CATALOG_ACCEPT (0.76). The sibling margin is a collision
+    # guard: two near-identical scores (e.g. EDT vs EDP) route to manual review.
+    ACCEPT = 0.82
+    MANUAL_REVIEW = 0.70
+    SIBLING_MARGIN = 0.06
+    # Cap on how many discovered candidates resolve() will fetch+score. Each
+    # candidate is a live Parfumo page load plus a `delay` sleep while the
+    # enrichment job is claimed, so a noisy SERP must not stretch one job into
+    # tens of seconds (and risk the claim expiring mid-resolve). The true match
+    # is essentially always in the first few SERP hits.
+    MAX_CANDIDATES = 5
+
+    @staticmethod
+    def enabled() -> bool:
+        """Master gate. The whole fallback is inert unless this is truthy."""
+        return _env_truthy("PARFUMO_FALLBACK_ENABLED")
+
+    @staticmethod
+    def brand_crawl_enabled() -> bool:
+        """Last-resort brand crawl is independently gated and off by default."""
+        return _env_truthy("PARFUMO_BRAND_CRAWL_ENABLED")
+
+    # ------------------------------------------------------------------
+    # URL shape / canonicalization
+    # ------------------------------------------------------------------
+    @staticmethod
+    def canonical_url(url: str) -> str:
+        """Normalize a Parfumo URL: https + www host, drop query/fragment, no
+        trailing slash. The /Parfums alias is NOT rewritten here -- the live
+        page's og:url already points at the canonical /Perfumes form, so
+        canonicalization of confirmed hits happens after the fetch."""
+        text = html.unescape(url or "").strip()
+        if not text:
+            return ""
+        if "://" not in text and text.lower().startswith(("parfumo.com", "www.parfumo.com")):
+            text = "https://" + text
+        parsed = urlparse(text)
+        host = (parsed.netloc or "").lower()
+        if host.endswith("parfumo.com"):
+            host = ParfumoEngine.HOST
+        path = (parsed.path or "").rstrip("/")
+        return f"https://{host}{path}" if host else ""
+
+    @staticmethod
+    def is_perfume_url(url: str) -> bool:
+        parsed = urlparse(ParfumoEngine.canonical_url(url))
+        return parsed.netloc == ParfumoEngine.HOST and bool(
+            ParfumoEngine.PERFUME_PATH_RE.match(parsed.path or "")
+        )
+
+    @staticmethod
+    def brand_slug(house: str) -> str:
+        """Parfumo brand slugs keep case and use underscores for spaces."""
+        cleaned = TextSanitizer.clean(house)
+        return re.sub(r"\s+", "_", cleaned).strip("_")
+
+    # ------------------------------------------------------------------
+    # Parsing -- factual fields only, no review text
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _gender_from_desc(desc: str) -> str:
+        low = desc.lower()
+        has_w = "for women" in low or "women and men" in low or "men and women" in low
+        has_m = "for men" in low or "women and men" in low or "men and women" in low
+        if has_w and has_m:
+            return "Unisex"
+        if "for women" in low:
+            return "Feminine"
+        if "for men" in low:
+            return "Masculine"
+        return ""
+
+    @staticmethod
+    def _status_from_desc(desc: str) -> str:
+        low = desc.lower()
+        if "still in production" in low:
+            return "in_production"
+        if "discontinued" in low:
+            return "discontinued"
+        return ""
+
+    @staticmethod
+    def _parse_notes(soup: BeautifulSoup) -> dict[str, list[str]]:
+        """Parfumo renders the pyramid as a .notes_list with 'Top/Heart/Base
+        Notes' headers followed by .clickable_note_img spans. Flanker / travel
+        sizes give a flat list with no section headers."""
+        out: dict[str, list[str]] = {"top": [], "heart": [], "base": [], "flat": []}
+        container = soup.select_one(".notes_list")
+        if not container:
+            return out
+        spans = container.select(".clickable_note_img")
+        note_texts = [TextSanitizer.clean(s.get_text(" ", strip=True)) for s in spans]
+        note_texts = [n for n in note_texts if n]
+        full = container.get_text(" ", strip=True).lower()
+        if "top notes" in full or "base notes" in full or "heart notes" in full:
+            current = "flat"
+            header_map = {"top notes": "top", "heart notes": "heart",
+                          "middle notes": "heart", "base notes": "base"}
+            text_blob = container.get_text("\n", strip=True)
+            for line in text_blob.split("\n"):
+                key = line.strip().lower()
+                if key in header_map:
+                    current = header_map[key]
+                    continue
+                cleaned = TextSanitizer.clean(line)
+                if cleaned and cleaned in note_texts:
+                    out[current].append(cleaned)
+            bucketed = set(out["top"]) | set(out["heart"]) | set(out["base"])
+            for n in note_texts:
+                if n not in bucketed and n not in out["flat"]:
+                    out["flat"].append(n)
+            if not (out["top"] or out["heart"] or out["base"]):
+                out["flat"] = note_texts
+        else:
+            out["flat"] = note_texts
+        return out
+
+    @staticmethod
+    def parse_fields(soup: BeautifulSoup) -> ParfumoRecord | None:
+        """Return a ParfumoRecord, or None for a soft-404 (Parfumo serves
+        missing slugs as HTTP 200 with no og:url and no breadcrumb name)."""
+        og_url_node = soup.select_one('meta[property="og:url"]')
+        og_url = og_url_node.get("content") if og_url_node else ""
+        if not og_url or not ParfumoEngine.is_perfume_url(og_url):
+            return None  # soft-404 / non-perfume page
+
+        rec = ParfumoRecord(url=ParfumoEngine.canonical_url(og_url))
+
+        house = name = ""
+        for s in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(s.string or s.get_text() or "{}")
+            except Exception:
+                continue
+            if isinstance(data, dict) and data.get("@type") == "BreadcrumbList":
+                items = data.get("itemListElement") or []
+                if len(items) >= 3:
+                    house = str(items[2].get("name") or "")
+                if items:
+                    name = str(items[-1].get("name") or "")
+        og_title = soup.select_one('meta[property="og:title"]')
+        if og_title and not name:
+            title = og_title.get("content") or ""
+            name = re.split(r"\s+by\s+", title)[0].strip()
+        rec.house = TextSanitizer.clean(house)
+        rec.name = TextSanitizer.clean(name)
+
+        og_desc_node = soup.select_one('meta[property="og:description"]')
+        og_desc = (og_desc_node.get("content") if og_desc_node else "") or ""
+        rec.gender = ParfumoEngine._gender_from_desc(og_desc)
+        rec.status = ParfumoEngine._status_from_desc(og_desc)
+        m = re.search(r"released in (\d{4})", og_desc)
+        if m:
+            rec.year = m.group(1)
+        else:
+            m = re.search(r"\b(?:19|20)\d{2}\b", og_desc)
+            rec.year = m.group(0) if m else ""
+        m2 = re.search(r"scent is ([a-z\-]+)", og_desc.lower())
+        if m2:
+            rec.accords = [m2.group(1)]
+
+        rv = soup.find(attrs={"itemprop": "ratingValue"})
+        rc = soup.find(attrs={"itemprop": "ratingCount"})
+        if rv:
+            rec.rating = (rv.get("content") or rv.get_text(strip=True) or "").strip()
+        if rc:
+            rec.rating_count = (rc.get("content") or rc.get_text(strip=True) or "").strip()
+
+        notes = ParfumoEngine._parse_notes(soup)
+        rec.notes_top, rec.notes_heart = notes["top"], notes["heart"]
+        rec.notes_base, rec.notes_flat = notes["base"], notes["flat"]
+
+        perf: list[str] = []
+        for a in soup.find_all("a", href=True):
+            if "/Perfumers/" in a.get("href", ""):
+                t = TextSanitizer.clean(a.get_text(strip=True))
+                if t and t not in perf:
+                    perf.append(t)
+        rec.perfumers = perf[:5]
+        return rec
+
+    @staticmethod
+    def fetch_record(scraper, url: str, *, timeout: float = 15.0) -> ParfumoRecord | None:
+        res = Http.get(scraper, url, timeout=timeout, attempts=2,
+                       referer="https://www.parfumo.com/")
+        if not res or getattr(res, "status_code", None) != 200:
+            return None
+        soup = BeautifulSoup(res.text or "", "html.parser")
+        return ParfumoEngine.parse_fields(soup)
+
+    # ------------------------------------------------------------------
+    # Discovery (Serper primary -> capped brand crawl, off by default)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _discover_via_brand_crawl(
+        scraper, house: str, *, max_pages: int = 6, delay: float = 2.0,
+        page_timeout: float = 15.0,
+    ) -> list[str]:
+        slug = ParfumoEngine.brand_slug(house)
+        if not slug:
+            return []
+        base = f"https://{ParfumoEngine.HOST}/Perfumes/{slug}"
+        found: list[str] = []
+        seen: set[str] = set()
+        for page in range(1, max(1, max_pages) + 1):
+            url = base if page == 1 else f"{base}?current_page={page}"
+            res = Http.get(scraper, url, timeout=page_timeout, attempts=2,
+                           referer="https://www.parfumo.com/")
+            if not res or getattr(res, "status_code", None) != 200:
+                break
+            soup = BeautifulSoup(res.text or "", "html.parser")
+            page_hits = 0
+            for a in soup.find_all("a", href=True):
+                path = urlparse(a.get("href", "")).path
+                if ParfumoEngine.PERFUME_PATH_RE.match(path):
+                    canonical = ParfumoEngine.canonical_url(urljoin(base, path))
+                    if canonical and canonical not in seen:
+                        seen.add(canonical)
+                        found.append(canonical)
+                        page_hits += 1
+            if page_hits == 0:
+                break
+            if delay > 0 and page < max_pages:
+                time.sleep(delay)
+        return found
+
+    @staticmethod
+    def discover_urls(scraper, house: str, name: str) -> tuple[list[str], str]:
+        """Return (candidate URLs, discovery-source label), capped at
+        MAX_CANDIDATES. Serper first; the single-house brand crawl only if Serper
+        is empty AND the crawl is explicitly enabled. The cap bounds how many
+        live Parfumo pages resolve() will fetch+score per job."""
+        urls = SerperClient.search_parfumo_urls(house, name)
+        if urls:
+            return urls[: ParfumoEngine.MAX_CANDIDATES], "serper"
+        if ParfumoEngine.brand_crawl_enabled():
+            crawled = ParfumoEngine._discover_via_brand_crawl(scraper, house)
+            if crawled:
+                return crawled[: ParfumoEngine.MAX_CANDIDATES], "brand_crawl"
+        return [], "serper"
+
+    # ------------------------------------------------------------------
+    # Identity match -- reuse the engine's scorer (no parallel logic)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_parfumo_name(name: str) -> str:
+        """Parfumo embeds flanker markers in parens, e.g. 'Ramz Lattafa (Gold)'.
+        Flatten to 'Ramz Lattafa Gold' so the engine tokenizer sees the words."""
+        return TextSanitizer.clean(re.sub(r"[()]", " ", name or ""))
+
+    @staticmethod
+    def score_record(probe_house: str, probe_name: str, probe_year: str, rec: ParfumoRecord) -> float:
+        probe = UnifiedFragrance(name=probe_name, brand=probe_house, year=probe_year or "")
+        catalog = CatalogItem(
+            name=ParfumoEngine._normalize_parfumo_name(rec.name),
+            brand=rec.house,
+            year=rec.year or "",
+            url=rec.url,
+        )
+        return Orchestrator.identity_score(probe, catalog)
+
+    @staticmethod
+    def resolve(
+        scraper,
+        house: str,
+        name: str,
+        year: str = "",
+        *,
+        delay: float = 2.0,
+    ) -> ParfumoVerdict:
+        """Full fallback resolve: discover -> fetch+parse+score each candidate
+        -> banded verdict. Returns ParfumoVerdict("not_found", ...) on any miss
+        and never raises."""
+        urls, discovery = ParfumoEngine.discover_urls(scraper, house, name)
+        if not urls:
+            return ParfumoVerdict("not_found", None, 0.0, 0.0, discovery, 0)
+
+        scored: list[tuple[float, ParfumoRecord]] = []
+        for i, url in enumerate(urls):
+            rec = ParfumoEngine.fetch_record(scraper, url)
+            if rec is None:
+                continue
+            scored.append((ParfumoEngine.score_record(house, name, year, rec), rec))
+            if delay > 0 and i < len(urls) - 1:
+                time.sleep(delay)
+        if not scored:
+            return ParfumoVerdict("not_found", None, 0.0, 0.0, discovery, 0)
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_rec = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+
+        if best_score >= ParfumoEngine.ACCEPT and (best_score - runner_up) >= ParfumoEngine.SIBLING_MARGIN:
+            decision = "accept"
+        elif best_score >= ParfumoEngine.MANUAL_REVIEW:
+            decision = "manual_review"  # includes sibling-collision near-ties
+        else:
+            decision = "reject"
+        return ParfumoVerdict(decision, best_rec, best_score, runner_up, discovery, len(scored))
+
 
 def print_derived_intelligence(details: UnifiedDetails) -> None:
     """Optional, read-only display of the derived_metrics bundle.
