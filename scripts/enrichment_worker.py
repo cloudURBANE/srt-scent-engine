@@ -577,7 +577,65 @@ def resolve_candidate(
         if candidate:
             return candidate
 
+    # Parfumo fallback (§6.B): Fragrantica resolution found no URL. When enabled,
+    # try the Parfumo factual-field resolver before giving up. On accept this
+    # returns a candidate with no fg_url, resolver_source="parfumo_fallback", and
+    # the parsed ParfumoRecord stashed for fetch_payload to build a partial.
+    parfumo_candidate = _try_parfumo_fallback(scraper, job, debug=debug)
+    if parfumo_candidate is not None:
+        return parfumo_candidate
+
     raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
+
+
+def _try_parfumo_fallback(
+    scraper,
+    job: dict[str, Any],
+    *,
+    debug: bool = False,
+) -> engine.UnifiedFragrance | None:
+    """Run the Parfumo fallback resolver for a job with no Fragrantica URL.
+
+    Returns a Parfumo-sourced candidate on auto-accept, else None (manual_review,
+    reject, not_found, disabled, or any failure -- the FG path then raises
+    fg_url_missing_after_resolution as before). Never raises: a Parfumo failure
+    must not crash the job, only forgo the fallback.
+    """
+    if not engine.ParfumoEngine.enabled():
+        return None
+    house = str(job.get("house") or "").strip()
+    name = str(job.get("name") or "").strip()
+    if not house or not name:
+        return None  # Parfumo discovery needs both a house and a name.
+    year = _coerce_year(job.get("year"))
+    try:
+        verdict = _run_engine_call(
+            lambda: engine.ParfumoEngine.resolve(scraper, house, name, year),
+            debug=debug,
+        )
+    except Exception as exc:
+        print(f"  [parfumo] resolve failed: {exc}")
+        return None
+    print(
+        f"  [parfumo] {house} / {name!r} -> {verdict.decision} "
+        f"score={verdict.score:.3f} runner_up={verdict.runner_up:.3f} "
+        f"via={verdict.discovery} scored={verdict.candidates_scored}"
+    )
+    if verdict.decision != "accept" or verdict.record is None:
+        return None
+    rec = verdict.record
+    candidate = engine.UnifiedFragrance(
+        name=rec.name or name,
+        brand=rec.house or house,
+        year=rec.year or year,
+        frag_url="",
+        resolver_source="parfumo_fallback",
+        resolver_score=verdict.score,
+    )
+    # Side channel: the parsed record rides on the candidate so fetch_payload
+    # can build the partial Parfumo payload without re-fetching the page.
+    candidate.parfumo_record = rec
+    return candidate
 
 
 _FG_METRIC_GROUPS = (
@@ -616,6 +674,10 @@ def fetch_payload(
     detail_timeout: float,
     debug: bool = False,
 ) -> dict[str, Any]:
+    # Parfumo fallback (§6.C): the candidate carries a parsed Parfumo record and
+    # no fg_url. Build a partial payload from it instead of fetching FG details.
+    if candidate.resolver_source == "parfumo_fallback":
+        return _build_parfumo_payload(candidate, job)
     if not candidate.frag_url:
         raise WorkerError("fg_url_missing_after_resolution", retryable=False)
     candidate.frag_url = engine.FragranticaEngine.canonical_url(candidate.frag_url)
@@ -695,6 +757,64 @@ def fetch_payload(
     }
 
 
+def _build_parfumo_payload(
+    candidate: engine.UnifiedFragrance,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the partial /complete payload for a Parfumo-sourced candidate (§6.C).
+
+    No frag_cards and no FG detail fetch -- Parfumo has no FG status pyramid.
+    Factual fields ride in `notes` / `gender` / `year`; accords, rating, status,
+    and perfumers ride in `raw_identity`. quality_status is always "partial", and
+    the API completion path (§6.D) keys it by the canonical parfumo_url and never
+    lets it masquerade as FG-complete.
+    """
+    rec = getattr(candidate, "parfumo_record", None)
+    if rec is None:
+        raise WorkerError("parfumo_record_missing", retryable=False)
+
+    notes = {
+        "has_pyramid": bool(rec.notes_top or rec.notes_heart or rec.notes_base),
+        "top": list(rec.notes_top or []),
+        "heart": list(rec.notes_heart or []),
+        "base": list(rec.notes_base or []),
+        "flat": list(rec.notes_flat or []),
+    }
+    raw_identity = {
+        "name": candidate.name,
+        "house": candidate.brand,
+        "year": candidate.year,
+        "parfumo_url": rec.url,
+        "resolver_source": candidate.resolver_source,
+        "resolver_score": candidate.resolver_score,
+        "accords": list(rec.accords or []),
+        "rating": rec.rating,
+        "rating_count": rec.rating_count,
+        "status": rec.status,
+        "perfumers": list(rec.perfumers or []),
+        "job_key": job.get("job_key") if job else None,
+        "query": job.get("query") if job else None,
+    }
+    raw_identity = {k: v for k, v in raw_identity.items() if v not in ("", None, [])}
+
+    return {
+        "source": "parfumo",
+        "parfumo_url": rec.url,
+        "fg_url": None,
+        "name": candidate.name or None,
+        "house": candidate.brand or None,
+        "year": candidate.year or None,
+        "gender": rec.gender or None,
+        "image_url": None,
+        "schema_version": SCHEMA_VERSION,
+        "captured_at": _now_iso(),
+        "notes": notes,
+        "raw_identity": raw_identity,
+        # Parfumo is never FG-complete; persist as a terminal partial.
+        "quality_status": "partial",
+    }
+
+
 def process_job(
     client: ApiClient,
     scraper,
@@ -733,13 +853,17 @@ def process_job(
         )
         notes = payload.get("notes") or {}
         note_count = sum(len(notes.get(k) or []) for k in ("top", "heart", "base", "flat"))
-        print(
-            f"{index_label} Parsed frag_cards={len(payload['frag_cards'])} "
-            f"notes={note_count} reviews={len(payload['reviews'])}"
-        )
+        target_url = payload.get("fg_url") or payload.get("parfumo_url") or "?"
+        if payload.get("source") == "parfumo":
+            print(f"{index_label} Parsed (parfumo) notes={note_count} url={target_url}")
+        else:
+            print(
+                f"{index_label} Parsed frag_cards={len(payload.get('frag_cards') or {})} "
+                f"notes={note_count} reviews={len(payload.get('reviews') or [])}"
+            )
 
         if config.dry_run:
-            print(f"{index_label} Dry run: would upload cache for {payload['fg_url']}")
+            print(f"{index_label} Dry run: would upload cache for {target_url}")
             return True
 
         try:

@@ -1115,7 +1115,8 @@ def health() -> dict[str, bool]:
 
 def _read_proc_cmdline(pid: int) -> str:
     try:
-        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
         return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
@@ -4008,6 +4009,12 @@ def requeue_details(req: RequeueDetailRequest) -> dict[str, Any]:
 
 class CompleteJobRequest(BaseModel):
     fg_url: str | None = None
+    # Parfumo fallback (see PARFUMO_FALLBACK_RESOLVER_DESIGN.md §6.D). When the FG
+    # resolver finds no page, the worker may complete a job from Parfumo instead.
+    # Such a payload carries `source="parfumo"` + `parfumo_url`, no `fg_url`, and
+    # no `frag_cards` (Parfumo has no FG status pyramid). Factual fields ride in
+    # `notes` / `gender` / `year` plus `raw_identity` (accords/rating/status).
+    parfumo_url: str | None = None
     name: str | None = None
     house: str | None = None
     year: int | str | None = None
@@ -4134,6 +4141,86 @@ def _payload_identity(
     return {"name": name or None, "house": house or None, "year": year, "image_url": image_url or None}
 
 
+# --------------------------------------------------------------------------
+# Parfumo fallback completion (PARFUMO_FALLBACK_RESOLVER_DESIGN.md §6.D).
+# Local, minimal canonicalizer; promote to engine.ParfumoEngine when §6.A lands.
+# --------------------------------------------------------------------------
+_PARFUMO_HOST = "www.parfumo.com"
+_PARFUMO_PERFUME_PATH_RE = re.compile(r"^/(?:Perfumes|Parfums)/[^/]+/[^/?#]+$")
+
+
+def _canonical_parfumo_url(url: str) -> str:
+    """Normalize a public Parfumo perfume URL, or "" if it is not one.
+
+    Forces https + www host, drops query/fragment, strips the trailing slash.
+    The /Parfums alias is accepted (Parfumo's own og:url collapses it to
+    /Perfumes; the worker is expected to send that canonical form)."""
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text and text.lower().startswith(("parfumo.com", "www.parfumo.com")):
+        text = "https://" + text
+    parsed = urlparse(text)
+    host = (parsed.netloc or "").lower()
+    if host.endswith("parfumo.com"):
+        host = _PARFUMO_HOST
+    path = (parsed.path or "").rstrip("/")
+    if host != _PARFUMO_HOST or not _PARFUMO_PERFUME_PATH_RE.match(path):
+        return ""
+    return f"https://{host}{path}"
+
+
+def _parfumo_payload_has_facts(payload: CompleteJobRequest) -> bool:
+    """A Parfumo partial must carry at least one usable factual field, so we
+    never store an empty shell that looks enriched but shows nothing."""
+    notes = payload.notes if isinstance(payload.notes, dict) else {}
+    if any(notes.get(layer) for layer in ("top", "heart", "base", "flat")):
+        return True
+    raw = payload.raw_identity if isinstance(payload.raw_identity, dict) else {}
+    return bool(raw.get("accords") or payload.gender or payload.year)
+
+
+def _build_parfumo_cache_row(
+    payload: CompleteJobRequest, job: dict[str, Any], canonical_parfumo_url: str
+) -> dict[str, Any]:
+    """Cache row for a Parfumo-sourced partial.
+
+    Keyed by the canonical Parfumo URL in the `canonical_fg_url` slot (that
+    column is the cache's generic identity key; using the Parfumo URL keeps it
+    unique and never collides with a real FG URL). `frag_cards` is empty: the FG
+    hydration path requires quality_status='complete', so this `partial` is never
+    mistaken for FG status metrics -- it surfaces via the identity-keyed
+    fragrance_records aggregate, exactly like the Parfinity seed pipeline."""
+    raw_identity = dict(payload.raw_identity) if isinstance(payload.raw_identity, dict) else {}
+    raw_identity.setdefault("parfumo_url", canonical_parfumo_url)
+    name = str(payload.name or raw_identity.get("name") or job.get("name") or "").strip()
+    house = str(payload.house or raw_identity.get("house") or job.get("house") or "").strip()
+    if name and house:
+        name = engine.IdentityTools.strip_house_from_name(name, house)
+    image_url = str(payload.image_url or "").strip()
+    if image_url and not image_url.startswith(("http://", "https://")):
+        image_url = ""
+    return {
+        "canonical_fg_url": canonical_parfumo_url,
+        "name": name or None,
+        "house": house or None,
+        "year": _coerce_year(payload.year),
+        "gender": payload.gender or "Unisex / Unspecified",
+        "image_url": image_url or None,
+        "schema_version": payload.schema_version,
+        "source": "parfumo",
+        "captured_at": payload.captured_at,
+        # Empty on purpose -- Parfumo has no FG status pyramid.
+        "frag_cards": _json_for_db_blob({}),
+        "notes": _json_for_db_blob(payload.notes or {}),
+        "pros_cons": _json_for_db_blob([]),  # never ingest Parfumo review text
+        "reviews": _json_for_db_blob([]),
+        "raw_identity": _json_for_db_blob(raw_identity),
+        # Parfumo is never FG-complete; persist as a terminal partial.
+        "quality_status": "partial",
+    }
+
+
 @app.get("/api/enrichment/status")
 def enrichment_status() -> dict[str, Any]:
     """Public enrichment health signal: job counts by status. No job content."""
@@ -4206,6 +4293,37 @@ def complete_enrichment_job(
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
+
+    # Parfumo fallback path (§6.D): no fg_url, no frag_cards. Triggered only by an
+    # explicit source="parfumo" (NOT by the mere presence of parfumo_url), so a
+    # payload that happens to carry a parfumo_url cross-reference alongside real
+    # fg_url/frag_cards still takes the FG contract below and is never silently
+    # downgraded to a partial. The FG contract is untouched for every caller that
+    # does not opt in via source.
+    if (payload.source or "").strip().lower() == "parfumo":
+        canonical_parfumo = _canonical_parfumo_url(payload.parfumo_url or "")
+        if not canonical_parfumo:
+            raise HTTPException(
+                status_code=400,
+                detail="source=parfumo requires a public parfumo_url (/Perfumes or /Parfums).",
+            )
+        if not _parfumo_payload_has_facts(payload):
+            raise HTTPException(
+                status_code=400,
+                detail="Parfumo payload has no usable facts (notes/accords/gender/year); use /fail instead.",
+            )
+        cache_row = _build_parfumo_cache_row(payload, job, canonical_parfumo)
+        try:
+            updated = db.complete_job(job_id, cache_row)
+        except Exception as exc:
+            logger.exception("complete_job (parfumo) failed job_id=%s url=%s", job_id, canonical_parfumo)
+            raise HTTPException(
+                status_code=500,
+                detail=f"complete_job failed ({type(exc).__name__}): {exc}",
+            ) from exc
+        if not updated:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        return {"completed": True, "source": "parfumo", "parfumo_url": canonical_parfumo, "job": updated}
 
     fg_url = (payload.fg_url or job.get("fg_url") or "").strip()
     if not fg_url:
