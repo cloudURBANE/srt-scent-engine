@@ -378,3 +378,35 @@ def overlay_onto_details(details: engine.UnifiedDetails, entry: dict[str, Any]) 
         return applied
     details.frag_cards = {}
     return applied
+
+
+def iter_entries(path: Path | None = None) -> list[dict[str, Any]]:
+    """Return one cache entry per Parfinity product (deduped by handle)."""
+    indexes = load_cache(path)
+    seen_handles: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for key, entry in indexes["by_url_handle"].items():
+        if not str(key).startswith("http"):
+            continue
+        raw_identity = entry.get("raw_identity") or {}
+        if not isinstance(raw_identity, dict):
+            raw_identity = {}
+        handle = str(raw_identity.get("handle") or _handle_from_url_or_handle(str(key)))
+        if not handle or handle in seen_handles:
+            continue
+        seen_handles.add(handle)
+        entries.append(entry)
+    return entries
+
+
+def entries_by_brand(path: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Group Parfinity catalog entries by house/brand label."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in iter_entries(path):
+        house = str(entry.get("house") or "").strip()
+        if not house:
+            continue
+        grouped.setdefault(house, []).append(entry)
+    for products in grouped.values():
+        products.sort(key=lambda row: str(row.get("name") or "").lower())
+    return dict(sorted(grouped.items(), key=lambda item: item[0].lower()))

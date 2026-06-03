@@ -8335,7 +8335,7 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
         catalog_labels = IdentityTools.catalog_brand_keys("", query)
-        canonical_brand = IdentityTools.canonical_brand_query(query)
+        canonical_brand = getattr(args, "brand", "") or IdentityTools.canonical_brand_query(query)
         if canonical_brand:
             catalog_labels = IdentityTools.catalog_brand_keys(canonical_brand, query)
         if catalog_labels:
@@ -8367,13 +8367,10 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
                         )),
                     )
                     brand_results.append(frag)
-                    if len(brand_results) >= args.max_results:
-                        break
-                if len(brand_results) >= args.max_results:
-                    break
             brand_results = filter_relevant_candidates(query, brand_results)
             if brand_results:
-                return brand_results
+                brand_results.sort(key=lambda x: x.query_score, reverse=True)
+                return brand_results[:args.max_results]
         best = max((item.query_score for item in candidates), default=0.0)
         if best < QueryRepair.MIN_USEFUL_TOP_SCORE:
             print(f"{Y}[SYS] Ignored weak FG-only fallback rows; best match was only {int(best * 100)}%.{Z}")
