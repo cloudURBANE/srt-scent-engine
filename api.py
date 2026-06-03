@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -144,6 +145,8 @@ _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
 
 
 _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
+_DERIVED_METRICS_LOCK_GUARD = threading.Lock()
+_DERIVED_METRICS_LOCKS: dict[str, threading.Lock] = {}
 
 # Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
 # `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
@@ -3517,14 +3520,51 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
                     source=str(raw_review.get("source", "")),
                 )
             )
-    if details.derived_metrics is None:
+    return details
+
+
+def _derived_metrics_lock_for(record: dict[str, Any]) -> threading.Lock:
+    key = (
+        str(record.get("record_key") or "").strip()
+        or str(record.get("canonical_fg_url") or "").strip()
+        or str(record.get("bn_url") or "").strip()
+        or f"{record.get('house') or ''}|{record.get('name') or ''}|{record.get('year') or ''}"
+    )
+    with _DERIVED_METRICS_LOCK_GUARD:
+        lock = _DERIVED_METRICS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DERIVED_METRICS_LOCKS[key] = lock
+        return lock
+
+
+def _fill_missing_derived_metrics_once(
+    record: dict[str, Any],
+    selected: engine.UnifiedFragrance,
+    details: engine.UnifiedDetails,
+) -> None:
+    if details.derived_metrics is not None:
+        return
+    lock = _derived_metrics_lock_for(record)
+    with lock:
+        latest = db.lookup_fragrance_record(
+            canonical_fg_url=record.get("canonical_fg_url") or _canonical_fg_url(selected.frag_url),
+            bn_url=record.get("bn_url") or selected.bn_url or None,
+        )
+        latest_metrics = latest.get("derived_metrics") if latest else None
+        if latest_metrics is not None:
+            details.derived_metrics = latest_metrics
+            setattr(details, "_had_stored_derived_metrics", True)
+            return
         try:
             from derived_metrics_adapter import build_derived_metrics
 
             details.derived_metrics = build_derived_metrics(details)
         except Exception:
             details.derived_metrics = None
-    return details
+        if details.derived_metrics is not None:
+            _persist_detail_record(selected, details)
+            setattr(details, "_had_stored_derived_metrics", True)
 
 
 def _is_parfumo_fallback_detail(details: engine.UnifiedDetails) -> bool:
@@ -3559,7 +3599,9 @@ def _lookup_stored_detail(
         image_url = getattr(item, "image_url", "")
         if image_url and not getattr(selected, "image_url", ""):
             setattr(selected, "image_url", image_url)
-    return _details_from_fragrance_record(record)
+    details = _details_from_fragrance_record(record)
+    _fill_missing_derived_metrics_once(record, selected, details)
+    return details
 
 
 def _persist_detail_record(
@@ -4101,6 +4143,13 @@ def _require_db() -> None:
         )
 
 
+def _validate_job_id(job_id: str) -> str:
+    try:
+        return str(uuid.UUID(str(job_id or "")))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="job_id must be a UUID.") from exc
+
+
 def _require_worker_token(authorization: str | None = Header(default=None)) -> None:
     """FastAPI dependency: enforce the worker bearer token. Never logs the token.
 
@@ -4301,6 +4350,7 @@ def list_enrichment_jobs(
 def claim_enrichment_job(job_id: str) -> dict[str, Any]:
     """Protected: claim a pending (or stale-processing) job with a lease window."""
     _require_db()
+    job_id = _validate_job_id(job_id)
     try:
         result = db.claim_job(job_id)
     except Exception as exc:
@@ -4323,6 +4373,7 @@ def requeue_enrichment_job(
 ) -> dict[str, Any]:
     """Protected: force a lost/stale job back to pending."""
     _require_db()
+    job_id = _validate_job_id(job_id)
     priority = payload.priority if payload else 10
     updated = db.requeue_job(job_id, priority=priority)
     if not updated:
@@ -4343,6 +4394,7 @@ def complete_enrichment_job(
     fail endpoint, never recorded as a successful cache entry.
     """
     _require_db()
+    job_id = _validate_job_id(job_id)
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -4471,6 +4523,7 @@ def complete_enrichment_job(
 def fail_enrichment_job(job_id: str, payload: FailJobRequest) -> dict[str, Any]:
     """Protected: record a failure. Retryable returns the job to 'pending'."""
     _require_db()
+    job_id = _validate_job_id(job_id)
     updated = db.fail_job(job_id, payload.error, payload.retryable)
     if not updated:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -4486,6 +4539,7 @@ def ignore_enrichment_job(
 ) -> dict[str, Any]:
     """Protected: permanently retire a job (non-fragrance, bad identity, dead URL)."""
     _require_db()
+    job_id = _validate_job_id(job_id)
     note = payload.note or payload.reason
     updated = db.ignore_job(job_id, note)
     if not updated:
@@ -4500,6 +4554,7 @@ def ignore_enrichment_job(
 def patch_enrichment_job(job_id: str, payload: PatchJobRequest) -> dict[str, Any]:
     """Protected: set fg_url or identity hints on a pending/failed job."""
     _require_db()
+    job_id = _validate_job_id(job_id)
     fg_url = (payload.fg_url or "").strip() if payload.fg_url is not None else None
     if fg_url is not None:
         canonical = _canonical_fg_url(fg_url)

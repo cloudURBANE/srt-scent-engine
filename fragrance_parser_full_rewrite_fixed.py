@@ -488,6 +488,17 @@ class IdentityTools:
         "homme", "femme", "men", "women", "man", "woman", "male", "female",
         "unisex", "spray", "version", "original", "new", "intense",
     }
+    GENDER_TOKEN_GROUPS = {
+        "homme": "masculine",
+        "men": "masculine",
+        "man": "masculine",
+        "male": "masculine",
+        "femme": "feminine",
+        "women": "feminine",
+        "woman": "feminine",
+        "female": "feminine",
+    }
+    REQUIRED_NAME_MARKER_TOKENS = frozenset({"eau"})
     GENERIC_BRAND_SUFFIX_TOKENS = frozenset({
         "beauty",
         "cosmetics",
@@ -562,6 +573,20 @@ class IdentityTools:
         tokens = IdentityTools.tokenized_keep_stopwords(name)
         brand_tokens = IdentityTools.brand_tokens_keep_stopwords(brand) if brand else set()
         return {t for t in tokens if t not in brand_tokens}
+
+    @staticmethod
+    def gender_marker_groups(name: str, brand: str = "") -> set[str]:
+        tokens = IdentityTools.name_tokens_keep_stopwords(name, brand)
+        return {
+            IdentityTools.GENDER_TOKEN_GROUPS[token]
+            for token in tokens
+            if token in IdentityTools.GENDER_TOKEN_GROUPS
+        }
+
+    @staticmethod
+    def required_name_markers(name: str, brand: str = "") -> set[str]:
+        tokens = IdentityTools.name_tokens_keep_stopwords(name, brand)
+        return tokens & IdentityTools.REQUIRED_NAME_MARKER_TOKENS
         
     @staticmethod
     def identity_tokens(normalized: str) -> set[str]:
@@ -7591,9 +7616,14 @@ class Orchestrator:
             return 0.0
         jaccard, coverage = IdentityTools.token_overlap(a_name, b_name)
         exact_name = a_name == b_name
+        shorter = min(len(a_name), len(b_name))
+        longer = max(len(a_name), len(b_name))
+        subset_length_mismatch = coverage >= 0.92 and longer > shorter
 
         if exact_name:
             return 0.96
+        if subset_length_mismatch:
+            return 0.68
         if coverage >= 0.92:
             return 0.90
         if jaccard >= 0.75:
@@ -7601,6 +7631,39 @@ class Orchestrator:
         if jaccard >= 0.55 and coverage >= 0.70:
             return 0.74
         return 0.0
+
+    @staticmethod
+    def _has_required_name_marker_mismatch(
+        a_name_raw: str,
+        a_brand: str,
+        b_name_raw: str,
+        b_brand: str,
+    ) -> bool:
+        a_gender = IdentityTools.gender_marker_groups(a_name_raw, a_brand)
+        b_gender = IdentityTools.gender_marker_groups(b_name_raw, b_brand)
+        if a_gender != b_gender:
+            return True
+        a_markers = IdentityTools.required_name_markers(a_name_raw, a_brand)
+        b_markers = IdentityTools.required_name_markers(b_name_raw, b_brand)
+        return a_markers != b_markers
+
+    @staticmethod
+    def _safe_name_sequence_fallback(
+        a_name_raw: str,
+        b_name_raw: str,
+        a_name: set[str],
+        b_name: set[str],
+    ) -> float:
+        if not a_name or not b_name or len(a_name) != len(b_name):
+            return 0.0
+        only_a = a_name - b_name
+        only_b = b_name - a_name
+        for left in only_a:
+            for right in only_b:
+                if left != right and (left.startswith(right) or right.startswith(left)):
+                    return 0.0
+        ratio = IdentityTools.seq_ratio(a_name_raw, b_name_raw)
+        return ratio if ratio >= 0.86 else 0.0
 
     @staticmethod
     def identity_score(a: UnifiedFragrance | CatalogItem, b: UnifiedFragrance | CatalogItem) -> float:
@@ -7622,6 +7685,13 @@ class Orchestrator:
         
         a_name = IdentityTools.name_tokens(a_name_raw, getattr(a, "brand", ""))
         b_name = IdentityTools.name_tokens(b_name_raw, getattr(b, "brand", ""))
+        if Orchestrator._has_required_name_marker_mismatch(
+            a_name_raw,
+            getattr(a, "brand", ""),
+            b_name_raw,
+            getattr(b, "brand", ""),
+        ):
+            return 0.0
         
         score = 0.0
         if not a_name or not b_name:
@@ -7636,6 +7706,13 @@ class Orchestrator:
                     return 0.0
         else:
             score = Orchestrator._name_token_score(a_name, b_name)
+            if score == 0.0:
+                score = Orchestrator._safe_name_sequence_fallback(
+                    a_name_raw,
+                    b_name_raw,
+                    a_name,
+                    b_name,
+                )
             if score == 0.0:
                 return 0.0  # Hard Gate: Names do not strongly match
 
