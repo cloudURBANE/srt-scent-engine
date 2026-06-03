@@ -476,13 +476,18 @@ def get_status_counts() -> dict[str, int]:
 
 
 def list_jobs(status: str = "pending", limit: int = DEFAULT_JOB_LIMIT) -> list[dict[str, Any]]:
-    """Worker job list, newest-priority first. limit is clamped to MAX_JOB_LIMIT."""
+    """Worker job list, newest-priority first. limit is clamped to MAX_JOB_LIMIT.
+
+    Projects only the columns _job_to_dict surfaces (excludes the unused
+    metadata_json blob) -- the mobile dashboard polls this every 4s, so the
+    dropped column would otherwise be steady Supabase egress for nothing.
+    """
     limit = max(1, min(int(limit or DEFAULT_JOB_LIMIT), MAX_JOB_LIMIT))
     ctx, conn = _conn()
     try:
         rows = conn.execute(
-            """
-            SELECT * FROM enrichment_jobs
+            f"""
+            SELECT {_ENRICHMENT_JOB_COLUMNS} FROM enrichment_jobs
             WHERE status = %s
             ORDER BY priority DESC, last_requested_at ASC, created_at ASC
             LIMIT %s
@@ -498,7 +503,8 @@ def get_job(job_id: str) -> dict[str, Any] | None:
     ctx, conn = _conn()
     try:
         row = conn.execute(
-            "SELECT * FROM enrichment_jobs WHERE id = %s", (job_id,)
+            f"SELECT {_ENRICHMENT_JOB_COLUMNS} FROM enrichment_jobs WHERE id = %s",
+            (job_id,),
         ).fetchone()
         return _job_to_dict(row) if row else None
     finally:
@@ -1035,7 +1041,15 @@ def lookup_fragrance_record(
 
 
 def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]]:
-    """Search aggregate identities. Empty when storage is absent/disabled."""
+    """Search aggregate identities. Empty when storage is absent/disabled.
+
+    Selects only the light identity columns the search/candidate path actually
+    reads. The heavy raw payload columns (fg_raw_json, bn_raw_json,
+    derived_metrics_json) are deliberately excluded here: a cache-search sweep
+    returns up to 50 rows and the caller discards those blobs, so fetching them
+    is pure Supabase egress. Per-URL hydration uses lookup_fragrance_record,
+    which still does SELECT * for the full record.
+    """
     if not ENABLED:
         return []
     text = (query or "").strip()
@@ -1047,8 +1061,8 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
     try:
         if mode == "regex":
             rows = conn.execute(
-                """
-                SELECT *
+                f"""
+                SELECT {_FRAGRANCE_RECORD_SEARCH_COLUMNS}
                 FROM fragrance_records
                 WHERE name ~* %s
                    OR house ~* %s
@@ -1066,10 +1080,10 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
                 """,
                 (term, term, term, term, term, term, term, limit),
             ).fetchall()
-            return [_fragrance_record_to_dict(row) for row in rows]
+            return [_fragrance_record_search_to_dict(row) for row in rows]
         rows = conn.execute(
-            """
-            SELECT *
+            f"""
+            SELECT {_FRAGRANCE_RECORD_SEARCH_COLUMNS}
             FROM fragrance_records
             WHERE name ILIKE %s
                OR house ILIKE %s
@@ -1087,7 +1101,7 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
             """,
             (term, term, term, term, term, term, term, limit),
         ).fetchall()
-        return [_fragrance_record_to_dict(row) for row in rows]
+        return [_fragrance_record_search_to_dict(row) for row in rows]
     finally:
         ctx.__exit__(None, None, None)
 
@@ -1145,8 +1159,8 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
     try:
         if mode == "regex":
             rows = conn.execute(
-                """
-                SELECT * FROM fg_detail_cache
+                f"""
+                SELECT {_DETAIL_CACHE_SEARCH_COLUMNS} FROM fg_detail_cache
                 WHERE quality_status = 'complete'
                   AND (
                       name ~* %s
@@ -1168,8 +1182,8 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
             ).fetchall()
         else:
             rows = conn.execute(
-                """
-                SELECT * FROM fg_detail_cache
+                f"""
+                SELECT {_DETAIL_CACHE_SEARCH_COLUMNS} FROM fg_detail_cache
                 WHERE quality_status = 'complete'
                   AND (
                       name ILIKE %s
@@ -1189,28 +1203,7 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
                 """,
                 (term, term, term, term, term, term, term, limit),
             ).fetchall()
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            out.append(
-                {
-                    "canonical_fg_url": row["canonical_fg_url"],
-                    "name": row["name"],
-                    "house": row["house"],
-                    "year": row["year"],
-                    "image_url": row["image_url"],
-                    "schema_version": row["schema_version"],
-                    "source": row["source"],
-                    "captured_at": _iso(row["captured_at"]),
-                    "updated_at": _iso(row["updated_at"]),
-                    "quality_status": row["quality_status"],
-                    "frag_cards": row["frag_cards_json"],
-                    "notes": row["notes_json"],
-                    "pros_cons": row["pros_cons_json"],
-                    "reviews": row["reviews_json"],
-                    "raw_identity": row["raw_identity_json"],
-                }
-            )
-        return out
+        return [_detail_cache_search_to_dict(row) for row in rows]
     finally:
         ctx.__exit__(None, None, None)
 
@@ -1218,6 +1211,55 @@ def search_detail_cache(query: str, limit: int = 15) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Row serialization
 # ---------------------------------------------------------------------------
+
+
+# Light projections for the cache-search hot path. These exclude the heavy raw
+# payload columns the search/candidate builders never read, so a search sweep
+# (up to 50 rows, run twice per request) stops egressing full scraped blobs out
+# of Supabase. Per-URL hydration (lookup_*) still selects everything.
+_FRAGRANCE_RECORD_SEARCH_COLUMNS = (
+    "canonical_fg_url, bn_url, name, house, year, image_url, "
+    "search_json, source_captured_at, updated_at"
+)
+_DETAIL_CACHE_SEARCH_COLUMNS = (
+    "canonical_fg_url, name, house, year, image_url, raw_identity_json"
+)
+
+
+def _fragrance_record_search_to_dict(row: Any) -> dict[str, Any]:
+    """Light serializer matching _FRAGRANCE_RECORD_SEARCH_COLUMNS."""
+    if not row:
+        return {}
+    return {
+        "canonical_fg_url": row["canonical_fg_url"],
+        "bn_url": row["bn_url"],
+        "name": row["name"],
+        "house": row["house"],
+        "year": row["year"],
+        "image_url": row["image_url"],
+        "search": row["search_json"] or {},
+        "source_captured_at": _iso(row["source_captured_at"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def _detail_cache_search_to_dict(row: Any) -> dict[str, Any]:
+    """Light serializer matching _DETAIL_CACHE_SEARCH_COLUMNS.
+
+    raw_identity is kept because _cache_entry_identity / _cache_entry_image_url
+    fall back to it for name/house/year/image; the bulk columns (reviews_json,
+    notes_json, frag_cards_json, pros_cons_json) are dropped.
+    """
+    if not row:
+        return {}
+    return {
+        "canonical_fg_url": row["canonical_fg_url"],
+        "name": row["name"],
+        "house": row["house"],
+        "year": row["year"],
+        "image_url": row["image_url"],
+        "raw_identity": row["raw_identity_json"],
+    }
 
 
 def _fragrance_record_to_dict(row: Any) -> dict[str, Any]:
@@ -1698,6 +1740,15 @@ def _command_to_dict(row: Any) -> dict[str, Any]:
         "claimed_at": _iso(row["claimed_at"]),
         "completed_at": _iso(row["completed_at"]),
     }
+
+
+# Exactly the columns _job_to_dict reads -- excludes metadata_json so the
+# 4s-interval dashboard poll (list_jobs) stops egressing an unused JSONB blob.
+_ENRICHMENT_JOB_COLUMNS = (
+    "id, job_key, query, name, house, year, bn_url, fg_url, status, priority, "
+    "requested_count, failure_count, last_error, created_at, last_requested_at, "
+    "claimed_at, claim_expires_at, completed_at, failed_at, ignored_at"
+)
 
 
 def _job_to_dict(row: Any) -> dict[str, Any]:
