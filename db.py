@@ -48,7 +48,7 @@ _pool: Any = None  # psycopg_pool.ConnectionPool, lazily created in init_db()
 # Conservative limits for the worker list endpoint.
 DEFAULT_JOB_LIMIT = 20
 MAX_JOB_LIMIT = 100
-DEFAULT_DB_POOL_MAX_SIZE = 20
+DEFAULT_DB_POOL_MAX_SIZE = 40
 # Lease window for a claimed job; a processing job past this is reclaimable.
 DEFAULT_LEASE_SECONDS = 15 * 60
 # Hard cap on retryable failures before a job is forcibly demoted to 'failed'.
@@ -251,6 +251,14 @@ def _conn():
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _valid_uuid_text(value: Any) -> bool:
+    try:
+        uuid.UUID(str(value or ""))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +487,7 @@ def requeue_or_enqueue_job(
 
 def requeue_job(job_id: str, *, priority: int = 10) -> dict[str, Any] | None:
     """Force an existing job back to pending so a worker can refresh it."""
-    if not ENABLED:
+    if not ENABLED or not _valid_uuid_text(job_id):
         return None
     ctx, conn = _conn()
     try:
@@ -549,6 +557,8 @@ def list_jobs(status: str = "pending", limit: int = DEFAULT_JOB_LIMIT) -> list[d
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
+    if not _valid_uuid_text(job_id):
+        return None
     ctx, conn = _conn()
     try:
         row = conn.execute(
@@ -566,6 +576,8 @@ def claim_job(job_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> dict[s
     Claimable when status is 'pending', or 'processing' with an expired lease
     (the previous claimant died). Returns {"claimed": bool, ...}.
     """
+    if not _valid_uuid_text(job_id):
+        return {"claimed": False, "reason": "not_found"}
     lease_seconds = max(1, int(lease_seconds or DEFAULT_LEASE_SECONDS))
     ctx, conn = _conn()
     try:
@@ -624,6 +636,8 @@ def complete_job(job_id: str, cache_row: dict[str, Any]) -> dict[str, Any] | Non
     canonical_fg_url present). Returns the updated job dict, or None if the job
     id does not exist. Both writes commit together or not at all.
     """
+    if not _valid_uuid_text(job_id):
+        return None
     from psycopg.types.json import Json
 
     ctx, conn = _conn()
@@ -713,6 +727,8 @@ def fail_job(job_id: str, error: str, retryable: bool) -> dict[str, Any] | None:
     queue instead of permanently occupying the head — see
     idx_enrichment_jobs_status which orders by (priority DESC, last_requested_at).
     """
+    if not _valid_uuid_text(job_id):
+        return None
     ctx, conn = _conn()
     try:
         row = conn.execute(
@@ -739,6 +755,8 @@ def fail_job(job_id: str, error: str, retryable: bool) -> dict[str, Any] | None:
 
 def ignore_job(job_id: str, note: str | None) -> dict[str, Any] | None:
     """Permanently retire a job (non-fragrance query, bad identity, dead URL)."""
+    if not _valid_uuid_text(job_id):
+        return None
     ctx, conn = _conn()
     try:
         row = conn.execute(
@@ -772,7 +790,7 @@ def patch_job(
     and its failure counter is cleared so the worker can retry immediately.
     Processing / completed / ignored rows are left untouched (returns None).
     """
-    if not ENABLED:
+    if not ENABLED or not _valid_uuid_text(job_id):
         return None
     cleaned_fg = _clean_url(fg_url) if fg_url is not None else None
     cleaned_query = _clean_text(query) if query is not None else None
@@ -866,6 +884,50 @@ def _lock_fragrance_record_write(
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s::text))", (key,))
 
 
+def _merge_fragrance_record_keys(conn: Any, target_key: str, duplicate_key: str) -> None:
+    """Move duplicate aggregate data into target without violating URL indexes."""
+    if not target_key or not duplicate_key or target_key == duplicate_key:
+        return
+    conn.execute(
+        """
+        WITH duplicate AS (
+            DELETE FROM fragrance_records
+            WHERE record_key = %s
+            RETURNING *
+        )
+        UPDATE fragrance_records AS target
+        SET
+            canonical_fg_url = COALESCE(target.canonical_fg_url, duplicate.canonical_fg_url),
+            bn_url           = COALESCE(target.bn_url, duplicate.bn_url),
+            name             = COALESCE(target.name, duplicate.name),
+            house            = COALESCE(target.house, duplicate.house),
+            year             = COALESCE(target.year, duplicate.year),
+            gender           = COALESCE(target.gender, duplicate.gender),
+            image_url        = COALESCE(target.image_url, duplicate.image_url),
+            search_json      = COALESCE(duplicate.search_json, '{}'::jsonb) || COALESCE(target.search_json, '{}'::jsonb),
+            fg_raw_json      = COALESCE(duplicate.fg_raw_json, '{}'::jsonb) || COALESCE(target.fg_raw_json, '{}'::jsonb),
+            bn_raw_json      = COALESCE(duplicate.bn_raw_json, '{}'::jsonb) || COALESCE(target.bn_raw_json, '{}'::jsonb),
+            derived_metrics_json = COALESCE(target.derived_metrics_json, duplicate.derived_metrics_json),
+            source_captured_at = CASE
+                WHEN target.source_captured_at IS NULL THEN duplicate.source_captured_at
+                WHEN duplicate.source_captured_at IS NULL THEN target.source_captured_at
+                ELSE GREATEST(target.source_captured_at, duplicate.source_captured_at)
+            END,
+            metrics_computed_at = CASE
+                WHEN target.metrics_computed_at IS NULL THEN duplicate.metrics_computed_at
+                WHEN duplicate.metrics_computed_at IS NULL THEN target.metrics_computed_at
+                ELSE GREATEST(target.metrics_computed_at, duplicate.metrics_computed_at)
+            END,
+            first_seen_at = LEAST(target.first_seen_at, duplicate.first_seen_at),
+            last_seen_at = GREATEST(target.last_seen_at, duplicate.last_seen_at),
+            updated_at = now()
+        FROM duplicate
+        WHERE target.record_key = %s
+        """,
+        (duplicate_key, target_key),
+    )
+
+
 def _identity_search_term(query: str) -> tuple[str, str]:
     """Return the SQL match mode and bound term for identity search.
 
@@ -901,7 +963,7 @@ def _find_fragrance_record_key(
         bn_url=bn_url,
         fallback_key=fallback_key,
     )
-    row = conn.execute(
+    rows = conn.execute(
         """
         SELECT record_key
         FROM fragrance_records
@@ -914,7 +976,7 @@ def _find_fragrance_record_key(
                 WHEN %s::text IS NOT NULL AND bn_url = %s::text THEN 1
                 ELSE 2
             END
-        LIMIT 1
+        FOR UPDATE
         """,
         (
             canonical_fg_url,
@@ -927,8 +989,15 @@ def _find_fragrance_record_key(
             bn_url,
             bn_url,
         ),
-    ).fetchone()
-    return row["record_key"] if row else fallback_key
+    ).fetchall()
+    if not rows:
+        return fallback_key
+    record_key = rows[0]["record_key"]
+    for row in rows[1:]:
+        duplicate_key = row["record_key"]
+        if duplicate_key != record_key:
+            _merge_fragrance_record_keys(conn, record_key, duplicate_key)
+    return record_key
 
 
 def upsert_fragrance_search(row: dict[str, Any]) -> None:
