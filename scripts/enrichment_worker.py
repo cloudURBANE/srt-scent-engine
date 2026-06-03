@@ -539,6 +539,21 @@ def _print_engine_lines(captured_text: str) -> None:
             print(f"    {line.strip()}")
 
 
+def _accept_candidate(candidate: engine.UnifiedFragrance | None, job: dict[str, Any]) -> bool:
+    if not candidate:
+        return False
+    if candidate.resolver_source == "designer_catalog_brand_query":
+        job_name = str(job.get("name") or "")
+        job_house = str(job.get("house") or "")
+        probe = engine.UnifiedFragrance(name=job_name, brand=job_house, year="")
+        catalog_item = engine.CatalogItem(name=candidate.name, brand=candidate.brand, year="", url=candidate.frag_url)
+        score = engine.Orchestrator.identity_score(probe, catalog_item)
+        if score < engine.Orchestrator.CATALOG_ACCEPT:
+            print(f"  [resolve] rejected weak catalog match {candidate.frag_url} score={score:.2f}")
+            return False
+    return True
+
+
 def resolve_candidate(
     scraper,
     args: argparse.Namespace,
@@ -560,21 +575,27 @@ def resolve_candidate(
     if not query:
         raise WorkerError("fg_url_missing_after_resolution", "job has no fg_url or usable query", retryable=False)
 
+    house = job.get("house")
+    if house:
+        args.brand = house
+
     try:
         results = _search_candidates(scraper, query, args, debug=debug)
     except WorkerError:
         raise
 
     candidate = _first_linked_result(results)
-    if candidate:
+    if _accept_candidate(candidate, job):
         return candidate
 
     if not getattr(args, "external_search", False):
         enhanced_args = _build_engine_args(enhanced=True)
+        if house:
+            enhanced_args.brand = house
         print(f"  [resolve] retrying with enhanced search for {query!r}")
         results = _search_candidates(scraper, query, enhanced_args, debug=debug)
         candidate = _first_linked_result(results)
-        if candidate:
+        if _accept_candidate(candidate, job):
             return candidate
 
     # Parfumo fallback (§6.B): Fragrantica resolution found no URL. When enabled,

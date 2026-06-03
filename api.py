@@ -3471,7 +3471,9 @@ def _record_has_detail_payload(record: dict[str, Any]) -> bool:
         or bn_raw.get("description")
         or bn_raw.get("reviews")
         or fg_raw.get("frag_cards")
+        or fg_raw.get("notes")
         or fg_raw.get("reviews")
+        or fg_raw.get("raw_identity")
     )
 
 
@@ -3481,6 +3483,7 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
     notes_raw = fg_raw.get("notes") or bn_raw.get("notes") or {}
     if not isinstance(notes_raw, dict):
         notes_raw = {}
+    stored_derived_metrics = record.get("derived_metrics")
     details = engine.UnifiedDetails(
         notes=engine.NotesList(
             has_pyramid=bool(notes_raw.get("has_pyramid", False)),
@@ -3494,8 +3497,18 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
         bn_consensus=bn_raw.get("bn_consensus") or {},
         frag_cards=fg_raw.get("frag_cards") or {},
         pros_cons=list(fg_raw.get("pros_cons") or []),
-        derived_metrics=record.get("derived_metrics"),
+        derived_metrics=stored_derived_metrics,
     )
+    source = str(fg_raw.get("source") or "").strip().lower()
+    raw_identity = fg_raw.get("raw_identity") or {}
+    if not isinstance(raw_identity, dict):
+        raw_identity = {}
+    if source:
+        setattr(details, "source", source)
+    parfumo_url = str(raw_identity.get("parfumo_url") or "").strip()
+    if parfumo_url:
+        setattr(details, "parfumo_url", parfumo_url)
+    setattr(details, "_had_stored_derived_metrics", stored_derived_metrics is not None)
     for raw_review in list(bn_raw.get("reviews") or []) + list(fg_raw.get("reviews") or []):
         if isinstance(raw_review, dict) and raw_review.get("text"):
             details.reviews.append(
@@ -3504,14 +3517,21 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
                     source=str(raw_review.get("source", "")),
                 )
             )
-    stored_metrics = details.derived_metrics
-    try:
-        from derived_metrics_adapter import build_derived_metrics
+    if details.derived_metrics is None:
+        try:
+            from derived_metrics_adapter import build_derived_metrics
 
-        details.derived_metrics = build_derived_metrics(details)
-    except Exception:
-        details.derived_metrics = stored_metrics
+            details.derived_metrics = build_derived_metrics(details)
+        except Exception:
+            details.derived_metrics = None
     return details
+
+
+def _is_parfumo_fallback_detail(details: engine.UnifiedDetails) -> bool:
+    source = str(getattr(details, "source", "") or "").strip().lower()
+    if source == "parfumo":
+        return True
+    return bool(str(getattr(details, "parfumo_url", "") or "").strip())
 
 
 def _lookup_stored_detail(
@@ -3900,9 +3920,15 @@ def details(req: DetailRequest) -> dict[str, Any]:
         fragrantica_cache_source: str | None = None
         if _apply_fg_detail_cache_db(selected, stored_detail):
             fragrantica_cache_source = "db"
+        is_parfumo_fallback = _is_parfumo_fallback_detail(stored_detail)
         enrichment_status: str | None
         enrichment_requested_count: int | None = None
-        if fragrantica_cache_source == "db" or bool(stored_detail.frag_cards) or _fg_metrics_complete(stored_detail):
+        if (
+            fragrantica_cache_source == "db"
+            or is_parfumo_fallback
+            or bool(stored_detail.frag_cards)
+            or _fg_metrics_complete(stored_detail)
+        ):
             # Worker already wrote a result; do not re-enqueue even if FG itself
             # never publishes all 4 metric groups. fragrantica_metrics_complete in
             # source_coverage is the truthful signal for "all 4 groups present".
@@ -3913,13 +3939,17 @@ def details(req: DetailRequest) -> dict[str, Any]:
             if isinstance(enqueued, int) and enqueued > 0:
                 enrichment_requested_count = enqueued
         engine.heal_missing_gender_and_year(selected, stored_detail)
-        _persist_detail_record(selected, stored_detail)
+        if (
+            not is_parfumo_fallback
+            and not getattr(stored_detail, "_had_stored_derived_metrics", False)
+        ):
+            _persist_detail_record(selected, stored_detail)
         return _details_to_dict(
             selected,
             stored_detail,
             fragrantica_cached=bool(stored_detail.frag_cards),
             fragrantica_cache_source=fragrantica_cache_source
-            or ("aggregate_db" if stored_detail.frag_cards else None),
+            or ("aggregate_db" if stored_detail.frag_cards or is_parfumo_fallback else None),
             enrichment_status=enrichment_status,
             enrichment_requested_count=enrichment_requested_count,
         )
@@ -4200,6 +4230,26 @@ def _build_parfumo_cache_row(
     image_url = str(payload.image_url or "").strip()
     if image_url and not image_url.startswith(("http://", "https://")):
         image_url = ""
+    notes = payload.notes if isinstance(payload.notes, dict) else {}
+    temp_details = engine.UnifiedDetails(
+        notes=engine.NotesList(
+            has_pyramid=bool(notes.get("has_pyramid")),
+            top=list(notes.get("top") or []),
+            heart=list(notes.get("heart") or []),
+            base=list(notes.get("base") or []),
+            flat=list(notes.get("flat") or []),
+        ),
+        gender=payload.gender or "Unisex / Unspecified",
+        description="",
+        frag_cards={},
+        pros_cons=[],
+    )
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        derived_metrics = build_derived_metrics(temp_details)
+    except Exception:
+        derived_metrics = None
     return {
         "canonical_fg_url": canonical_parfumo_url,
         "name": name or None,
@@ -4216,6 +4266,9 @@ def _build_parfumo_cache_row(
         "pros_cons": _json_for_db_blob([]),  # never ingest Parfumo review text
         "reviews": _json_for_db_blob([]),
         "raw_identity": _json_for_db_blob(raw_identity),
+        "derived_metrics": _json_for_db_blob(derived_metrics)
+        if derived_metrics is not None
+        else None,
         # Parfumo is never FG-complete; persist as a terminal partial.
         "quality_status": "partial",
     }
@@ -4369,6 +4422,12 @@ def complete_enrichment_job(
         pros_cons=payload.pros_cons or [],
     )
     engine.heal_missing_gender_and_year(temp_selected, temp_details)
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        temp_details.derived_metrics = build_derived_metrics(temp_details)
+    except Exception:
+        temp_details.derived_metrics = None
     gender = temp_details.gender
     year = _coerce_year(temp_selected.year)
 
@@ -4387,6 +4446,9 @@ def complete_enrichment_job(
         "pros_cons": _json_for_db_blob(payload.pros_cons or []),
         "reviews": _json_for_db_blob(payload.reviews or []),
         "raw_identity": _json_for_db_blob(payload.raw_identity or {}),
+        "derived_metrics": _json_for_db_blob(temp_details.derived_metrics)
+        if temp_details.derived_metrics is not None
+        else None,
         "quality_status": quality,
     }
     try:

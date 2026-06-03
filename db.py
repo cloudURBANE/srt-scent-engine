@@ -48,6 +48,7 @@ _pool: Any = None  # psycopg_pool.ConnectionPool, lazily created in init_db()
 # Conservative limits for the worker list endpoint.
 DEFAULT_JOB_LIMIT = 20
 MAX_JOB_LIMIT = 100
+DEFAULT_DB_POOL_MAX_SIZE = 20
 # Lease window for a claimed job; a processing job past this is reclaimable.
 DEFAULT_LEASE_SECONDS = 15 * 60
 # Hard cap on retryable failures before a job is forcibly demoted to 'failed'.
@@ -58,6 +59,14 @@ MAX_RETRYABLE_FAILURES = 10
 
 VALID_JOB_STATUSES = ("pending", "processing", "completed", "failed", "ignored")
 VALID_QUALITY_STATUSES = ("complete", "partial", "bad_parse", "stale")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +226,13 @@ def init_db() -> None:
         return
     from psycopg_pool import ConnectionPool
 
-    _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, kwargs={"autocommit": True})
+    max_size = _env_int("DB_POOL_MAX_SIZE", DEFAULT_DB_POOL_MAX_SIZE)
+    _pool = ConnectionPool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=max_size,
+        kwargs={"autocommit": True},
+    )
     with _pool.connection() as conn:
         conn.execute(_SCHEMA)
 
@@ -272,14 +287,18 @@ def _upsert_completed_fragrance_record(
         "source": cache_row.get("source", "worker"),
         "quality_status": cache_row.get("quality_status", "complete"),
     }
+    derived_metrics = cache_row.get("derived_metrics")
     conn.execute(
         """
         INSERT INTO fragrance_records
             (record_key, canonical_fg_url, bn_url, name, house, year,
-             gender, image_url, fg_raw_json, source_captured_at,
+             gender, image_url, fg_raw_json, derived_metrics_json,
+             source_captured_at, metrics_computed_at,
              first_seen_at, last_seen_at, updated_at)
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+             now(), CASE WHEN %s THEN now() ELSE NULL END,
+             now(), now(), now())
         ON CONFLICT (record_key) DO UPDATE SET
             canonical_fg_url = COALESCE(EXCLUDED.canonical_fg_url, fragrance_records.canonical_fg_url),
             bn_url           = COALESCE(EXCLUDED.bn_url, fragrance_records.bn_url),
@@ -289,9 +308,12 @@ def _upsert_completed_fragrance_record(
             gender           = COALESCE(EXCLUDED.gender, fragrance_records.gender),
             image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
             fg_raw_json      = EXCLUDED.fg_raw_json,
-            derived_metrics_json = NULL,
+            derived_metrics_json = EXCLUDED.derived_metrics_json,
             source_captured_at = now(),
-            metrics_computed_at = NULL,
+            metrics_computed_at = CASE
+                WHEN EXCLUDED.derived_metrics_json IS NOT NULL THEN now()
+                ELSE NULL
+            END,
             last_seen_at     = now(),
             updated_at       = now()
         """,
@@ -305,6 +327,8 @@ def _upsert_completed_fragrance_record(
             _clean_text(cache_row.get("gender")),
             _clean_text(cache_row.get("image_url")),
             Json(fg_raw),
+            Json(derived_metrics) if derived_metrics is not None else None,
+            derived_metrics is not None,
         ),
     )
 
@@ -322,8 +346,9 @@ def enqueue_job(
     """Upsert a job by job_key. A duplicate request bumps counters, never dupes.
 
     On conflict the row's status is left untouched (a pending job stays pending,
-    a completed job is not resurrected) except that an `ignored` job is never
-    touched at all -- it was deliberately retired.
+    a completed job is not resurrected) except that a `failed` job is returned
+    to `pending`, and an `ignored` job is never touched at all -- it was
+    deliberately retired.
 
     Returns the row's resulting `requested_count` -- 1 on first insert, then
     incremented once per duplicate request -- so callers can surface a
@@ -345,6 +370,30 @@ def enqueue_job(
                     (%s, %s, %s, %s, %s, %s, %s, %s,
                      'pending', 1, now(), now())
                 ON CONFLICT (job_key) DO UPDATE SET
+                    status            = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN 'pending'
+                        ELSE enrichment_jobs.status
+                    END,
+                    failure_count     = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN 0
+                        ELSE enrichment_jobs.failure_count
+                    END,
+                    last_error        = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN NULL
+                        ELSE enrichment_jobs.last_error
+                    END,
+                    failed_at         = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN NULL
+                        ELSE enrichment_jobs.failed_at
+                    END,
+                    claimed_at        = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN NULL
+                        ELSE enrichment_jobs.claimed_at
+                    END,
+                    claim_expires_at  = CASE
+                        WHEN enrichment_jobs.status = 'failed' THEN NULL
+                        ELSE enrichment_jobs.claim_expires_at
+                    END,
                     requested_count   = enrichment_jobs.requested_count + 1,
                     last_requested_at = now(),
                     query             = COALESCE(EXCLUDED.query, enrichment_jobs.query),
@@ -800,6 +849,23 @@ def _clean_url(value: Any) -> str | None:
     return text
 
 
+def _lock_fragrance_record_write(
+    conn: Any, *, canonical_fg_url: str | None, bn_url: str | None, fallback_key: str
+) -> None:
+    """Serialize aggregate writes for the same known identity within a txn."""
+    keys = {
+        key
+        for key in (
+            f"fg:{canonical_fg_url}" if canonical_fg_url else "",
+            f"bn:{bn_url}" if bn_url else "",
+            f"record:{fallback_key}" if fallback_key else "",
+        )
+        if key
+    }
+    for key in sorted(keys):
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s::text))", (key,))
+
+
 def _identity_search_term(query: str) -> tuple[str, str]:
     """Return the SQL match mode and bound term for identity search.
 
@@ -829,6 +895,12 @@ def _fragrance_record_key(row: dict[str, Any]) -> str:
 def _find_fragrance_record_key(
     conn: Any, *, canonical_fg_url: str | None, bn_url: str | None, fallback_key: str
 ) -> str:
+    _lock_fragrance_record_write(
+        conn,
+        canonical_fg_url=canonical_fg_url,
+        bn_url=bn_url,
+        fallback_key=fallback_key,
+    )
     row = conn.execute(
         """
         SELECT record_key
