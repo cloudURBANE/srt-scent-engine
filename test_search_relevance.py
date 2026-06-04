@@ -2,6 +2,8 @@
 """Plain-script checks for search result relevance filtering."""
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sys
 from pathlib import Path
@@ -430,6 +432,31 @@ def test_details_request_recovers_identity_from_legacy_blank_id() -> None:
     )
 
 
+def test_details_request_repairs_legacy_poisoned_id() -> None:
+    print("Legacy poisoned id recovery checks:")
+    payload = {
+        "n": "Dolce and gabana Q",
+        "b": "Dolce",
+        "y": "",
+        "bn": "",
+        "fg": "https://www.fragrantica.com/perfume/Dolce-Gabbana/Q-83367.html",
+    }
+    token = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    selected = api._candidate_from_request(api.DetailRequest(id=token))
+    check(
+        "details request repairs legacy poisoned id name",
+        selected.name == "Q",
+        f"{selected.name} | {selected.brand}",
+    )
+    check(
+        "details request repairs legacy poisoned id house",
+        selected.brand == "Dolce Gabbana",
+        f"{selected.name} | {selected.brand}",
+    )
+
+
 def test_details_request_accepts_source_prefixed_id() -> None:
     print("Source-prefixed id recovery checks:")
     url = "https://www.fragrantica.com/perfume/Le-Labo/Santal-33-12201.html"
@@ -701,6 +728,7 @@ def main() -> int:
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_details_request_recovers_identity_from_legacy_blank_id()
+    test_details_request_repairs_legacy_poisoned_id()
     test_details_request_accepts_source_prefixed_id()
     test_details_request_rejects_bad_source_prefixed_id()
     test_details_request_rejects_app_catalog_ids_clearly()
