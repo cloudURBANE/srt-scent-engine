@@ -3791,9 +3791,9 @@ def _candidate_from_request(req: DetailRequest) -> engine.UnifiedFragrance:
         selected = _candidate_from_source_url(req.source_url or "")
 
     identity = _recover_candidate_identity(selected)
-    if _identity_needs_recovery(selected.name) and identity["name"]:
+    if identity["name"] and identity["name"] != selected.name:
         selected.name = identity["name"]
-    if _identity_needs_recovery(selected.brand) and identity["house"]:
+    if identity["house"] and identity["house"] != selected.brand:
         selected.brand = identity["house"]
     return selected
 
