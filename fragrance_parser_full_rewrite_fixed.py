@@ -1079,6 +1079,36 @@ class QueryRepair:
 
     CANONICAL_DOMAIN_HINTS = ("fragrantica.", "basenotes.", "parfumo.")
 
+    # --- French elision repair -------------------------------------------
+    # Source URL slugs destroy the apostrophe in elided French articles, and
+    # the two canonical sources break it in two *different* shapes:
+    #   * Fragrantica keeps the particle as its own hyphen segment, so
+    #     ``Terre-d-Hermes`` -> tokens ``["Terre", "d", "Hermes"]`` (a bare
+    #     single-letter ``d``/``l`` token).
+    #   * Basenotes glues the particle to the next word, so
+    #     ``terre-dhermes`` -> ``["Terre", "Dhermes"]`` (no boundary at all).
+    # Both collapse the canonical "Terre d'Hermes". A bare ``d``/``l`` token is
+    # unambiguously an elided article, so that pass is fully general. The glued
+    # pass is deliberately a *curated* lookup -- a blanket "consonant+vowel ->
+    # apostrophe" rule would corrupt real words that legitimately start that way
+    # (Dune, Lancome, Lalique, Lacoste, Loewe, Lubin, Diptyque...).
+    ELISION_PARTICLES = ("d", "l")
+    # Elision only occurs before a vowel or mute h ("L'Eau", "d'Hermes",
+    # "l'Exclusif") -- never before a consonant, so a bare "L" in "L Red Tea
+    # Vetiver" (a line initial) must be left alone.
+    ELISION_VOWELS = tuple("aeiouyhàâäéèêëíîïóôöúûü")
+    ELISION_GLUED = {
+        "dhermes": "d'Hermes",
+        "dorsay": "d'Orsay",
+        "dissey": "d'Issey",
+        "lhomme": "L'Homme",
+        "leau": "L'Eau",
+        "lair": "L'Air",
+        "linterdit": "L'Interdit",
+        "linstant": "L'Instant",
+        "lartisan": "L'Artisan",
+    }
+
 
     @staticmethod
     def _anchor_fallback_query(query: str) -> str:
@@ -1491,12 +1521,51 @@ class QueryRepair:
             return (text or "").replace("+", " ")
 
     @staticmethod
+    def restore_elision(text: str) -> str:
+        """Re-insert French elision apostrophes stripped by source URL slugs.
+
+        Handles both broken shapes (see ``ELISION_PARTICLES`` / ``ELISION_GLUED``):
+          * standalone particle -- ``Terre d Hermes`` -> ``Terre d'Hermes``,
+            ``L Homme`` -> ``L'Homme`` (general; a bare ``d``/``l`` is always an
+            elided article);
+          * glued particle -- ``Terre Dhermes`` -> ``Terre d'Hermes`` (curated
+            lookup, so legitimate ``Dune``/``Lancome`` style names are untouched).
+        The particle is capitalised only when it opens the name (``L'Homme``)
+        and kept lowercase mid-name (``Terre d'Hermes``).
+        """
+        if not text:
+            return text
+        tokens = text.split()
+        out: list[str] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            low = tok.lower()
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if (
+                low in QueryRepair.ELISION_PARTICLES
+                and nxt[:1].lower() in QueryRepair.ELISION_VOWELS
+            ):
+                particle = low.upper() if not out else low
+                out.append(f"{particle}'{nxt}")
+                i += 2
+                continue
+            if low in QueryRepair.ELISION_GLUED:
+                out.append(QueryRepair.ELISION_GLUED[low])
+                i += 1
+                continue
+            out.append(tok)
+            i += 1
+        return " ".join(out)
+
+    @staticmethod
     def _slug_to_words(text: str) -> str:
         text = QueryRepair._safe_unquote(text)
         text = re.sub(r"[_\-]+", " ", text)
         text = re.sub(r"\.\d+.*$", "", text)
         text = re.sub(r"\b\d{4,}\b", " ", text)
-        return QueryRepair.clean_suggestion(text)
+        text = QueryRepair.clean_suggestion(text)
+        return QueryRepair.restore_elision(text)
 
     @staticmethod
     def _edit_distance(a: str, b: str, limit: int | None = None) -> int:
@@ -2614,6 +2683,176 @@ class Http:
         return None
 
 
+def _parse_key_list(*raw_values: str | None) -> list[str]:
+    """Split comma/whitespace/newline-delimited env values into unique keys."""
+    seen: set[str] = set()
+    keys: list[str] = []
+    for raw in raw_values:
+        if not raw:
+            continue
+        for piece in re.split(r"[\s,]+", raw):
+            k = piece.strip()
+            if k and k not in seen:
+                seen.add(k)
+                keys.append(k)
+    return keys
+
+
+def _mask_key(key: str) -> str:
+    if len(key) <= 8:
+        return "********"
+    return f"{key[:4]}…{key[-4:]}"
+
+
+class SerperKeyPool:
+    """Rotating pool of Serper.dev API keys with automatic failover.
+
+    Mirrors the Express api-server's key pool so the Python engine survives
+    free-tier exhaustion without a redeploy: set ``SERPER_API_KEYS`` to a
+    comma-separated list (the legacy singular ``SERPER_API_KEY`` is merged in).
+    One key is drained until it returns 401/402/403 (retired for the process) or
+    429 (short cooldown, retried later), then the pool rotates to the next key.
+
+    The *key list* is read fresh from the environment on every access so tests
+    that swap ``SERPER_API_KEY`` at runtime keep working; per-key retire/cooldown
+    *state* persists in memory. Hot-added keys (via ``add_keys``) live alongside
+    the env keys. Thread-safe — the engine resolves on a ThreadPoolExecutor.
+    """
+
+    def __init__(self, rate_limit_cooldown_s: float = 60.0) -> None:
+        self._lock = threading.Lock()
+        self._status: dict[str, dict] = {}
+        self._extra: list[str] = []
+        self._cursor = 0
+        self._cooldown_s = rate_limit_cooldown_s
+
+    def _current_keys(self) -> list[str]:
+        env_keys = _parse_key_list(
+            os.environ.get("SERPER_API_KEYS"),
+            os.environ.get("SERPER_API_KEY"),
+        )
+        out: list[str] = []
+        seen: set[str] = set()
+        for k in (*env_keys, *self._extra):
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
+    def _status_for(self, key: str) -> dict:
+        st = self._status.get(key)
+        if st is None:
+            st = {"retired": False, "cooldown_until": 0.0, "failures": 0, "label": _mask_key(key)}
+            self._status[key] = st
+        return st
+
+    def _usable(self, key: str, now: float) -> bool:
+        st = self._status.get(key)
+        if st is None:
+            return True
+        return (not st["retired"]) and st["cooldown_until"] <= now
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._current_keys())
+
+    def available_count(self, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        with self._lock:
+            return sum(1 for k in self._current_keys() if self._usable(k, now))
+
+    def acquire(self, exclude: set[str]) -> tuple[str, str] | None:
+        """Return ``(key, masked_label)`` for the next usable key not in
+        ``exclude``, advancing the round-robin cursor; ``None`` when none left."""
+        now = time.time()
+        with self._lock:
+            keys = self._current_keys()
+            n = len(keys)
+            if n == 0:
+                return None
+            start = self._cursor % n
+            for i in range(n):
+                idx = (start + i) % n
+                key = keys[idx]
+                if key in exclude or not self._usable(key, now):
+                    continue
+                self._cursor = idx  # stick here (drain this key) until it fails
+                return key, self._status_for(key)["label"]
+            return None
+
+    def report(self, key: str, action: str) -> None:
+        """``action``: 'success' | 'retire' | 'cooldown' | 'skip'."""
+        with self._lock:
+            st = self._status_for(key)
+            if action == "success":
+                st["failures"] = 0
+                return
+            st["failures"] += 1
+            if action == "retire":
+                st["retired"] = True
+            elif action == "cooldown":
+                st["cooldown_until"] = time.time() + self._cooldown_s
+            # 'skip': transient — no penalty.
+
+    def add_keys(self, raw_keys: list[str]) -> int:
+        """Hot-add keys at runtime (no redeploy). Re-adding a retired/cooling key
+        revives it. Returns the number of keys newly added or revived."""
+        added = 0
+        now = time.time()
+        with self._lock:
+            current = set(self._current_keys())
+            for raw in raw_keys:
+                k = (raw or "").strip()
+                if not k:
+                    continue
+                st = self._status.get(k)
+                if k not in current:
+                    self._extra.append(k)
+                    added += 1
+                if st and (st["retired"] or st["cooldown_until"] > now):
+                    st["retired"] = False
+                    st["cooldown_until"] = 0.0
+                    st["failures"] = 0
+                    if k in current:
+                        added += 1
+        return added
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._lock:
+            keys = self._current_keys()
+            entries = []
+            for k in keys:
+                st = self._status_for(k)
+                status = "retired" if st["retired"] else ("cooling_down" if st["cooldown_until"] > now else "available")
+                entries.append({
+                    "key": st["label"],
+                    "status": status,
+                    "failures": st["failures"],
+                    "cooldown_ms_remaining": 0 if st["retired"] else max(0, int((st["cooldown_until"] - now) * 1000)),
+                })
+            return {
+                "name": "serper",
+                "size": len(keys),
+                "available": sum(1 for k in keys if self._usable(k, now)),
+                "keys": entries,
+            }
+
+
+_SERPER_POOL: SerperKeyPool | None = None
+_SERPER_POOL_LOCK = threading.Lock()
+
+
+def serper_key_pool() -> SerperKeyPool:
+    """Process-wide Serper key pool (lazily created)."""
+    global _SERPER_POOL
+    if _SERPER_POOL is None:
+        with _SERPER_POOL_LOCK:
+            if _SERPER_POOL is None:
+                _SERPER_POOL = SerperKeyPool()
+    return _SERPER_POOL
+
+
 class SerperClient:
     """Structured Fragrantica URL discovery via Serper.dev.
 
@@ -2642,11 +2881,12 @@ class SerperClient:
 
     @staticmethod
     def enabled() -> bool:
-        key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
-        if not key:
-            return False
         provider = (os.environ.get("SERP_API_PROVIDER", "") or "serper").strip().lower()
-        return provider == "serper"
+        if provider != "serper":
+            return False
+        # Active when at least one key is configured (SERPER_API_KEYS pool or the
+        # legacy singular SERPER_API_KEY, both read by the pool).
+        return serper_key_pool().size() > 0
 
     @staticmethod
     def _cache_key(query: str) -> str:
@@ -2654,12 +2894,49 @@ class SerperClient:
 
     @classmethod
     def _post(cls, query: str, timeout: float, site: str = "fragrantica.com/perfume") -> dict:
-        key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
-        headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+        """POST to Serper, rotating through the key pool on quota/limit errors.
+
+        Drains one key until it returns 401/402/403 (retire) or 429 (cooldown),
+        then transparently retries with the next usable key. Raises on a fully
+        exhausted pool or a non-key upstream error — callers degrade to ``[]``.
+        """
+        pool = serper_key_pool()
         body = {"q": f"{query} site:{site}"}
-        res = requests.post(cls.ENDPOINT, json=body, headers=headers, timeout=timeout)
-        res.raise_for_status()
-        return res.json() or {}
+        tried: set[str] = set()
+        last_error: Exception | None = None
+        while True:
+            lease = pool.acquire(tried)
+            if lease is None:
+                break
+            key, _label = lease
+            tried.add(key)
+            headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+            try:
+                res = requests.post(cls.ENDPOINT, json=body, headers=headers, timeout=timeout)
+            except requests.RequestException as exc:
+                # Transient (timeout/connection) — don't penalize the key; try next.
+                pool.report(key, "skip")
+                last_error = exc
+                continue
+            # Fakes/stubs in tests omit status_code; treat missing as success.
+            status = int(getattr(res, "status_code", 200) or 200)
+            if status == 200:
+                pool.report(key, "success")
+                return res.json() or {}
+            if status in (401, 402, 403):
+                pool.report(key, "retire")
+                last_error = requests.HTTPError(f"Serper key unauthorized/out of credits ({status})")
+                continue
+            if status == 429:
+                pool.report(key, "cooldown")
+                last_error = requests.HTTPError("Serper rate limited (429)")
+                continue
+            # Other non-2xx: not a key-quota problem — surface it.
+            res.raise_for_status()
+            return res.json() or {}
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Serper: no usable API keys")
 
     @classmethod
     def search_fragrantica_urls(
