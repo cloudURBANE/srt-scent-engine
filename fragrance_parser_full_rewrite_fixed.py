@@ -7802,8 +7802,16 @@ class ParfumoEngine:
 
     @staticmethod
     def brand_crawl_enabled() -> bool:
-        """Last-resort brand crawl is independently gated and off by default."""
-        return _env_truthy("PARFUMO_BRAND_CRAWL_ENABLED")
+        """Last-resort brand crawl gate.
+
+        An explicit PARFUMO_BRAND_CRAWL_ENABLED value wins. Otherwise, fall back
+        to the capped crawl when Parfumo fallback is enabled but Serper is not
+        configured, so no-FG jobs still have a discovery path.
+        """
+        explicit = os.environ.get("PARFUMO_BRAND_CRAWL_ENABLED")
+        if explicit is not None:
+            return _env_truthy("PARFUMO_BRAND_CRAWL_ENABLED")
+        return ParfumoEngine.enabled() and not SerperClient.enabled()
 
     # ------------------------------------------------------------------
     # URL shape / canonicalization
@@ -8017,12 +8025,38 @@ class ParfumoEngine:
         live Parfumo pages resolve() will fetch+score per job."""
         urls = SerperClient.search_parfumo_urls(house, name)
         if urls:
-            return urls[: ParfumoEngine.MAX_CANDIDATES], "serper"
+            return ParfumoEngine._rank_discovered_urls(urls, house, name)[: ParfumoEngine.MAX_CANDIDATES], "serper"
         if ParfumoEngine.brand_crawl_enabled():
             crawled = ParfumoEngine._discover_via_brand_crawl(scraper, house)
             if crawled:
-                return crawled[: ParfumoEngine.MAX_CANDIDATES], "brand_crawl"
+                return ParfumoEngine._rank_discovered_urls(crawled, house, name)[: ParfumoEngine.MAX_CANDIDATES], "brand_crawl"
         return [], "serper"
+
+    @staticmethod
+    def _rank_discovered_urls(urls: list[str], house: str, name: str) -> list[str]:
+        """Prefer Parfumo URLs whose slug contains the requested name tokens.
+
+        Brand pages are paginated grids, so the true match can be well after the
+        first handful of house URLs. Rank before applying MAX_CANDIDATES so a
+        late but obvious slug hit, like Clive Christian Miami Poolside, is still
+        fetched and scored.
+        """
+        name_tokens = IdentityTools.name_tokens_keep_stopwords(name, house)
+        if not name_tokens:
+            name_tokens = IdentityTools.tokenized_keep_stopwords(name)
+        if not name_tokens:
+            return urls
+
+        def rank(item: tuple[int, str]) -> tuple[int, int, int]:
+            idx, url = item
+            path = urlparse(ParfumoEngine.canonical_url(url)).path
+            path_text = re.sub(r"[_\-/]+", " ", path)
+            path_tokens = IdentityTools.tokenized_keep_stopwords(path_text)
+            overlap = len(name_tokens & path_tokens)
+            all_tokens = int(name_tokens.issubset(path_tokens))
+            return (-all_tokens, -overlap, idx)
+
+        return [url for _, url in sorted(enumerate(urls), key=rank)]
 
     # ------------------------------------------------------------------
     # Identity match -- reuse the engine's scorer (no parallel logic)
@@ -8031,18 +8065,45 @@ class ParfumoEngine:
     def _normalize_parfumo_name(name: str) -> str:
         """Parfumo embeds flanker markers in parens, e.g. 'Ramz Lattafa (Gold)'.
         Flatten to 'Ramz Lattafa Gold' so the engine tokenizer sees the words."""
-        return TextSanitizer.clean(re.sub(r"[()]", " ", name or ""))
+        cleaned = TextSanitizer.clean(name)
+        if not cleaned:
+            return ""
+        cleaned = re.sub(
+            r"\(\s*(?:eau\s+de\s+toilette|eau\s+de\s+parfum|eau\s+de\s+cologne|"
+            r"extrait\s+de\s+parfum|extrait|parfum|edt|edp|edc)\s*\)",
+            " ",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(r"[()]", " ", cleaned)
+        return TextSanitizer.clean(cleaned)
+
+    @staticmethod
+    def _parfumo_name_variants(name: str) -> list[str]:
+        normalized = ParfumoEngine._normalize_parfumo_name(name)
+        if not normalized:
+            return []
+        variants = [normalized]
+        m = re.match(r"^(.+?\bcollection)\s*[-–—:]\s*(.+)$", normalized, flags=re.I)
+        if m:
+            suffix = TextSanitizer.clean(m.group(2))
+            if suffix and suffix not in variants:
+                variants.append(suffix)
+        return variants
 
     @staticmethod
     def score_record(probe_house: str, probe_name: str, probe_year: str, rec: ParfumoRecord) -> float:
         probe = UnifiedFragrance(name=probe_name, brand=probe_house, year=probe_year or "")
-        catalog = CatalogItem(
-            name=ParfumoEngine._normalize_parfumo_name(rec.name),
-            brand=rec.house,
-            year=rec.year or "",
-            url=rec.url,
-        )
-        return Orchestrator.identity_score(probe, catalog)
+        best = 0.0
+        for name_variant in ParfumoEngine._parfumo_name_variants(rec.name):
+            catalog = CatalogItem(
+                name=name_variant,
+                brand=rec.house,
+                year=rec.year or "",
+                url=rec.url,
+            )
+            best = max(best, Orchestrator.identity_score(probe, catalog))
+        return best
 
     @staticmethod
     def resolve(

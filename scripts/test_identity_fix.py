@@ -2,6 +2,7 @@
 """Regression checks for enrichment resolver identity matching."""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,26 @@ def score(a_name: str, a_brand: str, b_name: str, b_brand: str) -> float:
     return engine.Orchestrator.identity_score(
         UF(name=a_name, brand=a_brand, year=""),
         CI(name=b_name, brand=b_brand, year="", url=""),
+    )
+
+
+def parfumo_score(
+    a_name: str,
+    a_brand: str,
+    b_name: str,
+    b_brand: str | None = None,
+    year: str = "",
+) -> float:
+    return engine.ParfumoEngine.score_record(
+        a_brand,
+        a_name,
+        year,
+        engine.ParfumoRecord(
+            url="https://www.parfumo.com/Perfumes/_test_/identity",
+            name=b_name,
+            house=b_brand or a_brand,
+            year=year,
+        ),
     )
 
 
@@ -59,6 +80,65 @@ def main() -> int:
 
     sauvage = score("Sauvage", "Dior", "Sauvage", "Christian Dior")
     check("Dior Sauvage alias still matches Christian Dior", sauvage >= accept, f"score={sauvage:.4f}")
+
+    ck_parfumo = parfumo_score("Man", "Calvin Klein", "Calvin Klein Man (Eau de Toilette)")
+    check(
+        "Parfumo concentration suffix does not block CK Man",
+        ck_parfumo >= engine.ParfumoEngine.ACCEPT,
+        f"score={ck_parfumo:.4f}",
+    )
+
+    miami = parfumo_score(
+        "Miami Poolside",
+        "Clive Christian",
+        "The Art Of Travel Collection - Miami Poolside",
+        "Clive Christian",
+        "2019",
+    )
+    check(
+        "Parfumo collection prefix does not block Miami Poolside",
+        miami >= engine.ParfumoEngine.ACCEPT,
+        f"score={miami:.4f}",
+    )
+
+    ranked = engine.ParfumoEngine._rank_discovered_urls(
+        [
+            "https://www.parfumo.com/Perfumes/Clive_Christian/xxi-art-deco-blonde-amber",
+            "https://www.parfumo.com/Perfumes/Clive_Christian/1872-masculine",
+            "https://www.parfumo.com/Perfumes/Clive_Christian/the-art-of-travel-collection-miami-poolside",
+        ],
+        "Clive Christian",
+        "Miami Poolside",
+    )
+    check(
+        "Parfumo brand-crawl ranks late Miami slug before unrelated house URLs",
+        ranked[0].endswith("/the-art-of-travel-collection-miami-poolside"),
+    )
+
+    saved_env = {
+        "PARFUMO_FALLBACK_ENABLED": os.environ.get("PARFUMO_FALLBACK_ENABLED"),
+        "PARFUMO_BRAND_CRAWL_ENABLED": os.environ.get("PARFUMO_BRAND_CRAWL_ENABLED"),
+        "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
+    }
+    try:
+        os.environ["PARFUMO_FALLBACK_ENABLED"] = "1"
+        os.environ.pop("PARFUMO_BRAND_CRAWL_ENABLED", None)
+        os.environ.pop("SERPER_API_KEY", None)
+        check(
+            "Parfumo brand crawl defaults on when fallback is enabled and Serper is missing",
+            engine.ParfumoEngine.brand_crawl_enabled() is True,
+        )
+        os.environ["PARFUMO_BRAND_CRAWL_ENABLED"] = "0"
+        check(
+            "Explicit Parfumo brand-crawl disable is respected",
+            engine.ParfumoEngine.brand_crawl_enabled() is False,
+        )
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     if _FAILURES:
         print("\nFailures:")
