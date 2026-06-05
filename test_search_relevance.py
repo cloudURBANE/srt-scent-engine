@@ -177,11 +177,13 @@ def test_api_strong_cache_precheck_does_not_bypass_brand_only() -> None:
 
 def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
     print("API BN-only cache safety checks:")
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
     old_record_search = api.db.search_fragrance_records
     old_detail_search = api.db.search_detail_cache
     old_search_once = api.engine.search_once
     calls = {"live": 0}
     try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
         api.db.search_fragrance_records = lambda query, limit=15: [
             {
                 "name": "1861 Naxos",
@@ -207,6 +209,7 @@ def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
         api.engine.search_once = live_search
         response = api.search(q="xerjoff naxos")
     finally:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
         api.db.search_fragrance_records = old_record_search
         api.db.search_detail_cache = old_detail_search
         api.engine.search_once = old_search_once
@@ -224,6 +227,56 @@ def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
         "diagnostics record disqualified cache fast path",
         "precheck_missing_fragrantica_url" in diagnostics.get("cache_fast_path_disqualified", []),
         str(diagnostics),
+    )
+
+
+def test_api_identity_cache_rescues_bn_only_precheck() -> None:
+    print("API BN-only plus identity-cache rescue checks:")
+    old_cache = api._ARGS.fg_cache
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    try:
+        api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "1861 Naxos",
+                "house": "Xerjoff",
+                "bn_url": "https://basenotes.com/fragrances/1861-naxos-by-xerjoff.26145750",
+                "canonical_fg_url": "",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            }
+        ]
+        api.db.search_detail_cache = lambda query, limit=15: []
+
+        def fail_live_search(*args, **kwargs):
+            raise AssertionError("live search should be skipped when identity cache has a Fragrantica URL")
+
+        api.engine.search_once = fail_live_search
+        response = api.search(q="xerjoff naxos")
+    finally:
+        api._ARGS.fg_cache = old_cache
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    results = response.get("results", [])
+    check("identity cache labels source", diagnostics.get("cache_source") == "identity", str(diagnostics))
+    check("identity cache labels precheck", diagnostics.get("cache_mode") == "precheck", str(diagnostics))
+    check(
+        "identity cache restores Naxos Fragrantica URL",
+        any(
+            row.get("source_url") == "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html"
+            for row in results
+        ),
+        str(results),
     )
 
 
@@ -764,6 +817,7 @@ def main() -> int:
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_api_bn_only_cache_hit_does_not_skip_live_search()
+    test_api_identity_cache_rescues_bn_only_precheck()
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()

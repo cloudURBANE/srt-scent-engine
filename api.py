@@ -757,15 +757,25 @@ def _strong_cache_search(
         ("json", _json_cache_search),
         ("identity", _identity_cache_search),
     )
+    first_candidates: list[engine.UnifiedFragrance] = []
+    first_source: str | None = None
     for source, search_fn in searches:
         candidates = [
             item
             for item in search_fn(query, limit, min_score)
             if _strong_cache_candidate_ok(query, item, min_score)
         ]
-        if candidates:
+        if not candidates:
+            continue
+        if not first_candidates:
+            first_candidates = candidates
+            first_source = source
+        # A BN-only aggregate hit is not enough to bypass live search. Keep
+        # checking lower tiers so a shipped/durable Fragrantica identity match
+        # can still rescue exact queries in production.
+        if any(bool(item.frag_url) for item in candidates):
             return candidates, source
-    return [], None
+    return first_candidates, first_source
 
 
 def _can_skip_live_search_with_cache(candidates: list[engine.UnifiedFragrance]) -> bool:

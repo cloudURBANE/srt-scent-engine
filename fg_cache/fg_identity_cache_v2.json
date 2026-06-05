@@ -1215,6 +1215,22 @@
     "url": "https://www.fragrantica.com/perfume/Xerjoff/Alexandria-Orientale-51439.html",
     "year": "2018"
   },
+  "xerjoff|1861 naxos|": {
+    "brand": "Xerjoff",
+    "name": "1861 Naxos",
+    "source": "seeded_fg_identity_cache",
+    "updated_at": 1780673700,
+    "url": "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html",
+    "year": "2015"
+  },
+  "xerjoff|1861 naxos|2015": {
+    "brand": "Xerjoff",
+    "name": "1861 Naxos",
+    "source": "seeded_fg_identity_cache",
+    "updated_at": 1780673700,
+    "url": "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html",
+    "year": "2015"
+  },
   "le labo|santal 33|": {
     "brand": "Le Labo",
     "name": "Santal 33",
