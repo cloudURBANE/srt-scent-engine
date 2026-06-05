@@ -1109,6 +1109,7 @@ def _details_to_dict(
 class DetailRequest(BaseModel):
     id: str | None = None
     source_url: str | None = None
+    recover_incomplete: bool = False
 
 
 class RequeueDetailRequest(DetailRequest):
@@ -3913,6 +3914,39 @@ def _requeue_enrichment_job(
         return None
 
 
+def _recover_incomplete_enrichment_job(
+    selected: engine.UnifiedFragrance, req: DetailRequest
+) -> dict[str, Any] | None:
+    """Idempotently reopen a terminal incomplete detail job for recovery."""
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return None
+    try:
+        job_key = (
+            _canonical_fg_url(selected.frag_url)
+            or _canonical_fg_url(selected.bn_url)
+            or _identity_job_key(selected)
+        )
+        if not job_key:
+            return None
+        return db.recover_or_enqueue_job(
+            job_key=job_key,
+            query=(req.source_url or None),
+            name=selected.name or None,
+            house=selected.brand or None,
+            year=_coerce_year(selected.year),
+            bn_url=selected.bn_url or None,
+            fg_url=selected.frag_url or None,
+            priority=10,
+        )
+    except Exception:
+        logger.exception(
+            "recover_or_enqueue_job failed name=%s house=%s",
+            selected.name,
+            selected.brand,
+        )
+        return None
+
+
 def _fetch_parfinity_detail_bundle(
     selected: engine.UnifiedFragrance,
     detail_timeout: float,
@@ -3984,16 +4018,30 @@ def details(req: DetailRequest) -> dict[str, Any]:
         is_parfumo_fallback = _is_parfumo_fallback_detail(stored_detail)
         enrichment_status: str | None
         enrichment_requested_count: int | None = None
-        if (
+        worker_result_complete = (
             fragrantica_cache_source == "db"
             or is_parfumo_fallback
             or bool(stored_detail.frag_cards)
             or _fg_metrics_complete(stored_detail)
-        ):
+        )
+        if worker_result_complete:
             # Worker already wrote a result; do not re-enqueue even if FG itself
             # never publishes all 4 metric groups. fragrantica_metrics_complete in
             # source_coverage is the truthful signal for "all 4 groups present".
             enrichment_status = "completed"
+            if (
+                req.recover_incomplete
+                and not is_parfumo_fallback
+                and not _fg_metrics_complete(stored_detail)
+            ):
+                job_state = _recover_incomplete_enrichment_job(selected, req)
+                (
+                    recovery_status,
+                    recovery_requested_count,
+                ) = _enrichment_status_from_job_state(job_state)
+                if recovery_status != "unavailable":
+                    enrichment_status = recovery_status
+                    enrichment_requested_count = recovery_requested_count
         else:
             job_state = _enqueue_enrichment_job(selected, req)
             (

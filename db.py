@@ -537,6 +537,108 @@ def requeue_or_enqueue_job(
         ctx.__exit__(None, None, None)
 
 
+def recover_or_enqueue_job(
+    *,
+    job_key: str,
+    query: str | None,
+    name: str | None,
+    house: str | None,
+    year: int | None,
+    bn_url: str | None,
+    fg_url: str | None,
+    priority: int = 10,
+) -> dict[str, Any] | None:
+    """Idempotently make an incomplete detail job available to the worker.
+
+    Background recovery must not reset active worker leases or inflate retry
+    counts. Pending/processing rows are returned as-is; deliberately ignored
+    rows stay retired; other terminal rows reopen.
+    """
+    if not ENABLED:
+        return None
+    ctx, conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            INSERT INTO enrichment_jobs
+                (id, job_key, query, name, house, year, bn_url, fg_url,
+                 status, priority, requested_count, created_at, last_requested_at)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s,
+                 'pending', %s, 1, now(), now())
+            ON CONFLICT (job_key) DO UPDATE SET
+                status            = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.status
+                    ELSE 'pending'
+                END,
+                priority          = GREATEST(enrichment_jobs.priority, EXCLUDED.priority),
+                requested_count   = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.requested_count
+                    ELSE enrichment_jobs.requested_count + 1
+                END,
+                last_requested_at = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.last_requested_at
+                    ELSE now()
+                END,
+                query             = COALESCE(EXCLUDED.query, enrichment_jobs.query),
+                name              = COALESCE(EXCLUDED.name, enrichment_jobs.name),
+                house             = COALESCE(EXCLUDED.house, enrichment_jobs.house),
+                year              = COALESCE(EXCLUDED.year, enrichment_jobs.year),
+                bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url),
+                fg_url            = COALESCE(EXCLUDED.fg_url, enrichment_jobs.fg_url),
+                claimed_at        = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.claimed_at
+                    ELSE NULL
+                END,
+                claim_expires_at  = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.claim_expires_at
+                    ELSE NULL
+                END,
+                completed_at      = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.completed_at
+                    ELSE NULL
+                END,
+                failed_at         = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.failed_at
+                    ELSE NULL
+                END,
+                ignored_at        = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.ignored_at
+                    ELSE NULL
+                END,
+                last_error        = CASE
+                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    THEN enrichment_jobs.last_error
+                    ELSE NULL
+                END
+            WHERE enrichment_jobs.status <> 'ignored'
+            RETURNING *
+            """,
+            (
+                str(uuid.uuid4()),
+                job_key,
+                query,
+                name,
+                house,
+                year,
+                bn_url,
+                fg_url,
+                max(0, int(priority or 0)),
+            ),
+        ).fetchone()
+        return _job_to_dict(row) if row else None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def requeue_job(job_id: str, *, priority: int = 10) -> dict[str, Any] | None:
     """Force an existing job back to pending so a worker can refresh it."""
     if not ENABLED or not _valid_uuid_text(job_id):
