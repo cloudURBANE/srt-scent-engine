@@ -297,6 +297,39 @@ def test_q_relevance_is_word_based() -> None:
     check("D&G shorthand query matches canonical house", short_alias_score > 0.85, f"{short_alias_score:.3f}")
 
 
+def test_brand_alias_query_keeps_house_catalog() -> None:
+    print("Brand-alias query relevance checks:")
+    rows = [
+        candidate("Maison Francis Kurkdjian", "Baccarat Rouge 540"),
+        candidate("Maison Francis Kurkdjian", "Grand Soir"),
+        candidate("Creed", "Aventus"),
+        candidate("Dior", "Sauvage"),
+    ]
+    filtered = engine.filter_relevant_candidates("MFK", rows)
+    houses = {item.brand for item in filtered}
+    names = {item.name for item in filtered}
+    check("MFK keeps Maison Francis Kurkdjian results", houses == {"Maison Francis Kurkdjian"}, str(houses))
+    check("MFK keeps the whole MFK catalog, not one row", {"Baccarat Rouge 540", "Grand Soir"} <= names, str(names))
+    check("MFK does not leak into other houses", "Creed" not in houses and "Dior" not in houses, str(houses))
+
+    # A brand-only alias query must score the house strongly, while a
+    # brand+fragrance query must still discriminate within the house.
+    mfk_score = engine.IdentityTools.relevance_score(
+        "MFK", candidate("Maison Francis Kurkdjian", "Baccarat Rouge 540")
+    )
+    check("MFK alias scores the house strongly", mfk_score >= 0.99, f"{mfk_score:.3f}")
+    specific = engine.filter_relevant_candidates(
+        "dior sauvage",
+        [candidate("Dior", "J'adore Eau de Toilette 2002"), candidate("Dior", "Sauvage")],
+    )
+    specific_names = [item.name for item in specific]
+    check(
+        "brand-only boost does not relax brand+name filtering",
+        specific_names == ["Sauvage"],
+        str(specific_names),
+    )
+
+
 def test_dolce_gabbana_identity_recovery_and_persistence() -> None:
     print("Dolce Gabbana poisoned-row prevention checks:")
     row = engine.UnifiedFragrance(
@@ -722,6 +755,7 @@ def main() -> int:
     test_serper_caches_responses()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
+    test_brand_alias_query_keeps_house_catalog()
     test_dolce_gabbana_identity_recovery_and_persistence()
     test_poisoned_db_records_are_filtered()
     test_short_db_search_uses_word_boundaries()
