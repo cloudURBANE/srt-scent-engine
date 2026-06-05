@@ -177,11 +177,13 @@ def test_api_strong_cache_precheck_does_not_bypass_brand_only() -> None:
 
 def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
     print("API BN-only cache safety checks:")
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
     old_record_search = api.db.search_fragrance_records
     old_detail_search = api.db.search_detail_cache
     old_search_once = api.engine.search_once
     calls = {"live": 0}
     try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
         api.db.search_fragrance_records = lambda query, limit=15: [
             {
                 "name": "1861 Naxos",
@@ -207,6 +209,7 @@ def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
         api.engine.search_once = live_search
         response = api.search(q="xerjoff naxos")
     finally:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
         api.db.search_fragrance_records = old_record_search
         api.db.search_detail_cache = old_detail_search
         api.engine.search_once = old_search_once
@@ -224,6 +227,56 @@ def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
         "diagnostics record disqualified cache fast path",
         "precheck_missing_fragrantica_url" in diagnostics.get("cache_fast_path_disqualified", []),
         str(diagnostics),
+    )
+
+
+def test_api_identity_cache_rescues_bn_only_precheck() -> None:
+    print("API BN-only plus identity-cache rescue checks:")
+    old_cache = api._ARGS.fg_cache
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    try:
+        api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "1861 Naxos",
+                "house": "Xerjoff",
+                "bn_url": "https://basenotes.com/fragrances/1861-naxos-by-xerjoff.26145750",
+                "canonical_fg_url": "",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            }
+        ]
+        api.db.search_detail_cache = lambda query, limit=15: []
+
+        def fail_live_search(*args, **kwargs):
+            raise AssertionError("live search should be skipped when identity cache has a Fragrantica URL")
+
+        api.engine.search_once = fail_live_search
+        response = api.search(q="xerjoff naxos")
+    finally:
+        api._ARGS.fg_cache = old_cache
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    results = response.get("results", [])
+    check("identity cache labels source", diagnostics.get("cache_source") == "identity", str(diagnostics))
+    check("identity cache labels precheck", diagnostics.get("cache_mode") == "precheck", str(diagnostics))
+    check(
+        "identity cache restores Naxos Fragrantica URL",
+        any(
+            row.get("source_url") == "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html"
+            for row in results
+        ),
+        str(results),
     )
 
 
@@ -595,10 +648,13 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
 class _FakeSerperResponse:
     """Minimal stand-in for a requests.Response from google.serper.dev."""
 
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, status_code: int = 200) -> None:
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise engine.requests.HTTPError(f"HTTP {self.status_code}")
         return None
 
     def json(self) -> dict:
@@ -618,13 +674,16 @@ def _set_serper_env(enabled: bool) -> dict[str, str | None]:
     saved = {
         "SERP_API_PROVIDER": os.environ.get("SERP_API_PROVIDER"),
         "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
+        "SERPER_API_KEYS": os.environ.get("SERPER_API_KEYS"),
     }
     if enabled:
         os.environ["SERP_API_PROVIDER"] = "serper"
         os.environ["SERPER_API_KEY"] = "test-key-not-real"
+        os.environ.pop("SERPER_API_KEYS", None)
     else:
         os.environ.pop("SERP_API_PROVIDER", None)
         os.environ.pop("SERPER_API_KEY", None)
+        os.environ.pop("SERPER_API_KEYS", None)
     return saved
 
 
@@ -668,6 +727,51 @@ def test_serper_enabled_with_key_only() -> None:
         check("SerperClient.enabled() with key only", engine.SerperClient.enabled() is True, "")
     finally:
         _restore_serper_env(saved)
+
+
+def test_serper_rotates_after_exhausted_key() -> None:
+    print("Serper key-pool rotation checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=False)
+    old_post = engine.requests.post
+    old_pool = engine._SERPER_POOL
+    calls: list[str | None] = []
+    try:
+        os.environ["SERP_API_PROVIDER"] = "serper"
+        os.environ["SERPER_API_KEYS"] = "test-exhausted-key,test-live-key"
+        engine._SERPER_POOL = engine.SerperKeyPool(rate_limit_cooldown_s=1.0)
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            api_key = (headers or {}).get("X-API-KEY")
+            calls.append(api_key)
+            if api_key == "test-exhausted-key":
+                return _FakeSerperResponse({}, status_code=402)
+            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+
+        engine.requests.post = fake_post
+        urls = engine.SerperClient.search_fragrantica_urls("pool rotation")
+        snapshot = engine.serper_key_pool().snapshot()
+    finally:
+        engine.requests.post = old_post
+        engine._SERPER_POOL = old_pool
+        _restore_serper_env(saved)
+
+    check(
+        "exhausted key is followed by the next pool key",
+        calls == ["test-exhausted-key", "test-live-key"],
+        str(calls),
+    )
+    check(
+        "rotation still returns Serper results",
+        urls[:1] == ["https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"],
+        str(urls),
+    )
+    key_statuses = [entry["status"] for entry in snapshot.get("keys", [])]
+    check(
+        "exhausted key is retired in diagnostics",
+        any(status == "retired" for status in key_statuses),
+        str(snapshot),
+    )
 
 
 def test_serper_disabled_without_env() -> None:
@@ -786,11 +890,13 @@ def main() -> int:
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_api_bn_only_cache_hit_does_not_skip_live_search()
+    test_api_identity_cache_rescues_bn_only_precheck()
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()
     test_serper_disabled_without_env()
     test_serper_enabled_with_key_only()
+    test_serper_rotates_after_exhausted_key()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
     test_strip_house_from_name()
