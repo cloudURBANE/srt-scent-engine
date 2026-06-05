@@ -4049,30 +4049,26 @@ def details(req: DetailRequest) -> dict[str, Any]:
         is_parfumo_fallback = _is_parfumo_fallback_detail(stored_detail)
         enrichment_status: str | None
         enrichment_requested_count: int | None = None
-        worker_result_complete = (
-            fragrantica_cache_source == "db"
-            or is_parfumo_fallback
-            or bool(stored_detail.frag_cards)
-            or _fg_metrics_complete(stored_detail)
+        metrics_complete = _fg_metrics_complete(stored_detail)
+        has_stored_fg_payload = (
+            fragrantica_cache_source == "db" or bool(stored_detail.frag_cards)
         )
-        if worker_result_complete:
-            # Worker already wrote a result; do not re-enqueue even if FG itself
-            # never publishes all 4 metric groups. fragrantica_metrics_complete in
-            # source_coverage is the truthful signal for "all 4 groups present".
+        if is_parfumo_fallback or metrics_complete:
             enrichment_status = "completed"
-            if (
-                req.recover_incomplete
-                and not is_parfumo_fallback
-                and not _fg_metrics_complete(stored_detail)
-            ):
-                job_state = _recover_incomplete_enrichment_job(selected, req)
-                (
-                    recovery_status,
-                    recovery_requested_count,
-                ) = _enrichment_status_from_job_state(job_state)
-                if recovery_status != "unavailable":
-                    enrichment_status = recovery_status
-                    enrichment_requested_count = recovery_requested_count
+        elif has_stored_fg_payload:
+            # A previous worker/cache result exists, but one or more of the 4
+            # Fragrantica status-derived metric groups is still missing. Reopen
+            # the durable job by default so normal detail views can heal it.
+            job_state = _recover_incomplete_enrichment_job(selected, req)
+            (
+                recovery_status,
+                recovery_requested_count,
+            ) = _enrichment_status_from_job_state(job_state)
+            if recovery_status == "unavailable":
+                enrichment_status = "completed"
+            else:
+                enrichment_status = recovery_status
+                enrichment_requested_count = recovery_requested_count
         else:
             job_state = _enqueue_enrichment_job(selected, req)
             (
