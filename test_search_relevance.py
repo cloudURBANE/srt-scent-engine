@@ -361,6 +361,46 @@ def test_dolce_gabbana_identity_recovery_and_persistence() -> None:
     )
 
 
+def test_house_echo_poison_is_suppressed() -> None:
+    print("House-echo poison suppression checks:")
+    check("Creed/Creed Suicide is detected as house echo", api._identity_is_house_echo("Creed", "Creed Suicide"), "")
+    check("self-named house echo is detected", api._identity_is_house_echo("creed", "creed"), "")
+    check("real fragrance is not flagged", not api._identity_is_house_echo("Aventus", "Creed"), "")
+    check("multi-word name is not flagged", not api._identity_is_house_echo("Santal 33", "Le Labo"), "")
+
+    poison = engine.UnifiedFragrance(name="Creed", brand="Creed Suicide", year="")
+    real = engine.UnifiedFragrance(name="Aventus", brand="Creed", year="")
+    check("poison row is denied a display identity", not api._candidate_has_display_identity(poison), "")
+    check("real row keeps its display identity", api._candidate_has_display_identity(real), "")
+    check(
+        "poison row is not persisted to the aggregate cache",
+        not api._search_identity_is_safe_to_store("Creed", "Creed Suicide", poison),
+        "",
+    )
+
+
+def test_brand_only_query_gets_catalog_labels() -> None:
+    print("Brand-only designer-catalog fallback checks:")
+    # The bug: a single-token house we don't alias produced no catalog labels,
+    # so the designer-catalog breadth crawl never ran when Serper/native-FG
+    # discovery came back empty.
+    check(
+        "single-token brand query yields catalog labels",
+        engine.IdentityTools.catalog_brand_keys("creed") == ["creed"],
+        str(engine.IdentityTools.catalog_brand_keys("creed")),
+    )
+    check(
+        "treating the query as a name still yields nothing (the original bug)",
+        engine.IdentityTools.catalog_brand_keys("", "creed") == [],
+        str(engine.IdentityTools.catalog_brand_keys("", "creed")),
+    )
+    check(
+        "multi-token brand+name query is left to the name path",
+        engine.IdentityTools.catalog_brand_keys("", "dior sauvage") == [],
+        str(engine.IdentityTools.catalog_brand_keys("", "dior sauvage")),
+    )
+
+
 def test_poisoned_db_records_are_filtered() -> None:
     print("Poisoned DB record filtering checks:")
     old_record_search = api.db.search_fragrance_records
@@ -757,6 +797,8 @@ def main() -> int:
     test_q_relevance_is_word_based()
     test_brand_alias_query_keeps_house_catalog()
     test_dolce_gabbana_identity_recovery_and_persistence()
+    test_house_echo_poison_is_suppressed()
+    test_brand_only_query_gets_catalog_labels()
     test_poisoned_db_records_are_filtered()
     test_short_db_search_uses_word_boundaries()
     test_search_serialization_recovers_fragrantica_identity()
