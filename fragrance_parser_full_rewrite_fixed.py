@@ -825,6 +825,29 @@ class IdentityTools:
             IdentityTools.brand_forms_without_generic_suffixes(a)
             & IdentityTools.brand_forms_without_generic_suffixes(b)
         )
+
+    @staticmethod
+    def query_is_brand_only(query: str, brand: str) -> bool:
+        """True when the whole query names ``brand`` with no leftover name tokens.
+
+        Covers plain house queries ("creed", "tom ford") and, crucially, brand
+        abbreviations/aliases ("MFK" -> Maison Francis Kurkdjian, "D&G" ->
+        Dolce Gabbana). For these, every query token is explained by one of the
+        brand's alias forms and nothing is left over to identify a single
+        fragrance -- so the user wants the house's whole catalogue, not one row.
+        """
+        if not brand:
+            return False
+        remaining = IdentityTools.display_tokens(query)
+        if not remaining:
+            return False
+        for form in IdentityTools.brand_forms(brand):
+            form_tokens = IdentityTools.display_tokens(form)
+            if form_tokens and form_tokens.issubset(remaining):
+                remaining = remaining - form_tokens
+        if remaining:
+            return False
+        return IdentityTools.compatible_brand(query, brand)
         
     @staticmethod
     def token_overlap(a: set[str], b: set[str]) -> tuple[float, float]:
@@ -895,6 +918,16 @@ class IdentityTools:
     def relevance_score(query: str, item: "UnifiedFragrance") -> float:
         if IdentityTools.bad_partial_house_remainder(item.name, item.brand):
             return 0.0
+
+        # Brand-only queries name a whole house, not one fragrance. The token
+        # and sequence scorers below compare the query against the full
+        # "brand name" phrase, which dilutes a short brand query (especially an
+        # abbreviation alias like "MFK" -> Maison Francis Kurkdjian) far below
+        # the relevance floor -- dropping every one of that house's results and
+        # surfacing "no matches found". Recognise the brand-only case up front
+        # and treat it as a strong match so the catalogue survives filtering.
+        if IdentityTools.query_is_brand_only(query, item.brand):
+            return 1.0
 
         query_clean = TextSanitizer.clean(query).lower()
         name_clean = TextSanitizer.clean(item.name).lower()
@@ -8753,6 +8786,17 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
         canonical_brand = getattr(args, "brand", "") or IdentityTools.canonical_brand_query(query)
         if canonical_brand:
             catalog_labels = IdentityTools.catalog_brand_keys(canonical_brand, query)
+        elif not catalog_labels and len(query.split()) == 1:
+            # Brand-only query for a house we don't alias (e.g. "creed",
+            # "xerjoff"): canonical_brand_query() returns "" and
+            # catalog_brand_keys("", query) treats the query as a *name* with
+            # no house, yielding []. That collapses brand searches to zero
+            # breadth whenever Serper/native-FG discovery comes back empty.
+            # Treat the single-token query as the house so the designer-catalog
+            # resolver (server-rendered FG brand pages, reachable without
+            # Serper) can return the catalogue. Multi-token queries are left
+            # alone -- they are usually brand+fragrance, not a bare house.
+            catalog_labels = IdentityTools.catalog_brand_keys(query)
         if catalog_labels:
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
