@@ -425,8 +425,9 @@ def test_stored_detail_completion_logic() -> None:
 
         check("enrichment block is present", "enrichment" in data1)
         if "enrichment" in data1:
-            check("enrichment.status is completed", data1["enrichment"]["status"] == "completed")
-            check("enrichment.requires_worker is false", data1["enrichment"]["requires_worker"] is False)
+            check("incomplete stored detail reopens as pending", data1["enrichment"]["status"] == "pending")
+            check("incomplete stored detail requires worker", data1["enrichment"]["requires_worker"] is True)
+            check("incomplete stored detail surfaces requested count", data1["enrichment"]["requested_count"] == 83)
 
         check("source_coverage is present", "source_coverage" in data1)
         if "source_coverage" in data1:
@@ -436,7 +437,7 @@ def test_stored_detail_completion_logic() -> None:
             )
 
         check("no enqueue job calls were made", len(enqueue_calls) == 0, f"calls={enqueue_calls}")
-        check("no recovery job calls were made by default", len(recover_calls) == 0, f"calls={recover_calls}")
+        check("recovery job was called by default", len(recover_calls) == 1, f"calls={recover_calls}")
 
         res2 = client.post(
             "/api/fragrances/details",
@@ -450,7 +451,7 @@ def test_stored_detail_completion_logic() -> None:
         check("incomplete completed detail reopens as pending", data2["enrichment"]["status"] == "pending")
         check("reopened detail requires worker", data2["enrichment"]["requires_worker"] is True)
         check("reopened detail surfaces requested count", data2["enrichment"]["requested_count"] == 83)
-        check("recovery job was called once", len(recover_calls) == 1, f"calls={recover_calls}")
+        check("recovery flag remains compatible", len(recover_calls) == 2, f"calls={recover_calls}")
 
     finally:
         db.ENABLED = saved_enabled
