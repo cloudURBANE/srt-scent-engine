@@ -172,6 +172,34 @@ def test_no_db_contract() -> None:
         and sorted(sent.get("tags") or []) == ["amber", "warm"],
     )
 
+    saved_enqueue_state = db.enqueue_job_state
+    try:
+        db.enqueue_job_state = lambda **_kwargs: {  # type: ignore[assignment]
+            "status": "completed",
+            "requested_count": 82,
+        }
+        selected = api.engine.UnifiedFragrance(
+            name="Completed Partial",
+            brand="Test House",
+            year="2026",
+            frag_url=(
+                "https://www.fragrantica.com/perfume/"
+                "Test-House/Completed-Partial-82.html"
+            ),
+        )
+        job_state = api._enqueue_enrichment_job(
+            selected,
+            api.DetailRequest(source_url=selected.frag_url),
+        )
+        status, requested_count = api._enrichment_status_from_job_state(job_state)
+        check("duplicate completed queue row stays completed", status == "completed")
+        check(
+            "duplicate completed queue row keeps requested count",
+            requested_count == 82,
+        )
+    finally:
+        db.enqueue_job_state = saved_enqueue_state
+
 
 def test_mobile_new_device_session_binding() -> None:
     print("Mobile auth checks (no DATABASE_URL required):")
@@ -325,9 +353,11 @@ def test_stored_detail_completion_logic() -> None:
     saved_lookup_rec = db.lookup_fragrance_record
     saved_lookup_cache = db.lookup_detail_cache
     saved_enqueue = db.enqueue_job
+    saved_recover = db.recover_or_enqueue_job
     saved_upsert = db.upsert_fragrance_details
 
     enqueue_calls = []
+    recover_calls = []
 
     # A record representing a completed worker job but with missing metrics (wear_profile missing):
     mock_frag_record_partial = {
@@ -371,12 +401,17 @@ def test_stored_detail_completion_logic() -> None:
             enqueue_calls.append((args, kwargs))
             return 1
 
+        def fake_recover_or_enqueue_job(*args, **kwargs):
+            recover_calls.append((args, kwargs))
+            return {"status": "pending", "requested_count": 83}
+
         def fake_upsert_fragrance_details(*args, **kwargs):
             pass
 
         db.lookup_fragrance_record = fake_lookup_fragrance_record
         db.lookup_detail_cache = fake_lookup_detail_cache
         db.enqueue_job = fake_enqueue_job
+        db.recover_or_enqueue_job = fake_recover_or_enqueue_job
         db.upsert_fragrance_details = fake_upsert_fragrance_details
 
         client = TestClient(api.app)
@@ -401,12 +436,28 @@ def test_stored_detail_completion_logic() -> None:
             )
 
         check("no enqueue job calls were made", len(enqueue_calls) == 0, f"calls={enqueue_calls}")
+        check("no recovery job calls were made by default", len(recover_calls) == 0, f"calls={recover_calls}")
+
+        res2 = client.post(
+            "/api/fragrances/details",
+            json={
+                "id": "source:https://www.fragrantica.com/perfume/Test-Brand/Test-Fragrance-9999.html",
+                "recover_incomplete": True,
+            },
+        )
+        check("details response 200 with recovery flag", res2.status_code == 200)
+        data2 = res2.json()
+        check("incomplete completed detail reopens as pending", data2["enrichment"]["status"] == "pending")
+        check("reopened detail requires worker", data2["enrichment"]["requires_worker"] is True)
+        check("reopened detail surfaces requested count", data2["enrichment"]["requested_count"] == 83)
+        check("recovery job was called once", len(recover_calls) == 1, f"calls={recover_calls}")
 
     finally:
         db.ENABLED = saved_enabled
         db.lookup_fragrance_record = saved_lookup_rec
         db.lookup_detail_cache = saved_lookup_cache
         db.enqueue_job = saved_enqueue
+        db.recover_or_enqueue_job = saved_recover
         db.upsert_fragrance_details = saved_upsert
 
 
