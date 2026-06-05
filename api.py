@@ -1089,7 +1089,7 @@ def _details_to_dict(
     if enrichment_status:
         enrichment_block: dict[str, Any] = {
             "status": enrichment_status,
-            "requires_worker": enrichment_status == "pending",
+            "requires_worker": enrichment_status in {"pending", "processing"},
             "cache_source": fragrantica_cache_source,
         }
         # Surface the durable retry counter so the frontend's bounded-retry cap
@@ -3823,7 +3823,7 @@ def _identity_job_key(selected: engine.UnifiedFragrance) -> str:
 
 def _enqueue_enrichment_job(
     selected: engine.UnifiedFragrance, req: DetailRequest
-) -> int | None:
+) -> dict[str, Any] | None:
     """Enqueue (or upsert) an enrichment job for a partial detail result.
 
     Job key prefers the canonical Fragrantica URL, falls back to the canonical
@@ -3833,15 +3833,13 @@ def _enqueue_enrichment_job(
     duplicating. Any failure here is swallowed -- enrichment is a background
     nicety and must never break the user-facing /details response.
 
-    Returns the job's resulting `requested_count` (>= 1) on success; `0` when
-    the write was accepted but no count is available (storage disabled, or a
-    deliberately `ignored` job left untouched); and `None` only when the write
-    raised. Callers treat any non-None result as "queued" -- this preserves the
-    prior bool contract while letting `/details` surface the retry counter the
-    frontend's MAX_ENRICHMENT_ATTEMPTS cap reads.
+    Returns the job's actual resulting status/count row on success. This keeps
+    `/details` from labeling duplicate requests as "pending" when the durable
+    queue row is already terminal (for example, completed-but-partial source
+    coverage).
     """
     if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
-        return 0
+        return None
     try:
         job_key = (
             _canonical_fg_url(selected.frag_url)
@@ -3850,7 +3848,7 @@ def _enqueue_enrichment_job(
         )
         if not job_key:
             return None
-        count = db.enqueue_job(
+        return db.enqueue_job_state(
             job_key=job_key,
             query=(req.source_url or None),
             name=selected.name or None,
@@ -3859,7 +3857,6 @@ def _enqueue_enrichment_job(
             bn_url=selected.bn_url or None,
             fg_url=selected.frag_url or None,
         )
-        return count if isinstance(count, int) else 0
     except Exception:
         # Best-effort: never let queue write failures surface to the client.
         logger.exception(
@@ -3869,6 +3866,18 @@ def _enqueue_enrichment_job(
             selected.brand,
         )
         return None
+
+
+def _enrichment_status_from_job_state(
+    job: dict[str, Any] | None,
+) -> tuple[str, int | None]:
+    if not job:
+        return "unavailable", None
+    status = str(job.get("status") or "").strip().lower()
+    if status not in {"pending", "processing", "completed", "failed", "ignored"}:
+        status = "unavailable"
+    count = job.get("requested_count")
+    return status, count if isinstance(count, int) and count > 0 else None
 
 
 def _requeue_enrichment_job(
@@ -3986,10 +3995,11 @@ def details(req: DetailRequest) -> dict[str, Any]:
             # source_coverage is the truthful signal for "all 4 groups present".
             enrichment_status = "completed"
         else:
-            enqueued = _enqueue_enrichment_job(selected, req)
-            enrichment_status = "pending" if enqueued is not None else "unavailable"
-            if isinstance(enqueued, int) and enqueued > 0:
-                enrichment_requested_count = enqueued
+            job_state = _enqueue_enrichment_job(selected, req)
+            (
+                enrichment_status,
+                enrichment_requested_count,
+            ) = _enrichment_status_from_job_state(job_state)
         engine.heal_missing_gender_and_year(selected, stored_detail)
         if (
             not is_parfumo_fallback
@@ -4038,10 +4048,11 @@ def details(req: DetailRequest) -> dict[str, Any]:
     elif fragrantica_cache_source == "json":
         enrichment_status = "bundled_cache"
     elif not _fg_metrics_complete(detail_bundle):
-        enqueued = _enqueue_enrichment_job(selected, req)
-        enrichment_status = "pending" if enqueued is not None else "unavailable"
-        if isinstance(enqueued, int) and enqueued > 0:
-            enrichment_requested_count = enqueued
+        job_state = _enqueue_enrichment_job(selected, req)
+        (
+            enrichment_status,
+            enrichment_requested_count,
+        ) = _enrichment_status_from_job_state(job_state)
 
     engine.heal_missing_gender_and_year(selected, detail_bundle)
     _persist_detail_record(selected, detail_bundle)

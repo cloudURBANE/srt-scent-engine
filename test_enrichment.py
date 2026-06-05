@@ -172,6 +172,34 @@ def test_no_db_contract() -> None:
         and sorted(sent.get("tags") or []) == ["amber", "warm"],
     )
 
+    saved_enqueue_state = db.enqueue_job_state
+    try:
+        db.enqueue_job_state = lambda **_kwargs: {  # type: ignore[assignment]
+            "status": "completed",
+            "requested_count": 82,
+        }
+        selected = api.engine.UnifiedFragrance(
+            name="Completed Partial",
+            brand="Test House",
+            year="2026",
+            frag_url=(
+                "https://www.fragrantica.com/perfume/"
+                "Test-House/Completed-Partial-82.html"
+            ),
+        )
+        job_state = api._enqueue_enrichment_job(
+            selected,
+            api.DetailRequest(source_url=selected.frag_url),
+        )
+        status, requested_count = api._enrichment_status_from_job_state(job_state)
+        check("duplicate completed queue row stays completed", status == "completed")
+        check(
+            "duplicate completed queue row keeps requested count",
+            requested_count == 82,
+        )
+    finally:
+        db.enqueue_job_state = saved_enqueue_state
+
 
 def test_mobile_new_device_session_binding() -> None:
     print("Mobile auth checks (no DATABASE_URL required):")

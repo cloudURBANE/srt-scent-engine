@@ -341,7 +341,7 @@ def _upsert_completed_fragrance_record(
     )
 
 
-def enqueue_job(
+def _enqueue_job_row(
     *,
     job_key: str,
     query: str | None,
@@ -350,19 +350,13 @@ def enqueue_job(
     year: int | None,
     bn_url: str | None,
     fg_url: str | None,
-) -> int | None:
-    """Upsert a job by job_key. A duplicate request bumps counters, never dupes.
+) -> Any | None:
+    """Upsert a job by job_key and return its resulting status/count row.
 
     On conflict the row's status is left untouched (a pending job stays pending,
     a completed job is not resurrected) except that a `failed` job is returned
     to `pending`, and an `ignored` job is never touched at all -- it was
     deliberately retired.
-
-    Returns the row's resulting `requested_count` -- 1 on first insert, then
-    incremented once per duplicate request -- so callers can surface a
-    bounded-retry signal to the client. Returns None when storage is disabled,
-    or when the conflicting job is `ignored` (the upsert WHERE clause skips it,
-    so no row is returned).
     """
     if not ENABLED:
         return None
@@ -411,13 +405,71 @@ def enqueue_job(
                     bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url),
                     fg_url            = COALESCE(EXCLUDED.fg_url, enrichment_jobs.fg_url)
                 WHERE enrichment_jobs.status <> 'ignored'
-                RETURNING requested_count
+                RETURNING status, requested_count
                 """,
                 (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url),
             ).fetchone()
-            return row["requested_count"] if row else None
+            return row
     finally:
         ctx.__exit__(None, None, None)
+
+
+def enqueue_job(
+    *,
+    job_key: str,
+    query: str | None,
+    name: str | None,
+    house: str | None,
+    year: int | None,
+    bn_url: str | None,
+    fg_url: str | None,
+) -> int | None:
+    """Upsert a job by job_key. A duplicate request bumps counters, never dupes.
+
+    Returns the row's resulting `requested_count` -- 1 on first insert, then
+    incremented once per duplicate request -- so callers can surface a
+    bounded-retry signal to the client. Returns None when storage is disabled,
+    or when the conflicting job is `ignored` (the upsert WHERE clause skips it,
+    so no row is returned).
+    """
+    row = _enqueue_job_row(
+        job_key=job_key,
+        query=query,
+        name=name,
+        house=house,
+        year=year,
+        bn_url=bn_url,
+        fg_url=fg_url,
+    )
+    return row["requested_count"] if row else None
+
+
+def enqueue_job_state(
+    *,
+    job_key: str,
+    query: str | None,
+    name: str | None,
+    house: str | None,
+    year: int | None,
+    bn_url: str | None,
+    fg_url: str | None,
+) -> dict[str, Any] | None:
+    """Upsert a job and return the actual queue state after the write."""
+    row = _enqueue_job_row(
+        job_key=job_key,
+        query=query,
+        name=name,
+        house=house,
+        year=year,
+        bn_url=bn_url,
+        fg_url=fg_url,
+    )
+    if not row:
+        return None
+    return {
+        "status": row["status"],
+        "requested_count": row["requested_count"],
+    }
 
 
 def requeue_or_enqueue_job(
