@@ -72,11 +72,22 @@ Optional Fragrantica URL discovery variables for the Serper-backed path:
 
 ```bash
 SERP_API_PROVIDER=serper
+# Single key, or a comma/space/newline-separated POOL of free-account keys.
+SERPER_API_KEYS=<key1>,<key2>,<key3>
+# Legacy singular var still works and is merged into the pool.
 SERPER_API_KEY=<secret>
 ```
 
-Leaving `SERP_API_PROVIDER` or `SERPER_API_KEY` unset preserves the current
+Leaving `SERP_API_PROVIDER` unset (or providing no keys) preserves the current
 non-Serper behavior.
+
+**Key pool / auto-rotation.** When multiple keys are supplied the engine drains
+one key until it returns 401/402/403 (out of credits → retired for the process)
+or 429 (rate-limited → short cooldown, retried later), then rotates to the next
+key automatically — no redeploy. Inspect live health at
+`GET /api/diagnostics/serper-pool` (masked keys). Refill without a redeploy via
+`POST /api/admin/serper-pool/keys` (worker bearer token) with body
+`{"keys": "k1,k2"}`. State is in-memory only, so a restart re-tests every key.
 
 ## Basenotes / Chromium requirement
 

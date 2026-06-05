@@ -522,10 +522,13 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
 class _FakeSerperResponse:
     """Minimal stand-in for a requests.Response from google.serper.dev."""
 
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, status_code: int = 200) -> None:
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise engine.requests.HTTPError(f"HTTP {self.status_code}")
         return None
 
     def json(self) -> dict:
@@ -545,13 +548,16 @@ def _set_serper_env(enabled: bool) -> dict[str, str | None]:
     saved = {
         "SERP_API_PROVIDER": os.environ.get("SERP_API_PROVIDER"),
         "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
+        "SERPER_API_KEYS": os.environ.get("SERPER_API_KEYS"),
     }
     if enabled:
         os.environ["SERP_API_PROVIDER"] = "serper"
         os.environ["SERPER_API_KEY"] = "test-key-not-real"
+        os.environ.pop("SERPER_API_KEYS", None)
     else:
         os.environ.pop("SERP_API_PROVIDER", None)
         os.environ.pop("SERPER_API_KEY", None)
+        os.environ.pop("SERPER_API_KEYS", None)
     return saved
 
 
@@ -595,6 +601,51 @@ def test_serper_enabled_with_key_only() -> None:
         check("SerperClient.enabled() with key only", engine.SerperClient.enabled() is True, "")
     finally:
         _restore_serper_env(saved)
+
+
+def test_serper_rotates_after_exhausted_key() -> None:
+    print("Serper key-pool rotation checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=False)
+    old_post = engine.requests.post
+    old_pool = engine._SERPER_POOL
+    calls: list[str | None] = []
+    try:
+        os.environ["SERP_API_PROVIDER"] = "serper"
+        os.environ["SERPER_API_KEYS"] = "test-exhausted-key,test-live-key"
+        engine._SERPER_POOL = engine.SerperKeyPool(rate_limit_cooldown_s=1.0)
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            api_key = (headers or {}).get("X-API-KEY")
+            calls.append(api_key)
+            if api_key == "test-exhausted-key":
+                return _FakeSerperResponse({}, status_code=402)
+            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+
+        engine.requests.post = fake_post
+        urls = engine.SerperClient.search_fragrantica_urls("pool rotation")
+        snapshot = engine.serper_key_pool().snapshot()
+    finally:
+        engine.requests.post = old_post
+        engine._SERPER_POOL = old_pool
+        _restore_serper_env(saved)
+
+    check(
+        "exhausted key is followed by the next pool key",
+        calls == ["test-exhausted-key", "test-live-key"],
+        str(calls),
+    )
+    check(
+        "rotation still returns Serper results",
+        urls[:1] == ["https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"],
+        str(urls),
+    )
+    key_statuses = [entry["status"] for entry in snapshot.get("keys", [])]
+    check(
+        "exhausted key is retired in diagnostics",
+        any(status == "retired" for status in key_statuses),
+        str(snapshot),
+    )
 
 
 def test_serper_disabled_without_env() -> None:
@@ -718,6 +769,7 @@ def main() -> int:
     test_casamorati_tempio_catalog_identity_score()
     test_serper_disabled_without_env()
     test_serper_enabled_with_key_only()
+    test_serper_rotates_after_exhausted_key()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
     test_strip_house_from_name()

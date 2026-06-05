@@ -4124,6 +4124,11 @@ class PatchJobRequest(BaseModel):
     house: str | None = None
 
 
+class SerperKeysRequest(BaseModel):
+    # Comma/space/newline-delimited string or a list of key strings.
+    keys: str | list[str] = ""
+
+
 def _json_for_db_blob(obj: Any) -> Any:
     """Return strict JSON-native data for psycopg ``Json()`` payloads.
 
@@ -4329,6 +4334,35 @@ def enrichment_status() -> dict[str, Any]:
     if not db.ENABLED:
         return {"enabled": False, "counts": {}}
     return {"enabled": True, "counts": db.get_status_counts()}
+
+
+@app.get("/api/diagnostics/serper-pool")
+def serper_pool_diagnostics() -> dict[str, Any]:
+    """Live health of the Serper API-key pool (masked keys only).
+
+    Lets you watch free-tier keys drain and spot when the pool is running low
+    without a redeploy. Pairs with POST /api/admin/serper-pool/keys to refill.
+    """
+    return engine.serper_key_pool().snapshot()
+
+
+@app.post(
+    "/api/admin/serper-pool/keys",
+    dependencies=[Depends(_require_worker_token)],
+)
+def add_serper_pool_keys(payload: SerperKeysRequest) -> dict[str, Any]:
+    """Protected: hot-add Serper keys to the pool at runtime (no redeploy).
+
+    Body: {"keys": "k1,k2"} or {"keys": ["k1", "k2"]}. Re-adding a retired or
+    cooling key revives it.
+    """
+    raw = payload.keys
+    raw_list = raw if isinstance(raw, list) else [raw]
+    keys = engine._parse_key_list(*raw_list)
+    if not keys:
+        raise HTTPException(status_code=400, detail="Provide one or more keys in the `keys` field.")
+    added = engine.serper_key_pool().add_keys(keys)
+    return {"added": added, "snapshot": engine.serper_key_pool().snapshot()}
 
 
 @app.get("/api/enrichment/jobs", dependencies=[Depends(_require_worker_token)])
