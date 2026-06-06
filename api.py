@@ -1849,12 +1849,18 @@ def search(
     # diagnostics.timing so latency can be attributed to a stage instead of
     # inferred from stdout. Cheap to collect; always on.
     timing: dict[str, Any] = {}
+    fallback_source: str | None = None
     try:
         results = engine.search_once(scraper, query, _ARGS, timing=timing)
-    except Exception as exc:  # engine degrades cleanly; surface a 502 if not
-        raise HTTPException(status_code=502, detail=f"Search failed: {exc}") from exc
+    except Exception:
+        # A live-engine crash (transient provider fault, encoding error, etc.)
+        # must not rob the client of the DB-backed fallback below. Log loudly
+        # and degrade to the cache path instead of surfacing a bare 502 -- a
+        # crash here previously masked perfectly good DB results (e.g. the
+        # "Royal Sapphire" spell-repair UnicodeEncodeError).
+        logger.exception("engine.search_once failed for query %r; falling back to cache", query)
+        results = []
 
-    fallback_source: str | None = None
     if not results:
         results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
 

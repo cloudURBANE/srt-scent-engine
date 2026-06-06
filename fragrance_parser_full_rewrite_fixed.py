@@ -24,6 +24,30 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 
+
+def _ensure_utf8_stdio() -> None:
+    """Force stdout/stderr to UTF-8 so the engine's Unicode log output (arrows,
+    box-drawing glyphs, accented fragrance names) never raises
+    UnicodeEncodeError on a non-UTF-8 console.
+
+    main() historically did this for the CLI only. Doing it at import covers
+    every caller -- notably api.py, which imports this module and runs
+    search_once() directly without ever going through main(). Without it a
+    single Unicode print (e.g. the spell-repair "corrected" line) crashes the
+    search and the API turns it into a 502, masking the DB fallback.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            encoding = getattr(stream, "encoding", None)
+            if encoding and encoding.lower() != "utf-8" and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            # Best-effort: never let stdio setup break module import.
+            pass
+
+
+_ensure_utf8_stdio()
+
 _DRISSION_ORIGIN_PATCH_ACTIVE = False
 _DRISSION_LAST_WS_CONNECT: dict[str, Any] | None = None
 _CLEARANCE_RAW_CDP_LAST_RESULT: dict[str, Any] | None = None
@@ -8745,7 +8769,7 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
         if args.spell_repair_budget > 0:
             suggestion = QueryRepair.suggest(scraper, query, seconds=args.spell_repair_budget)
             if suggestion:
-                print(f"{Y}[SYS] Search corrected: {query!r} → {suggestion!r}{Z}")
+                print(f"{Y}[SYS] Search corrected: {query!r} -> {suggestion!r}{Z}")
                 repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False, timing=timing)
                 if repaired and not QueryRepair.needs_repair(repaired_bn, repaired):
                     return repaired
@@ -8963,8 +8987,7 @@ def load_local_env() -> None:
 
 def main() -> None:
     load_local_env()
-    if getattr(sys.stdout, "encoding", None) and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8" and hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    _ensure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args()
     if getattr(args, "debug", False):
