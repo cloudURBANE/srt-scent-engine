@@ -1,17 +1,28 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
-desktop.ini
-.cache/
-.black_sun_cache.json
+
+# Editor / OS
 .claude/
+.cursor/
+desktop.ini
+
+# Logs
+*.log
 debug-*.log
 ipc_out.txt
-c*tmp*.json
-import rssandom.py
-.fragrantica_clearance_cache.json
+
+# Runtime caches / generated data
+.cache/
 out/
-side_effect_probe.html
-test_fg_status_decode.py
+.black_sun_cache.json
+.fragrantica_clearance_cache.json
+
+# Scratch / throwaway investigation scripts (keep these out of the repo)
+scratch/
+
+# Windows malformed-path artifacts (e.g. accidental "c:\tmp...")
+c*tmp*
