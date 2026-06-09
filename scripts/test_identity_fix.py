@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine
+import scripts.enrichment_worker as worker
 
 UF = engine.UnifiedFragrance
 CI = engine.CatalogItem
@@ -80,6 +81,34 @@ def main() -> int:
 
     sauvage = score("Sauvage", "Dior", "Sauvage", "Christian Dior")
     check("Dior Sauvage alias still matches Christian Dior", sauvage >= accept, f"score={sauvage:.4f}")
+
+    hermes_urls = {
+        "https://www.fragrantica.com/perfume/Hermes/Twilly-d-Hermes-46145.html": "Twilly d'Hermes",
+        "https://www.fragrantica.com/perfume/Hermes/Galop-d-Hermes-39584.html": "Galop d'Hermes",
+        "https://www.fragrantica.com/perfume/Hermes/Terre-d-Hermes-Eau-Givree-72439.html": "Terre d'Hermes Eau Givree",
+    }
+    for url, expected in hermes_urls.items():
+        derived = engine.FragranticaEngine.name_from_url(url)
+        check(
+            f"Fragrantica URL identity restores {expected}",
+            derived == expected,
+            f"derived={derived!r}",
+        )
+
+    repaired = worker._specific_identity(
+        UF(
+            name="Terre Dhermes Eau Givree",
+            brand="Hermes",
+            year="",
+            bn_url="",
+            frag_url="https://www.fragrantica.com/perfume/Hermes/Terre-d-Hermes-Eau-Givree-72439.html",
+        )
+    )
+    check(
+        "worker completion identity repairs glued Hermes elision",
+        repaired["name"] == "Terre d'Hermes Eau Givree",
+        f"name={repaired['name']!r}",
+    )
 
     ck_parfumo = parfumo_score("Man", "Calvin Klein", "Calvin Klein Man (Eau de Toilette)")
     check(

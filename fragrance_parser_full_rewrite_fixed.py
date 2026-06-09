@@ -385,6 +385,19 @@ class TextSanitizer:
     ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\uFEFF]")
     SPACE = re.compile(r"\s+")
     YEAR_RE = re.compile(r"\b(?:17|18|19|20)\d{2}\b")
+    ELISION_PARTICLES = ("d", "l")
+    ELISION_VOWELS = tuple("aeiouyh")
+    ELISION_GLUED = {
+        "dhermes": "d'Hermes",
+        "dorsay": "d'Orsay",
+        "dissey": "d'Issey",
+        "lhomme": "L'Homme",
+        "leau": "L'Eau",
+        "lair": "L'Air",
+        "linterdit": "L'Interdit",
+        "linstant": "L'Instant",
+        "lartisan": "L'Artisan",
+    }
     CLEANUP_RULES = [
         (re.compile(r"(?i)proven[^a-z]*al\s+"), ""),
         (re.compile(r"(?i)ylang[^a-z]lang"), "ylang-ylang"),
@@ -450,7 +463,35 @@ class TextSanitizer:
         value = unquote(slug or "")
         value = re.sub(r"[-_]+", " ", value)
         value = cls.SPACE.sub(" ", value).strip()
-        return value.title()
+        return cls.restore_elision(value.title())
+
+    @classmethod
+    def restore_elision(cls, text: str) -> str:
+        """Re-insert French elision apostrophes stripped by source URL slugs."""
+        if not text:
+            return text
+        tokens = text.split()
+        out: list[str] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            low = tok.lower()
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if (
+                low in cls.ELISION_PARTICLES
+                and nxt[:1].lower() in cls.ELISION_VOWELS
+            ):
+                particle = low.upper() if not out else low
+                out.append(f"{particle}'{nxt}")
+                i += 2
+                continue
+            if low in cls.ELISION_GLUED:
+                out.append(cls.ELISION_GLUED[low])
+                i += 1
+                continue
+            out.append(tok)
+            i += 1
+        return " ".join(out)
 
 # Identity sanity: reject parser captures that are obviously page UI debris
 # (pure digits, year-only, vote counters, gender chips) instead of a real
