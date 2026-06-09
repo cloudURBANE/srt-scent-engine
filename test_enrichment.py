@@ -483,7 +483,12 @@ def _cleanup() -> None:
         ctx.__exit__(None, None, None)
 
 
+import pytest
+
+@pytest.mark.skipif(not db.ENABLED, reason="DATABASE_URL not set")
 def test_db_lifecycle() -> None:
+    if not db.ENABLED:
+        return
     print("DB-backed checks (DATABASE_URL is set):")
     db.init_db()
     _cleanup()
