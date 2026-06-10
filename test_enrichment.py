@@ -453,6 +453,68 @@ def test_stored_detail_completion_logic() -> None:
         check("reopened detail surfaces requested count", data2["enrichment"]["requested_count"] == 83)
         check("recovery flag remains compatible", len(recover_calls) == 2, f"calls={recover_calls}")
 
+        parfumo_url = "https://www.parfumo.com/Perfumes/Creed/Bayrhum_Vetiver"
+        mock_parfumo_record = {
+            "record_key": f"fg:{parfumo_url}",
+            "canonical_fg_url": parfumo_url,
+            "bn_url": "https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
+            "name": "Bayrhum Vetiver",
+            "house": "Creed",
+            "year": 2006,
+            "gender": "Unisex",
+            "image_url": None,
+            "search": {},
+            "fg_raw": {
+                "frag_cards": {},
+                "notes": {
+                    "has_pyramid": True,
+                    "top": ["Bay Leaf", "Pepper"],
+                    "heart": ["Vetiver"],
+                    "base": ["Vetiver"],
+                    "flat": [],
+                },
+                "raw_identity": {"parfumo_url": parfumo_url},
+                "source": "parfumo",
+                "quality_status": "partial",
+            },
+            "bn_raw": {},
+            "derived_metrics": {
+                "notes": {
+                    "has_pyramid": True,
+                    "top": ["Bay Leaf", "Pepper"],
+                    "heart": ["Vetiver"],
+                    "base": ["Vetiver"],
+                    "flat": [],
+                },
+                "source_coverage": {
+                    "performance_score": False,
+                    "value_score": False,
+                    "community_interest_score": False,
+                    "wear_profile": False,
+                    "notes": True,
+                },
+            },
+        }
+
+        def fake_lookup_parfumo_record(canonical_fg_url, bn_url):
+            return mock_parfumo_record
+
+        db.lookup_fragrance_record = fake_lookup_parfumo_record
+        db.lookup_detail_cache = lambda canonical_fg_url: None
+        selected = api.engine.UnifiedFragrance(
+            name="Bayrhum Vetiver",
+            brand="Creed",
+            year="",
+            bn_url="https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
+            frag_url=parfumo_url,
+        )
+        res3 = client.post("/api/fragrances/details", json={"id": api._encode_id(selected)})
+        check("parfumo stored detail response 200", res3.status_code == 200, str(res3.status_code))
+        data3 = res3.json()
+        check("parfumo fallback is surfaced as partial", data3["enrichment"]["status"] == "partial", str(data3.get("enrichment")))
+        check("parfumo fallback is not marked worker-complete", data3["source_coverage"]["complete"] is False, str(data3.get("source_coverage")))
+        check("parfumo fallback keeps parsed top notes", data3["raw"]["notes"]["top"] == ["Bay Leaf", "Pepper"], str(data3["raw"]["notes"]))
+
     finally:
         db.ENABLED = saved_enabled
         db.lookup_fragrance_record = saved_lookup_rec
@@ -483,9 +545,6 @@ def _cleanup() -> None:
         ctx.__exit__(None, None, None)
 
 
-import pytest
-
-@pytest.mark.skipif(not db.ENABLED, reason="DATABASE_URL not set")
 def test_db_lifecycle() -> None:
     if not db.ENABLED:
         return

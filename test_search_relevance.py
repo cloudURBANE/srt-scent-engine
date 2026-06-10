@@ -96,6 +96,51 @@ def test_brand_plus_name_filter() -> None:
     check("matching same-house fragrance remains", names == ["Sauvage", "Sauvage Elixir"], str(names))
 
 
+def test_multi_token_name_requires_distinctive_coverage() -> None:
+    print("Multi-token name coverage checks:")
+    query = "Creed Bayrhum Vétiver"
+    rows = [
+        candidate("Creed", "Wild Vétiver"),
+        candidate("Creed", "Original Vétiver"),
+        candidate("Creed", "Bayrhum Vétiver"),
+    ]
+    filtered = engine.filter_relevant_candidates(query, rows)
+    names = [item.name for item in filtered]
+    wild_score = engine.IdentityTools.relevance_score(query, rows[0])
+    check("same-house sibling scores near old floor", 0.70 <= wild_score < 0.75, f"{wild_score:.3f}")
+    check("same-house sibling missing Bayrhum is rejected", "Wild Vétiver" not in names, str(names))
+    check("true Creed Bayrhum Vétiver remains", names == ["Bayrhum Vétiver"], str(names))
+
+
+def test_cache_search_rejects_same_house_sibling() -> None:
+    print("API cache sibling relevance checks:")
+    old_record_search = api.db.search_fragrance_records
+    try:
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "Wild Vétiver",
+                "house": "Creed",
+                "bn_url": "",
+                "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Wild-Vetiver-125485.html",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "name": "Bayrhum Vétiver",
+                "house": "Creed",
+                "bn_url": "https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
+                "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Bayrhum-Vetiver-30691.html",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            },
+        ]
+        rows = api._fragrance_record_search("Creed Bayrhum Vétiver", 10)
+    finally:
+        api.db.search_fragrance_records = old_record_search
+
+    identities = [(row.brand, row.name) for row in rows]
+    check("cached Wild Vétiver row is dropped", ("Creed", "Wild Vétiver") not in identities, str(identities))
+    check("cached Bayrhum Vétiver row remains", identities == [("Creed", "Bayrhum Vétiver")], str(identities))
+
+
 def test_api_cache_threshold_matches_engine() -> None:
     print("API fallback threshold checks:")
     check(
@@ -813,6 +858,8 @@ def main() -> int:
     test_compatible_catalog_brand_accepts_parent_line()
     test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
+    test_multi_token_name_requires_distinctive_coverage()
+    test_cache_search_rejects_same_house_sibling()
     test_api_cache_threshold_matches_engine()
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
