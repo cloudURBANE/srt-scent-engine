@@ -557,7 +557,7 @@ def _fragrance_record_search(
         if not item:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < min_score:
+        if not engine.candidate_relevance_ok(query, item, min_score):
             continue
         key = item.frag_url or item.bn_url or item.cache_key
         if key in seen:
@@ -649,7 +649,7 @@ def _json_cache_search(
         if not item:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < min_score:
+        if not engine.candidate_relevance_ok(query, item, min_score):
             continue
         key = item.frag_url or item.cache_key
         if key in seen:
@@ -694,7 +694,7 @@ def _identity_cache_search(
         if not item.name or not item.brand:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < min_score:
+        if not engine.candidate_relevance_ok(query, item, min_score):
             continue
         seen.add(fg_url)
         candidates.append(item)
@@ -716,7 +716,7 @@ def _db_detail_cache_search(
         if not item:
             continue
         item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if item.query_score < min_score:
+        if not engine.candidate_relevance_ok(query, item, min_score):
             continue
         key = item.frag_url or item.cache_key
         if key in seen:
@@ -4059,8 +4059,10 @@ def details(req: DetailRequest) -> dict[str, Any]:
         has_stored_fg_payload = (
             fragrantica_cache_source == "db" or bool(stored_detail.frag_cards)
         )
-        if is_parfumo_fallback or metrics_complete:
+        if metrics_complete:
             enrichment_status = "completed"
+        elif is_parfumo_fallback:
+            enrichment_status = "partial"
         elif has_stored_fg_payload:
             # A previous worker/cache result exists, but one or more of the 4
             # Fragrantica status-derived metric groups is still missing. Reopen

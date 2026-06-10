@@ -2709,9 +2709,43 @@ def filter_relevant_candidates(
     relevant: list[UnifiedFragrance] = []
     for item in candidates:
         item.query_score = IdentityTools.relevance_score(query, item)
-        if item.query_score >= minimum:
+        if candidate_relevance_ok(query, item, minimum):
             relevant.append(item)
     return relevant
+
+
+def candidate_relevance_ok(
+    query: str,
+    item: UnifiedFragrance,
+    minimum: float = QueryRepair.MIN_RESULT_SCORE,
+) -> bool:
+    """Return True only when score and distinctive name coverage are adequate.
+
+    The scalar score intentionally tolerates misspellings and partial provider
+    rows, but that made same-house siblings with one shared descriptor survive
+    the 0.72 fallback floor (for example Creed "Wild Vetiver" for the query
+    "Creed Bayrhum Vetiver"). For multi-token fragrance names, require the
+    candidate name to cover the query's distinctive name tokens as well.
+    """
+    if float(getattr(item, "query_score", 0.0) or 0.0) < minimum:
+        return False
+    query_name_tokens = IdentityTools.query_name_tokens(query, item.brand)
+    target_name_tokens = IdentityTools.name_tokens(item.name, item.brand)
+    if not target_name_tokens:
+        target_name_tokens = IdentityTools.name_tokens_keep_stopwords(item.name, item.brand)
+    if len(query_name_tokens) < 2 or not target_name_tokens:
+        return True
+    if len(target_name_tokens) == 1 and bool(query_name_tokens & target_name_tokens):
+        extra_query_tokens = query_name_tokens - target_name_tokens
+        brand_tokens = IdentityTools.brand_tokens_keep_stopwords(item.brand)
+        if not extra_query_tokens:
+            return True
+        if (
+            brand_tokens
+            and IdentityTools.fuzzy_token_coverage(extra_query_tokens, brand_tokens) >= 0.86
+        ):
+            return True
+    return IdentityTools.fuzzy_token_coverage(query_name_tokens, target_name_tokens) >= 0.86
 
 class Http:
     DEFAULT_HEADERS = {
