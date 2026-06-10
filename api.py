@@ -447,7 +447,7 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
 
 
 def _candidate_from_fragrance_record(
-    record: dict[str, Any], source: str = "fragrance_db"
+    record: dict[str, Any], source: str = "fragrance_db", trust_image: bool = False
 ) -> engine.UnifiedFragrance | None:
     fg_url = _canonical_fg_url(str(record.get("canonical_fg_url") or ""))
     bn_url = str(record.get("bn_url") or "").strip()
@@ -482,7 +482,7 @@ def _candidate_from_fragrance_record(
         resolver_score=0.99,
     )
     image_url = str(record.get("image_url") or "").strip()
-    if image_url:
+    if trust_image and image_url:
         setattr(candidate, "image_url", image_url)
     search_blob = record.get("search") or {}
     if isinstance(search_blob, dict):
@@ -933,6 +933,29 @@ def _cache_entry_image_url(entry: dict[str, Any]) -> str:
     return ""
 
 
+def _cache_entry_matches_selected_identity(
+    selected: engine.UnifiedFragrance, entry: dict[str, Any]
+) -> bool:
+    entry_url = _canonical_fg_url(
+        str(entry.get("canonical_fg_url") or entry.get("fg_url") or "")
+    )
+    selected_url = _canonical_fg_url(selected.frag_url)
+    if selected_url and entry_url:
+        return selected_url == entry_url
+
+    identity = _cache_entry_identity(entry)
+    entry_name = engine.TextSanitizer.normalize_identity(identity["name"])
+    selected_name = engine.TextSanitizer.normalize_identity(selected.name)
+    if entry_name and selected_name and entry_name != selected_name:
+        return False
+
+    entry_house = identity["house"]
+    selected_house = selected.brand
+    if entry_house and selected_house:
+        return engine.IdentityTools.compatible_brand(entry_house, selected_house)
+    return bool(entry_name and selected_name)
+
+
 def _cache_entry_identity(entry: dict[str, Any], fg_url: str = "") -> dict[str, str]:
     """Best-effort identity from a DB/JSON cache entry or Fragrantica URL.
 
@@ -1015,6 +1038,7 @@ def _fill_selected_identity(
 ) -> None:
     """Fill blank request identity from a trusted cache entry."""
     identity = _cache_entry_identity(entry, selected.frag_url)
+    image_entry_matches_selected = _cache_entry_matches_selected_identity(selected, entry)
     if not selected.name and identity["name"]:
         selected.name = identity["name"]
     if not selected.brand and identity["house"]:
@@ -1022,7 +1046,11 @@ def _fill_selected_identity(
     if not selected.year and identity["year"]:
         selected.year = identity["year"]
     image_url = _cache_entry_image_url(entry)
-    if image_url and not getattr(selected, "image_url", ""):
+    if (
+        image_url
+        and not getattr(selected, "image_url", "")
+        and image_entry_matches_selected
+    ):
         setattr(selected, "image_url", image_url)
 
 
@@ -3604,7 +3632,9 @@ def _lookup_stored_detail(
         or _fragrance_record_is_stale(record)
     ):
         return None
-    item = _candidate_from_fragrance_record(record, source="fragrance_db_detail")
+    item = _candidate_from_fragrance_record(
+        record, source="fragrance_db_detail", trust_image=True
+    )
     if item:
         if _identity_needs_recovery(selected.name):
             selected.name = item.name

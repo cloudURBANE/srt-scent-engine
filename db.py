@@ -314,7 +314,7 @@ def _upsert_completed_fragrance_record(
             house            = COALESCE(EXCLUDED.house, fragrance_records.house),
             year             = COALESCE(EXCLUDED.year, fragrance_records.year),
             gender           = COALESCE(EXCLUDED.gender, fragrance_records.gender),
-            image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+            image_url        = EXCLUDED.image_url,
             fg_raw_json      = EXCLUDED.fg_raw_json,
             derived_metrics_json = EXCLUDED.derived_metrics_json,
             source_captured_at = now(),
@@ -1057,7 +1057,13 @@ def _merge_fragrance_record_keys(conn: Any, target_key: str, duplicate_key: str)
             house            = COALESCE(target.house, duplicate.house),
             year             = COALESCE(target.year, duplicate.year),
             gender           = COALESCE(target.gender, duplicate.gender),
-            image_url        = COALESCE(target.image_url, duplicate.image_url),
+            image_url        = CASE
+                WHEN target.image_url IS NOT NULL AND target.image_url <> '' THEN target.image_url
+                WHEN target.canonical_fg_url IS NOT NULL
+                 AND duplicate.canonical_fg_url IS NOT NULL
+                 AND target.canonical_fg_url <> duplicate.canonical_fg_url THEN NULL
+                ELSE duplicate.image_url
+            END,
             search_json      = COALESCE(duplicate.search_json, '{}'::jsonb) || COALESCE(target.search_json, '{}'::jsonb),
             fg_raw_json      = COALESCE(duplicate.fg_raw_json, '{}'::jsonb) || COALESCE(target.fg_raw_json, '{}'::jsonb),
             bn_raw_json      = COALESCE(duplicate.bn_raw_json, '{}'::jsonb) || COALESCE(target.bn_raw_json, '{}'::jsonb),
@@ -1249,7 +1255,7 @@ def upsert_fragrance_details(row: dict[str, Any]) -> None:
                     house            = COALESCE(EXCLUDED.house, fragrance_records.house),
                     year             = COALESCE(EXCLUDED.year, fragrance_records.year),
                     gender           = COALESCE(EXCLUDED.gender, fragrance_records.gender),
-                    image_url        = COALESCE(EXCLUDED.image_url, fragrance_records.image_url),
+                    image_url        = EXCLUDED.image_url,
                     search_json      = fragrance_records.search_json || EXCLUDED.search_json,
                     fg_raw_json      = CASE
                         WHEN EXCLUDED.fg_raw_json <> '{}'::jsonb THEN EXCLUDED.fg_raw_json
