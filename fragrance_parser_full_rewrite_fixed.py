@@ -598,6 +598,12 @@ class IdentityTools:
         "jpg": {"jean paul gaultier", "jpg"},
         "dolce and gabbana": {"dolce and gabbana", "dolce gabbana", "d and g", "dg"},
         "dolce gabbana": {"dolce and gabbana", "dolce gabbana", "d and g", "dg"},
+        "casamorati": {"casamorati", "casamorati 1888", "xerjoff"},
+        "casamorati 1888": {"casamorati", "casamorati 1888", "xerjoff"},
+        "maison margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
+        "maison martin margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
+        "martin margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
+        "replica": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
     }
     # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
     # Keys are normalized sub-line tokens; values are designer labels to crawl.
@@ -912,6 +918,11 @@ class IdentityTools:
             ft = IdentityTools.display_tokens(form)
             if ft and ft.issubset(tokens):
                 tokens -= ft
+                continue
+            non_numeric = {token for token in ft if not token.isdigit()}
+            numeric = ft - non_numeric
+            if numeric and non_numeric and non_numeric.issubset(tokens):
+                tokens -= non_numeric
         return tokens or IdentityTools.display_tokens(query)
         
     @staticmethod
@@ -5259,7 +5270,7 @@ class BasenotesEngine:
             year = year_match.group(1)
 
         if " By " in raw_name:
-            left, right = raw_name.split(" By ", 1)
+            left, right = raw_name.rsplit(" By ", 1)
             name = left.strip()
             brand = right.strip()
         elif re.search(r"(?i)\bby\b", combined):
@@ -8003,9 +8014,17 @@ class Orchestrator:
         shorter = min(len(a_name), len(b_name))
         longer = max(len(a_name), len(b_name))
         subset_length_mismatch = coverage >= 0.92 and longer > shorter
+        optional_line_tokens = {
+            token
+            for line in IdentityTools.FRAGRANTICA_LINE_ALIASES
+            for token in IdentityTools.tokenized_keep_stopwords(line)
+        }
+        extra_tokens = (a_name | b_name) - (a_name & b_name)
 
         if exact_name:
             return 0.96
+        if subset_length_mismatch and extra_tokens and extra_tokens <= optional_line_tokens:
+            return 0.90
         if subset_length_mismatch:
             return 0.68
         if coverage >= 0.92:

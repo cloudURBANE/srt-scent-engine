@@ -62,6 +62,60 @@ def test_compatible_catalog_brand_accepts_parent_line() -> None:
     check("Xerjoff house can match Casamorati 1888 catalog brand", ok, "compatible_catalog_brand returned False")
 
 
+def test_line_alias_queries_are_treated_as_brand_tokens() -> None:
+    print("Product-line query alias checks:")
+    tempio = candidate("Casamorati 1888", "Tempio D Acqua")
+    wrong_xerjoff = candidate("Xerjoff", "Casamorati Harrods Edition")
+    for query in (
+        "casamorati tempio d acqua",
+        "tempio d acqua casamorati",
+        "xerjoff tempio d acqua",
+    ):
+        tempio.query_score = engine.IdentityTools.relevance_score(query, tempio)
+        wrong_xerjoff.query_score = engine.IdentityTools.relevance_score(query, wrong_xerjoff)
+        check(
+            f"{query!r} keeps the Casamorati Tempio result",
+            engine.candidate_relevance_ok(query, tempio),
+            f"{tempio.query_score:.3f} {engine.IdentityTools.query_name_tokens(query, tempio.brand)}",
+        )
+        check(
+            f"{query!r} still rejects an unrelated Xerjoff line result",
+            not engine.candidate_relevance_ok(query, wrong_xerjoff),
+            f"{wrong_xerjoff.query_score:.3f} {engine.IdentityTools.query_name_tokens(query, wrong_xerjoff.brand)}",
+        )
+
+
+def test_margiela_replica_line_aliases_merge_and_filter() -> None:
+    print("Margiela Replica line alias checks:")
+    bn_fireplace = engine.UnifiedFragrance(
+        name="Replica By The Fireplace",
+        brand="Martin Margiela",
+        year="2015",
+        bn_url="https://basenotes.com/fragrances/replica-by-the-fireplace-by-martin-margiela.26147432",
+    )
+    fg_fireplace = engine.UnifiedFragrance(
+        name="By The Fireplace",
+        brand="Maison Martin Margiela",
+        year="2015",
+        frag_url="https://www.fragrantica.com/perfume/Maison-Martin-Margiela/By-the-Fireplace-31623.html",
+        resolver_source="serper_fragrantica_search",
+    )
+    merged = engine.Orchestrator.match_and_merge([bn_fireplace], [fg_fireplace])
+    check(
+        "Replica prefix does not block BN/FG merge",
+        merged[0].frag_url == fg_fireplace.frag_url,
+        f"{merged[0].brand} | {merged[0].name} | {merged[0].frag_url}",
+    )
+
+    jazz = candidate("Martin Margiela", "Replica Jazz Club")
+    jazz.query_score = engine.IdentityTools.relevance_score("maison margiela jazz club", jazz)
+    check(
+        "Maison/Martin Margiela aliases keep Jazz Club",
+        engine.candidate_relevance_ok("maison margiela jazz club", jazz),
+        f"{jazz.query_score:.3f} {engine.IdentityTools.query_name_tokens('maison margiela jazz club', jazz.brand)}",
+    )
+
+
 def test_native_search_unusable_detects_junk() -> None:
     print("Native Fragrantica search junk checks:")
     query = "Xerjoff Casamorati Mefisto"
@@ -576,6 +630,21 @@ def test_search_serialization_recovers_basenotes_identity() -> None:
     )
 
 
+def test_basenotes_slug_splits_on_final_by() -> None:
+    print("Basenotes slug parsing checks:")
+    parsed = engine.BasenotesEngine._parse_name_metadata(
+        "https://basenotes.com/fragrances/replica-by-the-fireplace-by-martin-margiela.26147432",
+        "",
+        "",
+    )
+    check(
+        "name keeps internal By phrase",
+        parsed.name == "Replica By The Fireplace",
+        f"{parsed.name} | {parsed.brand}",
+    )
+    check("brand comes from final By phrase", parsed.brand == "Martin Margiela", f"{parsed.name} | {parsed.brand}")
+
+
 def test_details_request_recovers_identity_from_legacy_blank_id() -> None:
     print("Legacy id recovery checks:")
     legacy = engine.UnifiedFragrance(
@@ -949,6 +1018,8 @@ def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
     test_compatible_catalog_brand_accepts_parent_line()
+    test_line_alias_queries_are_treated_as_brand_tokens()
+    test_margiela_replica_line_aliases_merge_and_filter()
     test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_multi_token_name_requires_distinctive_coverage()
@@ -977,6 +1048,7 @@ def main() -> int:
     test_short_db_search_uses_word_boundaries()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
+    test_basenotes_slug_splits_on_final_by()
     test_details_request_recovers_identity_from_legacy_blank_id()
     test_details_request_repairs_legacy_poisoned_id()
     test_details_request_accepts_source_prefixed_id()
