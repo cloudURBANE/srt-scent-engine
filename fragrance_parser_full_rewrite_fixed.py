@@ -22,8 +22,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote, unquote, urljoin, urlparse
 
-import requests
-
 
 def _ensure_utf8_stdio() -> None:
     """Force stdout/stderr to UTF-8 so the engine's Unicode log output (arrows,
