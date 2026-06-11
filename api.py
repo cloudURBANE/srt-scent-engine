@@ -41,6 +41,7 @@ import os
 import re
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -48,7 +49,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine
@@ -153,17 +154,45 @@ _DERIVED_METRICS_LOCKS: dict[str, threading.Lock] = {}
 # offline worker only -- it is never sent to the frontend and is never logged.
 # Unset => the worker endpoints are unconfigured and return 503.
 _ENRICHMENT_WORKER_TOKEN = os.environ.get("ENRICHMENT_WORKER_TOKEN", "")
+_PUBLIC_DIAGNOSTICS = _env_flag("PUBLIC_DIAGNOSTICS", default=False)
+
+
+def _require_bearer_authorization(
+    authorization: str | None,
+    token: str,
+    *,
+    unconfigured_detail: str,
+) -> None:
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail=unconfigured_detail,
+        )
+    expected = f"Bearer {token}"
+    if not hmac.compare_digest(authorization or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
 
 
 def _require_clearance_token(authorization: str | None = Header(default=None)) -> None:
-    if not _ENRICHMENT_WORKER_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Clearance endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset).",
-        )
-    expected = f"Bearer {_ENRICHMENT_WORKER_TOKEN}"
-    if not hmac.compare_digest(authorization or "", expected):
-        raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
+    _require_bearer_authorization(
+        authorization,
+        _ENRICHMENT_WORKER_TOKEN,
+        unconfigured_detail=(
+            "Clearance endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset)."
+        ),
+    )
+
+
+def _require_diagnostics_token(authorization: str | None = Header(default=None)) -> None:
+    if _PUBLIC_DIAGNOSTICS:
+        return
+    _require_bearer_authorization(
+        authorization,
+        _ENRICHMENT_WORKER_TOKEN,
+        unconfigured_detail=(
+            "Diagnostics endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset)."
+        ),
+    )
 
 
 class ClearanceCookieRequest(BaseModel):
@@ -172,8 +201,6 @@ class ClearanceCookieRequest(BaseModel):
     cookies: dict[str, str] | None = None
     validate_session: bool = True
 
-
-app = FastAPI(title="Fragrance Engine API", version="1.0.0")
 
 _BN_WARMUP_LOCK = threading.Lock()
 _BN_WARMUP_STARTED = False
@@ -206,11 +233,15 @@ def _start_basenotes_warmup() -> None:
     thread.start()
 
 
-@app.on_event("startup")
-def _startup() -> None:
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
     """Bootstrap durable storage. Inert when DATABASE_URL is unset (local dev)."""
     db.init_db()
     _start_basenotes_warmup()
+    yield
+
+
+app = FastAPI(title="Fragrance Engine API", version="1.0.0", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS -- restricted to the frontend origin(s).
@@ -1209,7 +1240,10 @@ def _proc_self_memory() -> dict[str, Any]:
     return fields
 
 
-@app.get("/api/diagnostics/memory")
+@app.get(
+    "/api/diagnostics/memory",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def memory_diagnostics() -> dict[str, Any]:
     """Report API RSS and browser helper processes without shelling to procps."""
     chromium = _matching_processes(("chromium", "chrome"))
@@ -1344,7 +1378,10 @@ def _cache_file_state(path: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/diagnostics/runtime")
+@app.get(
+    "/api/diagnostics/runtime",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def runtime_diagnostics() -> dict[str, Any]:
     """Report the deployed runtime's identity for parity comparison vs. local.
 
@@ -1551,7 +1588,10 @@ def _classify_probe(url: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/diagnostics/upstream")
+@app.get(
+    "/api/diagnostics/upstream",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def upstream_diagnostics() -> dict[str, Any]:
     """Probe every upstream host the engine depends on. Temporary; read-only.
 
@@ -1682,7 +1722,10 @@ def _run_variant(label: str, fetch: Any) -> dict[str, Any]:
     }
 
 
-@app.get("/api/diagnostics/fetch-variants")
+@app.get(
+    "/api/diagnostics/fetch-variants",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def fetch_variant_diagnostics() -> dict[str, Any]:
     """Fetch one Fragrantica perfume page five ways to localize the 403 cause.
 
@@ -1989,7 +2032,10 @@ def _engine_candidate_to_diag(item: engine.UnifiedFragrance) -> dict[str, Any]:
     }
 
 
-@app.get("/api/diagnostics/engine-search")
+@app.get(
+    "/api/diagnostics/engine-search",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def engine_search_diagnostics(
     q: str = Query("silver mountain water", min_length=1),
 ) -> dict[str, Any]:
@@ -2781,7 +2827,10 @@ def _install_manual_clearance(source: str, payload: ClearanceCookieRequest) -> d
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/diagnostics/basenotes")
+@app.get(
+    "/api/diagnostics/basenotes",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def basenotes_diagnostics(
     q: str = Query("xerjoff", min_length=1),
     mint: bool = Query(False),
@@ -3068,7 +3117,10 @@ def _fg_diag_engine_search(query: str) -> dict[str, Any]:
     return result
 
 
-@app.get("/api/diagnostics/fragrantica")
+@app.get(
+    "/api/diagnostics/fragrantica",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def fragrantica_diagnostics(
     q: str = Query("dior sauvage", min_length=1),
     mint: bool = Query(False),
@@ -3192,7 +3244,10 @@ def _inspect_search_markup(markup: str, kind: str, original: str) -> dict[str, A
     }
 
 
-@app.get("/api/diagnostics/spell-repair")
+@app.get(
+    "/api/diagnostics/spell-repair",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def spell_repair_diagnostics(
     q: str = Query("dior sava", min_length=1),
 ) -> dict[str, Any]:
@@ -4228,11 +4283,11 @@ class CompleteJobRequest(BaseModel):
     schema_version: int = 1
     captured_at: str | None = None
     source: str | None = None
-    frag_cards: dict[str, Any] = {}
-    notes: dict[str, Any] = {}
-    pros_cons: list[Any] = []
-    reviews: list[Any] = []
-    raw_identity: dict[str, Any] = {}
+    frag_cards: dict[str, Any] = Field(default_factory=dict)
+    notes: dict[str, Any] = Field(default_factory=dict)
+    pros_cons: list[Any] = Field(default_factory=list)
+    reviews: list[Any] = Field(default_factory=list)
+    raw_identity: dict[str, Any] = Field(default_factory=dict)
     quality_status: str | None = None
 
 
@@ -4294,16 +4349,13 @@ def _require_worker_token(authorization: str | None = Header(default=None)) -> N
     503 when the token env var is unset (endpoint unconfigured), 401 when the
     Authorization header is missing or does not carry the exact bearer token.
     """
-    if not _ENRICHMENT_WORKER_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Worker endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset).",
-        )
-    expected = f"Bearer {_ENRICHMENT_WORKER_TOKEN}"
-    presented = authorization or ""
-    # Constant-time comparison; the token value never appears in logs or errors.
-    if not hmac.compare_digest(presented, expected):
-        raise HTTPException(status_code=401, detail="Invalid or missing worker token.")
+    _require_bearer_authorization(
+        authorization,
+        _ENRICHMENT_WORKER_TOKEN,
+        unconfigured_detail=(
+            "Worker endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset)."
+        ),
+    )
 
 
 def _payload_identity(
@@ -4485,7 +4537,10 @@ def enrichment_status() -> dict[str, Any]:
     return {"enabled": True, "counts": db.get_status_counts()}
 
 
-@app.get("/api/diagnostics/serper-pool")
+@app.get(
+    "/api/diagnostics/serper-pool",
+    dependencies=[Depends(_require_diagnostics_token)],
+)
 def serper_pool_diagnostics() -> dict[str, Any]:
     """Live health of the Serper API-key pool (masked keys only).
 

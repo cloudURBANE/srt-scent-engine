@@ -2020,6 +2020,25 @@ def latest_worker_heartbeat_seconds() -> float | None:
         ctx.__exit__(None, None, None)
 
 
+def _active_lock_iso(value: Any) -> str | None:
+    """Serialize only unexpired account locks.
+
+    Expired locks remain in the database until the next successful PIN reset,
+    but auth decisions must treat them as inactive once their window has passed.
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        lock_until = value
+        if lock_until.tzinfo is None:
+            lock_until = lock_until.replace(tzinfo=timezone.utc)
+        else:
+            lock_until = lock_until.astimezone(timezone.utc)
+        if lock_until <= _now():
+            return None
+    return _iso(value)
+
+
 def _account_to_dict(row: Any) -> dict[str, Any]:
     if not row:
         return {}
@@ -2030,7 +2049,7 @@ def _account_to_dict(row: Any) -> dict[str, Any]:
         "pin_hash": row["pin_hash"],
         "disabled": bool(row["disabled"]),
         "pin_strikes": row["pin_strikes"],
-        "locked_until": _iso(row["locked_until"]),
+        "locked_until": _active_lock_iso(row["locked_until"]),
         "created_at": _iso(row["created_at"]),
         "last_login_at": _iso(row["last_login_at"]),
     }

@@ -85,9 +85,10 @@ non-Serper behavior.
 one key until it returns 401/402/403 (out of credits → retired for the process)
 or 429 (rate-limited → short cooldown, retried later), then rotates to the next
 key automatically — no redeploy. Inspect live health at
-`GET /api/diagnostics/serper-pool` (masked keys). Refill without a redeploy via
-`POST /api/admin/serper-pool/keys` (worker bearer token) with body
-`{"keys": "k1,k2"}`. State is in-memory only, so a restart re-tests every key.
+`GET /api/diagnostics/serper-pool` with the worker bearer token (masked keys).
+Refill without a redeploy via `POST /api/admin/serper-pool/keys` with the same
+bearer token and body `{"keys": "k1,k2"}`. State is in-memory only, so a
+restart re-tests every key.
 
 ## Basenotes / Chromium requirement
 
@@ -114,13 +115,19 @@ to auto-discover the binary.
 
 ### Post-deploy validation
 
-After Railway redeploys, run:
+After Railway redeploys, run diagnostics with the worker bearer token:
 
 ```bash
-curl "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff"
-curl "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff&mint=1"
+curl -H "Authorization: Bearer $ENRICHMENT_WORKER_TOKEN" \
+  "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff"
+curl -H "Authorization: Bearer $ENRICHMENT_WORKER_TOKEN" \
+  "https://srt-scent-engine-production.up.railway.app/api/diagnostics/basenotes?q=xerjoff&mint=1"
 curl "https://srt-scent-engine-production.up.railway.app/api/fragrances/search?q=xerjoff"
 ```
+
+Diagnostics are private by default because they can expose runtime/process/cache
+state and trigger upstream probes. For a short local debugging window only, set
+`PUBLIC_DIAGNOSTICS=1` to bypass the bearer-token check.
 
 Expected:
 
