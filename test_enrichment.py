@@ -346,6 +346,158 @@ def test_hydration_dedup() -> None:
     )
 
 
+def test_concentration_pipeline() -> None:
+    print("Concentration enrichment checks (no DATABASE_URL required):")
+
+    # 1. The /complete payload model accepts a concentration field.
+    payload = api.CompleteJobRequest(
+        fg_url="https://www.fragrantica.com/perfume/Test-House/Test-1.html",
+        frag_cards={"Community Interest": [{"label": "Have", "count": "1"}]},
+        concentration="Eau de Parfum",
+    )
+    check(
+        "complete payload model accepts concentration",
+        payload.concentration == "Eau de Parfum",
+    )
+
+    # 2. Worker tier-1 resolution works without the SERP/browser tier.
+    # Fictional names keep the Parfinity catalog tier from short-circuiting.
+    resolved = enrichment_worker._resolve_concentration(
+        "Testhouse", "Imaginary Extrait de Parfum", allow_serp=False
+    )
+    check(
+        "worker resolves explicit concentration token",
+        bool(resolved) and resolved["concentration"] == "Extrait",
+        str(resolved),
+    )
+    resolved = enrichment_worker._resolve_concentration(
+        "Xerjoff", "Totally Made Up Scent", allow_serp=False
+    )
+    check(
+        "worker resolves brand-prior concentration",
+        bool(resolved) and resolved["concentration"] == "Parfum",
+        str(resolved),
+    )
+    check(
+        "worker concentration meta carries source",
+        bool(resolved) and resolved["concentration_meta"]["source"] == "tier1_brand_prior",
+        str(resolved),
+    )
+
+    # 3. _apply_concentration injects into payload + raw_identity.
+    worker_payload = {"raw_identity": {"name": "Imaginary Extrait de Parfum"}}
+    enrichment_worker._apply_concentration(
+        worker_payload, "Testhouse", "Imaginary Extrait de Parfum"
+    )
+    check(
+        "worker payload carries top-level concentration",
+        worker_payload.get("concentration") == "Extrait",
+        str(worker_payload),
+    )
+    check(
+        "worker raw_identity carries concentration + meta",
+        worker_payload["raw_identity"].get("concentration") == "Extrait"
+        and isinstance(worker_payload["raw_identity"].get("concentration_meta"), dict),
+        str(worker_payload["raw_identity"]),
+    )
+
+    # 4. Cache hydration fills details.concentration (fill-only, live wins).
+    details = api.engine.UnifiedDetails(notes=api.engine.NotesList())
+    entry = {
+        "frag_cards": {"Community Interest": [{"label": "Have", "count": "1"}]},
+        "raw_identity": {"concentration": "Eau de Parfum"},
+    }
+    api._hydrate_details_from_entry(details, entry)
+    check(
+        "hydration fills concentration from cached raw_identity",
+        getattr(details, "concentration", None) == "Eau de Parfum",
+    )
+    setattr(details, "concentration", "Extrait")
+    api._hydrate_details_from_entry(details, entry)
+    check(
+        "hydration never overwrites an existing concentration",
+        getattr(details, "concentration", None) == "Extrait",
+    )
+
+    # 5. Stored fragrance_records surface concentration from fg_raw.
+    record = {
+        "record_key": "fg:test",
+        "canonical_fg_url": "https://www.fragrantica.com/perfume/Test-House/Test-1.html",
+        "bn_url": None,
+        "name": "Test",
+        "house": "Test House",
+        "year": 2026,
+        "gender": "Unisex",
+        "image_url": None,
+        "search": {},
+        "fg_raw": {
+            "frag_cards": {"Community Interest": [{"label": "Have", "count": "1"}]},
+            "concentration": "Extrait",
+        },
+        "bn_raw": {},
+        "derived_metrics": None,
+    }
+    stored_details = api._details_from_fragrance_record(record)
+    check(
+        "stored record surfaces concentration onto details",
+        getattr(stored_details, "concentration", None) == "Extrait",
+    )
+
+    # 6. The backlog sweeper flags rows missing base fields.
+    import scripts.enrich_database_metrics as sweeper
+
+    complete_dm = {
+        "source_coverage": {
+            "performance_score": True,
+            "value_score": True,
+            "community_interest_score": True,
+            "wear_profile": True,
+        }
+    }
+    full_row = {
+        "derived_metrics": complete_dm,
+        "gender": "Unisex",
+        "year": 2026,
+        "concentration": "Eau de Parfum",
+    }
+    check(
+        "sweeper accepts a row with metrics and base fields",
+        sweeper._stored_metrics_complete(full_row) is True,
+    )
+    for missing in ("gender", "year", "concentration"):
+        partial_row = {k: v for k, v in full_row.items() if k != missing}
+        check(
+            f"sweeper flags a row missing {missing}",
+            sweeper._stored_metrics_complete(partial_row) is False,
+        )
+    check(
+        "sweeper treats explicit Unknown concentration as attempted",
+        sweeper._stored_metrics_complete({**full_row, "concentration": "Unknown"}) is True,
+    )
+    nested_row = {
+        "derived_metrics": complete_dm,
+        "concentration": "Eau de Parfum",
+        "product": {"gender": "Unisex", "year": 2026},
+    }
+    check(
+        "sweeper reads base fields nested under product",
+        sweeper._stored_metrics_complete(nested_row) is True,
+    )
+
+    # 7. Backfill writes the missing base fields in place.
+    row = {"concentration": ""}
+    sweeper._backfill_base_fields(
+        row, gender="Men", year=2020, brand="Testhouse", name="Imaginary Extrait de Parfum"
+    )
+    check(
+        "backfill fills gender/year/concentration",
+        row.get("gender") == "Men"
+        and row.get("year") == 2020
+        and row.get("concentration") == "Extrait",
+        str(row),
+    )
+
+
 def test_stored_detail_completion_logic() -> None:
     print("Stored detail completion logic checks (no DATABASE_URL required):")
 
@@ -726,6 +878,7 @@ def main() -> int:
     test_no_db_contract()
     test_mobile_new_device_session_binding()
     test_hydration_dedup()
+    test_concentration_pipeline()
     test_stored_detail_completion_logic()
     if db.ENABLED:
         test_db_lifecycle()

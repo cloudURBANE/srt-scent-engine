@@ -3439,6 +3439,24 @@ def _hydrate_details_from_entry(
             if notes.top or notes.heart or notes.base or notes.flat:
                 applied = True
 
+    # Concentration: fill-only, like notes. The worker stores it inside
+    # raw_identity (fg_detail_cache has no dedicated column); fragrance_records
+    # rows surface it top-level in fg_raw. Without this fill the /details
+    # payload's getattr(details, "concentration", None) always resolves None
+    # for worker-enriched fragrances.
+    if not str(getattr(details, "concentration", "") or "").strip():
+        entry_raw_identity = entry.get("raw_identity") or {}
+        if not isinstance(entry_raw_identity, dict):
+            entry_raw_identity = {}
+        cached_concentration = str(
+            entry.get("concentration")
+            or entry_raw_identity.get("concentration")
+            or ""
+        ).strip()
+        if cached_concentration:
+            setattr(details, "concentration", cached_concentration)
+            applied = True
+
     # pros_cons / reviews: additive but de-duplicated -- never replace live
     # content, and never accumulate copies. This helper can run more than once
     # over the same bundle (a stored detail that already carries pros_cons /
@@ -3556,6 +3574,11 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
     parfumo_url = str(raw_identity.get("parfumo_url") or "").strip()
     if parfumo_url:
         setattr(details, "parfumo_url", parfumo_url)
+    concentration = str(
+        fg_raw.get("concentration") or raw_identity.get("concentration") or ""
+    ).strip()
+    if concentration:
+        setattr(details, "concentration", concentration)
     setattr(details, "_had_stored_derived_metrics", stored_derived_metrics is not None)
     for raw_review in list(bn_raw.get("reviews") or []) + list(fg_raw.get("reviews") or []):
         if isinstance(raw_review, dict) and raw_review.get("text"):
@@ -4194,6 +4217,11 @@ class CompleteJobRequest(BaseModel):
     house: str | None = None
     year: int | str | None = None
     gender: str | None = None
+    # Worker-resolved concentration (SemanticScentEngine / Parfinity tiers).
+    # Stored inside raw_identity_json (fg_detail_cache has no dedicated column)
+    # and in fragrance_records.fg_raw_json; hydrated back onto details so the
+    # /details response stops resolving it to None.
+    concentration: str | None = None
     image_url: str | None = None
     schema_version: int = 1
     captured_at: str | None = None
@@ -4310,6 +4338,10 @@ def _payload_identity(
     if image_url and not image_url.startswith(("http://", "https://")):
         image_url = ""
 
+    concentration = str(
+        payload.concentration or raw_identity.get("concentration") or ""
+    ).strip()
+
     if canonical_fg_url:
         url_name = engine.FragranticaEngine.name_from_url(canonical_fg_url)
         url_house = engine.FragranticaEngine.brand_from_url(canonical_fg_url)
@@ -4325,7 +4357,13 @@ def _payload_identity(
     if name and house:
         name = engine.IdentityTools.strip_house_from_name(name, house)
 
-    return {"name": name or None, "house": house or None, "year": year, "image_url": image_url or None}
+    return {
+        "name": name or None,
+        "house": house or None,
+        "year": year,
+        "image_url": image_url or None,
+        "concentration": concentration or None,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -4380,6 +4418,11 @@ def _build_parfumo_cache_row(
     fragrance_records aggregate, exactly like the Parfinity seed pipeline."""
     raw_identity = dict(payload.raw_identity) if isinstance(payload.raw_identity, dict) else {}
     raw_identity.setdefault("parfumo_url", canonical_parfumo_url)
+    concentration = str(
+        payload.concentration or raw_identity.get("concentration") or ""
+    ).strip()
+    if concentration:
+        raw_identity.setdefault("concentration", concentration)
     name = str(payload.name or raw_identity.get("name") or job.get("name") or "").strip()
     house = str(payload.house or raw_identity.get("house") or job.get("house") or "").strip()
     if name and house:
@@ -4413,6 +4456,7 @@ def _build_parfumo_cache_row(
         "house": house or None,
         "year": _coerce_year(payload.year),
         "gender": payload.gender or "Unisex / Unspecified",
+        "concentration": concentration or None,
         "image_url": image_url or None,
         "schema_version": payload.schema_version,
         "source": "parfumo",
@@ -4619,6 +4663,14 @@ def complete_enrichment_job(
         temp_details.derived_metrics = None
     gender = temp_details.gender
     year = _coerce_year(temp_selected.year)
+    concentration = identity.get("concentration")
+    # raw_identity_json is the durable home for concentration: fg_detail_cache
+    # has no dedicated column, and lookup_detail_cache already returns this blob.
+    raw_identity_blob = (
+        dict(payload.raw_identity) if isinstance(payload.raw_identity, dict) else {}
+    )
+    if concentration:
+        raw_identity_blob.setdefault("concentration", concentration)
 
     cache_row = {
         "canonical_fg_url": canonical,
@@ -4626,6 +4678,7 @@ def complete_enrichment_job(
         "house": identity["house"],
         "year": year,
         "gender": gender,
+        "concentration": concentration,
         "image_url": identity["image_url"],
         "schema_version": payload.schema_version,
         "source": payload.source or "worker",
@@ -4634,7 +4687,7 @@ def complete_enrichment_job(
         "notes": _json_for_db_blob(payload.notes or {}),
         "pros_cons": _json_for_db_blob(payload.pros_cons or []),
         "reviews": _json_for_db_blob(payload.reviews or []),
-        "raw_identity": _json_for_db_blob(payload.raw_identity or {}),
+        "raw_identity": _json_for_db_blob(raw_identity_blob),
         "derived_metrics": _json_for_db_blob(temp_details.derived_metrics)
         if temp_details.derived_metrics is not None
         else None,

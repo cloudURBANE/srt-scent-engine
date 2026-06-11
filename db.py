@@ -295,6 +295,15 @@ def _upsert_completed_fragrance_record(
         "source": cache_row.get("source", "worker"),
         "quality_status": cache_row.get("quality_status", "complete"),
     }
+    # Concentration rides in the JSONB payload (no dedicated column). Accept it
+    # top-level on the cache_row or nested in raw_identity, so both the API
+    # completion path and direct script callers persist it consistently.
+    raw_identity = cache_row.get("raw_identity")
+    concentration = _clean_text(cache_row.get("concentration")) or _clean_text(
+        raw_identity.get("concentration") if isinstance(raw_identity, dict) else None
+    )
+    if concentration:
+        fg_raw["concentration"] = concentration
     derived_metrics = cache_row.get("derived_metrics")
     conn.execute(
         """
