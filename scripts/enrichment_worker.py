@@ -80,7 +80,89 @@ HEAL_SWEEP_PAGE_LIMIT = 200
 # Churn guard: stop re-opening a job after this many total requests -- a row
 # whose upstream sources genuinely lack a fact should not loop forever.
 HEAL_SWEEP_MAX_REQUESTED = int(os.environ.get("ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED", "8"))
+# Resolver misses get this many retryable failures before going terminal.
+# Queue analysis showed every resolver miss was marked non-retryable on its
+# first attempt, so transient SERP/budget hiccups became permanent failures.
+# db.fail_job still hard-caps total retryable failures at MAX_RETRYABLE_FAILURES.
+RESOLVER_RETRY_GRACE = int(os.environ.get("ENRICHMENT_RESOLVER_RETRY_GRACE", "2"))
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Basenotes-normalized house names that no longer match their Fragrantica
+# designer. Keys are alias-normalized (lowercase, alphanumerics + spaces);
+# values are the Fragrantica brand. Applied to args.brand, identity probes,
+# and the normalized query variant.
+HOUSE_ALIASES: dict[str, str] = {
+    "initio": "Initio Parfums Privés",
+    "initio parfums": "Initio Parfums Privés",
+    "penhaligons": "Penhaligon's",
+    "lataffa": "Lattafa",
+    "lattafa perfumes": "Lattafa",
+    "pull bear": "Pull&Bear",
+    "pull and bear": "Pull&Bear",
+    "d s and durga": "D.S. & Durga",
+    "d s durga": "D.S. & Durga",
+    "ds durga": "D.S. & Durga",
+    "maitre parfumeur et gantier": "Maitre Parfumeur et Gantier",
+    "le jardin retrouve": "Le Jardin Retrouvé",
+    "victorias secret": "Victoria's Secret",
+    "bath and body works": "Bath & Body Works",
+}
+
+# Product lines with essentially no Fragrantica coverage (mass-market body
+# mists). When one of these exhausts the resolver (terminal
+# fg_url_missing_after_resolution), the worker retires the job to `ignored`
+# instead of `failed`, so it stops polluting the failure counts and is never
+# requeued by "Retry failed jobs". Mode: "any" retires the whole house,
+# "prefix"/"contains" match against the alias-normalized name.
+NO_FRAGRANTICA_LINES: tuple[tuple[str, str, str], ...] = (
+    ("bath and body works", "any", ""),
+    ("bath body works", "any", ""),
+    ("victorias secret", "prefix", "pink"),
+    ("calvin klein", "contains", "body mist"),
+)
+
+
+def _matches_no_fragrantica_line(job: dict[str, Any]) -> bool:
+    house = _alias_key(str(job.get("house") or ""))
+    name = _alias_key(str(job.get("name") or ""))
+    if not house:
+        return False
+    for house_key, mode, marker in NO_FRAGRANTICA_LINES:
+        if house != house_key:
+            continue
+        if mode == "any":
+            return True
+        if mode == "prefix" and name.startswith(marker):
+            return True
+        if mode == "contains" and marker in name:
+            return True
+    return False
+
+
+# Garbled Basenotes names that cannot be repaired generically (accents and
+# punctuation were stripped at import). Keyed by (alias-normalized house,
+# alias-normalized name) -> the Fragrantica display name.
+NAME_ALIASES: dict[tuple[str, str], str] = {
+    ("le jardin retrouve", "verveine dete"): "Verveine d'Été",
+    ("xerjoff", "17 17 irisss"): "Irisss",
+}
+
+# Concentration suffixes baked into Basenotes-normalized names ("24 Faubourg
+# Eau De Parfum") that defeat Fragrantica search. Longest forms first.
+_CONCENTRATION_RE = re.compile(
+    r"\b("
+    r"eau\s+de\s+parfum(\s+intense)?"
+    r"|eau\s+de\s+toilette(\s+intense)?"
+    r"|eau\s+de\s+cologne"
+    r"|eau\s+fraiche"
+    r"|extrait\s+de\s+parfum"
+    r"|esprit\s+de\s+parfum"
+    r"|parfum\s+de\s+toilette"
+    r"|elixir\s+de\s+parfum"
+    r"|edp|edt|edc"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class WorkerError(Exception):
@@ -190,12 +272,13 @@ class ApiClient:
     def status(self) -> dict[str, Any]:
         return self._request("GET", "/api/enrichment/status", auth=False)
 
-    def list_jobs(self, status: str = "pending", limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
-        payload = self._request(
-            "GET",
-            "/api/enrichment/jobs",
-            params={"status": status, "limit": max(1, min(limit, MAX_LIST_LIMIT))},
-        )
+    def list_jobs(
+        self, status: str = "pending", limit: int = DEFAULT_LIMIT, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"status": status, "limit": max(1, min(limit, MAX_LIST_LIMIT))}
+        if offset:
+            params["offset"] = max(0, int(offset))
+        payload = self._request("GET", "/api/enrichment/jobs", params=params)
         jobs = payload.get("jobs") or []
         if not isinstance(jobs, list):
             raise WorkerError("api_invalid_json", "jobs was not a list", retryable=True)
@@ -362,26 +445,138 @@ def _now_iso() -> str:
 
 
 def _canonical_fg_url(url: str) -> str:
+    """Canonical perfume-page URL, or "" when the input is not one.
+
+    Non-perfume Fragrantica URLs (designer pages, search pages) must never be
+    treated as a usable fg_url: feeding one to fetch_payload yields an instant
+    parser_empty_frag_cards that repeats identically on every retry. Returning
+    "" here makes every caller fall through to real query resolution instead.
+    """
     text = (url or "").strip()
     if not text:
         return ""
     canonical = engine.FragranticaEngine.canonical_url(text)
     if engine.FragranticaEngine.is_perfume_url(canonical):
         return canonical.rstrip("/")
-    if "://" in text:
-        scheme, rest = text.split("://", 1)
-        if "/" in rest:
-            host, path = rest.split("/", 1)
-            text = f"{scheme.lower()}://{host.lower()}/{path}"
-        else:
-            text = f"{scheme.lower()}://{rest.lower()}"
-    return text.rstrip("/")
+    return ""
 
 
 def _job_label(job: dict[str, Any]) -> str:
     bits = [str(job.get("name") or "").strip(), str(job.get("house") or "").strip()]
     label = " ".join(b for b in bits if b)
     return label or str(job.get("query") or job.get("fg_url") or job.get("job_key") or job.get("id") or "job")
+
+
+def _alias_key(text: str) -> str:
+    """Lowercase alphanumeric-and-space form used to match HOUSE_ALIASES keys."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (text or "").lower())).strip()
+
+
+def _canonical_house(house: str) -> str:
+    """Map a Basenotes-normalized house to its Fragrantica brand, if known."""
+    text = (house or "").strip()
+    if not text:
+        return ""
+    return HOUSE_ALIASES.get(_alias_key(text), text)
+
+
+def _canonical_name(house: str, name: str) -> str:
+    """Repair a known-garbled fragrance name for a given house."""
+    text = (name or "").strip()
+    if not text:
+        return ""
+    return NAME_ALIASES.get((_alias_key(house), _alias_key(text)), text)
+
+
+def _apply_house_aliases(query: str) -> str:
+    """Rewrite known-broken house spellings inside a free-text query.
+
+    Longest keys apply first so "initio parfums" wins over "initio", and a
+    query that already carries the canonical brand is left alone — otherwise a
+    shorter key matching inside an already-rewritten canonical value would
+    duplicate its tokens ("Initio Parfums Privés Privés …").
+    """
+    out = query
+    for key, canonical in sorted(HOUSE_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if canonical.lower() in out.lower():
+            continue
+        pattern = re.compile(r"\b" + r"\s+".join(re.escape(t) for t in key.split()) + r"\b", re.IGNORECASE)
+        out = pattern.sub(canonical, out)
+    return out
+
+
+def _strip_concentration_terms(text: str) -> str:
+    stripped = _CONCENTRATION_RE.sub(" ", text)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" -–—|:")
+    # Never strip the query down to nothing (e.g. a bare "Eau de Cologne").
+    return stripped or text
+
+
+def _dedupe_query_tokens(text: str) -> str:
+    """Drop repeated tokens, keeping first occurrence — fixes Basenotes rows
+    like "Classique Eau De Toilette Jean Paul Gaultier Classique"."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in text.split():
+        key = tok.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+    return " ".join(out)
+
+
+def _normalize_query_text(query: str) -> str:
+    """The cleaned-up search variant: alias houses, drop concentration
+    suffixes, collapse duplicated tokens. The raw query stays available as a
+    fallback variant, so normalization only has to help the common case."""
+    text = re.sub(r"\s+", " ", (query or "")).strip()
+    if not text:
+        return ""
+    text = _apply_house_aliases(text)
+    text = _strip_concentration_terms(text)
+    return _dedupe_query_tokens(text)
+
+
+def _query_variants(job: dict[str, Any]) -> list[str]:
+    """Search-query variants in priority order: repaired identity (when a
+    house/name alias applies), then the normalized query, then the raw query."""
+    raw = _build_query(job)
+    variants: list[str] = []
+    house = str(job.get("house") or "").strip()
+    name = str(job.get("name") or "").strip()
+    if house and name:
+        repaired_house = _canonical_house(house)
+        repaired_name = _canonical_name(house, name)
+        if repaired_house != house or repaired_name != name:
+            repaired = _normalize_query_text(f"{repaired_house} {repaired_name}")
+            if repaired:
+                variants.append(repaired)
+    for q in (_normalize_query_text(raw), raw):
+        if q and q not in variants:
+            variants.append(q)
+    return variants
+
+
+def _fg_url_from_job_query(job: dict[str, Any]) -> str:
+    """Promote a query that is itself a Fragrantica perfume URL to fg_url.
+
+    Some Basenotes-imported rows arrive with the literal FG URL in `query` and
+    no fg_url; _build_query used to discard those, so the job could never
+    resolve despite carrying its own answer.
+    """
+    query = str(job.get("query") or "").strip()
+    if not query.lower().startswith("http"):
+        return ""
+    canonical = engine.FragranticaEngine.canonical_url(query)
+    if engine.FragranticaEngine.is_perfume_url(canonical):
+        return canonical.rstrip("/")
+    return ""
+
+
+def _resolver_miss_retryable(job: dict[str, Any]) -> bool:
+    """First RESOLVER_RETRY_GRACE misses stay retryable; after that, terminal."""
+    return int(job.get("failure_count") or 0) < RESOLVER_RETRY_GRACE
 
 
 def _build_query(job: dict[str, Any]) -> str:
@@ -518,7 +713,7 @@ def _build_engine_args(*, enhanced: bool = False) -> argparse.Namespace:
 
 def _first_linked_result(results: list[engine.UnifiedFragrance]) -> engine.UnifiedFragrance | None:
     for item in results:
-        if item.frag_url:
+        if item.frag_url and _canonical_fg_url(item.frag_url):
             return engine.UnifiedFragrance(
                 name=item.name,
                 brand=item.brand,
@@ -555,8 +750,8 @@ def _api_result_to_candidate(item: dict[str, Any]) -> engine.UnifiedFragrance | 
 
 
 def _candidate_matches_job(candidate: engine.UnifiedFragrance, job: dict[str, Any]) -> bool:
-    job_name = str(job.get("name") or "").strip()
-    job_house = str(job.get("house") or "").strip()
+    job_name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
+    job_house = _canonical_house(str(job.get("house") or ""))
     if not job_name and not job_house:
         return True
     probe = engine.UnifiedFragrance(
@@ -571,6 +766,79 @@ def _candidate_matches_job(candidate: engine.UnifiedFragrance, job: dict[str, An
         url=candidate.frag_url,
     )
     return engine.Orchestrator.identity_score(probe, catalog_item) >= engine.Orchestrator.CATALOG_ACCEPT
+
+
+CATALOG_TIER_BUDGET = float(os.environ.get("ENRICHMENT_CATALOG_TIER_BUDGET", "12") or 12)
+CATALOG_TIER_SIBLING_MARGIN = 0.06
+
+
+def _designer_catalog_candidate(
+    scraper,
+    job: dict[str, Any],
+    *,
+    debug: bool = False,
+) -> engine.UnifiedFragrance | None:
+    """Deterministic Fragrantica tier: crawl the house's designer page(s).
+
+    The engine's own designer-catalog fallback only runs behind the
+    QueryRepair.needs_repair gate under a small shared deadline, which is how
+    sibling flankers flake ("1872 Twist Basil" resolved while "1872 Twist
+    Geranium" exhausted its retries). This tier always runs for house+name
+    jobs once search came up empty: a designer page enumerates the whole
+    line, so if the perfume exists on Fragrantica it is in this list. Scored
+    with the engine's own identity acceptor plus a sibling margin so
+    near-ties (EDT vs EDP rows) are never guessed.
+    """
+    house = _canonical_house(str(job.get("house") or ""))
+    name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
+    if not house or not name:
+        return None
+    probe = engine.UnifiedFragrance(name=name, brand=house, year=_coerce_year(job.get("year")))
+    scored: list[tuple[float, engine.CatalogItem]] = []
+    try:
+        for label in engine.IdentityTools.catalog_brand_keys(house, name):
+            deadline = engine.Deadline(CATALOG_TIER_BUDGET)
+            items = _run_engine_call(
+                lambda: engine.SearchSniper.catalog_candidates_for_brand(
+                    scraper, label, deadline, slug_limit=8, page_timeout=6.0
+                ),
+                debug=debug,
+            )
+            for item in items:
+                scored.append((engine.Orchestrator.identity_score(probe, item), item))
+            if scored and max(score for score, _ in scored) >= engine.Orchestrator.CATALOG_ACCEPT:
+                break
+    except Exception as exc:
+        print(f"  [catalog] designer-catalog tier failed: {exc}")
+        return None
+    if not scored:
+        return None
+    # Collapse duplicates before ranking: the same perfume frequently appears
+    # on more than one designer label page (parent house + line alias), and a
+    # duplicate of the best row must never masquerade as a sibling near-tie.
+    best_by_url: dict[str, tuple[float, engine.CatalogItem]] = {}
+    for score, item in scored:
+        key = engine.FragranticaEngine.dedupe_key(item.url)
+        if key not in best_by_url or score > best_by_url[key][0]:
+            best_by_url[key] = (score, item)
+    ranked = sorted(best_by_url.values(), key=lambda pair: pair[0], reverse=True)
+    best_score, best = ranked[0]
+    runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+    if best_score < engine.Orchestrator.CATALOG_ACCEPT:
+        print(f"  [catalog] best {best.url} score={best_score:.2f} below accept; skipping")
+        return None
+    if runner_up >= engine.Orchestrator.CATALOG_ACCEPT and best_score - runner_up < CATALOG_TIER_SIBLING_MARGIN:
+        print(f"  [catalog] sibling collision ({best_score:.2f} vs {runner_up:.2f}); skipping")
+        return None
+    print(f"  [catalog] accepted {best.url} score={best_score:.2f}")
+    return engine.UnifiedFragrance(
+        name=best.name,
+        brand=best.brand,
+        year=best.year,
+        frag_url=best.url,
+        resolver_source="worker_designer_catalog",
+        resolver_score=best_score,
+    )
 
 
 def _api_linked_candidates(
@@ -649,8 +917,8 @@ def _accept_candidate(candidate: engine.UnifiedFragrance | None, job: dict[str, 
     if not candidate:
         return False
     if candidate.resolver_source == "designer_catalog_brand_query":
-        job_name = str(job.get("name") or "")
-        job_house = str(job.get("house") or "")
+        job_name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
+        job_house = _canonical_house(str(job.get("house") or ""))
         probe = engine.UnifiedFragrance(name=job_name, brand=job_house, year="")
         catalog_item = engine.CatalogItem(name=candidate.name, brand=candidate.brand, year="", url=candidate.frag_url)
         score = engine.Orchestrator.identity_score(probe, catalog_item)
@@ -667,7 +935,14 @@ def resolve_candidate(
     *,
     debug: bool = False,
 ) -> engine.UnifiedFragrance:
-    fg_url = engine.FragranticaEngine.canonical_url(str(job.get("fg_url") or "").strip())
+    raw_fg_url = str(job.get("fg_url") or "").strip()
+    fg_url = _canonical_fg_url(raw_fg_url)
+    if raw_fg_url and not fg_url:
+        # A stored non-perfume URL (designer/search page) would fail parsing
+        # instantly on every attempt; ignore it and resolve by query instead.
+        print(f"  [resolve] ignoring non-perfume fg_url on job: {raw_fg_url!r}")
+    if not fg_url:
+        fg_url = _fg_url_from_job_query(job)
     if fg_url:
         return engine.UnifiedFragrance(
             name=str(job.get("name") or ""),
@@ -677,32 +952,38 @@ def resolve_candidate(
             frag_url=fg_url,
         )
 
-    query = _build_query(job)
-    if not query:
+    queries = _query_variants(job)
+    if not queries:
         raise WorkerError("fg_url_missing_after_resolution", "job has no fg_url or usable query", retryable=False)
 
-    house = job.get("house")
-    if house:
-        args.brand = house
+    house = _canonical_house(str(job.get("house") or ""))
+    # Work on a per-job copy: mutating the shared engine args would leak this
+    # job's brand into every later job's search (the catalog fallback keys off
+    # args.brand, so a stale brand sends house-less jobs to the wrong catalog).
+    args = argparse.Namespace(**vars(args))
+    args.brand = house
 
-    try:
+    for query in queries:
         results = _search_candidates(scraper, query, args, debug=debug)
-    except WorkerError:
-        raise
-
-    candidate = _first_linked_result(results)
-    if _accept_candidate(candidate, job):
-        return candidate
-
-    if not getattr(args, "external_search", False):
-        enhanced_args = _build_engine_args(enhanced=True)
-        if house:
-            enhanced_args.brand = house
-        print(f"  [resolve] retrying with enhanced search for {query!r}")
-        results = _search_candidates(scraper, query, enhanced_args, debug=debug)
         candidate = _first_linked_result(results)
         if _accept_candidate(candidate, job):
             return candidate
+
+    if not getattr(args, "external_search", False):
+        enhanced_args = _build_engine_args(enhanced=True)
+        enhanced_args.brand = house
+        for query in queries:
+            print(f"  [resolve] retrying with enhanced search for {query!r}")
+            results = _search_candidates(scraper, query, enhanced_args, debug=debug)
+            candidate = _first_linked_result(results)
+            if _accept_candidate(candidate, job):
+                return candidate
+
+    # Deterministic designer-catalog tier: search missed, so enumerate the
+    # house's Fragrantica catalog directly and identity-match against it.
+    catalog_candidate = _designer_catalog_candidate(scraper, job, debug=debug)
+    if catalog_candidate is not None:
+        return catalog_candidate
 
     # Parfumo fallback (§6.B): Fragrantica resolution found no URL. When enabled,
     # try the Parfumo factual-field resolver before giving up. On accept this
@@ -712,7 +993,11 @@ def resolve_candidate(
     if parfumo_candidate is not None:
         return parfumo_candidate
 
-    raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
+    raise WorkerError(
+        "fg_url_missing_after_resolution",
+        "resolver returned no Fragrantica URL",
+        retryable=_resolver_miss_retryable(job),
+    )
 
 
 def resolve_candidate_for_job(
@@ -725,8 +1010,7 @@ def resolve_candidate_for_job(
 ) -> engine.UnifiedFragrance:
     if not _job_missing_fg_url(job):
         return resolve_candidate(scraper, args, job, debug=debug)
-    query = _build_query(job)
-    if query:
+    for query in _query_variants(job):
         linked = _api_linked_candidates(client, query, job, debug=debug)
         if linked:
             return linked[0]
@@ -748,8 +1032,8 @@ def _try_parfumo_fallback(
     """
     if not engine.ParfumoEngine.enabled():
         return None
-    house = str(job.get("house") or "").strip()
-    name = str(job.get("name") or "").strip()
+    house = _canonical_house(str(job.get("house") or ""))
+    name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
     if not house or not name:
         return None  # Parfumo discovery needs both a house and a name.
     year = _coerce_year(job.get("year"))
@@ -990,7 +1274,12 @@ def fetch_payload(
 
     frag_cards = details.frag_cards or {}
     if not isinstance(frag_cards, dict) or not frag_cards:
-        retryable = bool(engine.FragranticaEngine.is_perfume_url(candidate.frag_url))
+        # A perfume-shaped URL is always worth retrying; a non-perfume landing
+        # (designer/search page) still gets the resolver grace window, because
+        # the next attempt re-resolves and may pick a different URL.
+        retryable = bool(
+            engine.FragranticaEngine.is_perfume_url(candidate.frag_url)
+        ) or _resolver_miss_retryable(job)
         fetch_errors = getattr(details, "fetch_errors", {}) or {}
         parse_diagnostics = getattr(details, "parse_diagnostics", {}) or {}
         fg_diag = parse_diagnostics.get("fg") if isinstance(parse_diagnostics, dict) else {}
@@ -1218,16 +1507,34 @@ def process_job(
                 print(f"{index_label} Server: {detail[:200]}")
         elif config.debug and str(exc) != exc.code:
             print(f"{index_label} {exc}")
+        retire = (
+            exc.code == "fg_url_missing_after_resolution"
+            and not exc.retryable
+            and _matches_no_fragrantica_line(job)
+        )
         if config.dry_run:
-            print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
+            if retire:
+                print(f"{index_label} Dry run: would retire to ignored (no Fragrantica coverage)")
+            else:
+                print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
             return False
+        if retire:
+            try:
+                client.ignore_job(
+                    job_id,
+                    "no Fragrantica coverage for this product line; retired after resolver exhausted retries",
+                )
+                print(f"{index_label} Retired {label} to ignored (no Fragrantica coverage)")
+                return False
+            except WorkerError as ignore_exc:
+                print(f"{index_label} Could not retire to ignored: {ignore_exc.code}")
         try:
             client.fail_job(job_id, str(exc), exc.retryable)
             print(f"{index_label} Marked {'retryable' if exc.retryable else 'non-retryable'} failure")
         except WorkerError as fail_exc:
             print(f"{index_label} Could not report failure: {fail_exc.code}")
         return False
-    except Exception as exc:
+    except Exception:
         if result_sink is not None:
             result_sink["error"] = "engine_exception"
         print(f"{index_label} Failed {label}: engine_exception")
@@ -1245,23 +1552,44 @@ def requeue_terminal_failed_jobs(
     config: WorkerConfig,
     *,
     limit: int,
-) -> int:
-    """Move terminal `failed` rows back to `pending` so the worker can process them."""
+) -> list[str]:
+    """Move terminal `failed` rows back to `pending`; returns the requeued ids.
+
+    The ids matter to the caller: requeueing resets failure_count to 0, so the
+    only-retries filter in process_pending cannot recognize these rows by their
+    failure history and must match them by id instead.
+    """
     failed_jobs = client.list_jobs("failed", limit=max(limit, MAX_LIST_LIMIT))
-    requeued = 0
+    requeued: list[str] = []
     for job in failed_jobs[:limit]:
         job_id = str(job.get("id") or "").strip()
         if not job_id:
             continue
         if config.dry_run:
             print(f"Dry run: would requeue failed job {job_id}")
-            requeued += 1
+            requeued.append(job_id)
             continue
         client.requeue_job(job_id, priority=max(10, int(job.get("priority") or 0) + 1))
-        requeued += 1
+        requeued.append(job_id)
     if requeued:
-        print(f"Requeued {requeued} terminal failed job(s) to pending.")
+        print(f"Requeued {len(requeued)} terminal failed job(s) to pending.")
     return requeued
+
+
+def _retry_batch(jobs: list[dict[str, Any]], requeued_ids: set[str]) -> list[dict[str, Any]]:
+    """Pending rows that belong in a "Retry failed jobs" batch.
+
+    Two populations qualify: rows with a live failure history (retryable
+    failures keep their failure_count on the way back to pending), and rows
+    just requeued from terminal `failed` — requeueing resets failure_count to
+    0, so those are only recognizable by id.
+    """
+    return [
+        j
+        for j in jobs
+        if int(j.get("failure_count") or 0) > 0
+        or str(j.get("id") or "") in requeued_ids
+    ]
 
 
 def process_pending(
@@ -1274,14 +1602,15 @@ def process_pending(
     if not config.auth_configured:
         raise SystemExit("ENRICHMENT_WORKER_TOKEN is required for worker operations.")
 
+    requeued_ids: set[str] = set()
     if only_retries:
-        requeue_terminal_failed_jobs(client, config, limit=config.limit)
+        requeued_ids = set(requeue_terminal_failed_jobs(client, config, limit=config.limit))
 
     list_limit = max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit)
     pending_all = client.list_jobs("pending", limit=list_limit)
     jobs = pending_all
     if only_retries:
-        jobs = [j for j in jobs if int(j.get("failure_count") or 0) > 0]
+        jobs = _retry_batch(jobs, requeued_ids)
     jobs = jobs[: config.limit]
     if not jobs:
         print("No matching pending jobs.")
@@ -1425,9 +1754,9 @@ def print_manager_header(client: ApiClient, config: WorkerConfig) -> None:
     if status.get("error"):
         print(f"Status endpoint: unavailable ({status['error']})")
     print(f"Pending jobs: {counts.get('pending', 'unavailable')}")
-    print(f"Processing stale: unavailable")
-    print(f"Failed retryable: unavailable")
-    print(f"Completed today: unavailable")
+    print("Processing stale: unavailable")
+    print("Failed retryable: unavailable")
+    print("Completed today: unavailable")
     print()
     print("1. List pending jobs")
     print("2. Process next job")
@@ -1889,7 +2218,7 @@ def _run_auto_approve(
                 )
         except Exception:
             _log_event("auto: FG clearance preflight errored (continuing)", "warn")
-    target = job.get("name") or job.get("brand") or job.get("id") or "next job"
+    target = job.get("name") or job.get("house") or job.get("id") or "next job"
     if reclaiming:
         _log_event(f"auto: reclaiming stale {target}", "warn")
     else:
