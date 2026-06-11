@@ -3231,6 +3231,7 @@ _BASENOTES_CHALLENGE_MARKERS = (
     "/cdn-cgi/challenge-platform",
 )
 _BASENOTES_SESSION_LOCK = threading.Lock()
+_BASENOTES_SESSION_REQUEST_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
 _BASENOTES_LAST_MINT_ERROR: str | None = None
 _BASENOTES_NEXT_MINT_AFTER = 0.0
@@ -3242,6 +3243,7 @@ _FRAGRANTICA_CACHE_FILE = Path(
     )
 )
 _FRAGRANTICA_SESSION_LOCK = threading.Lock()
+_FRAGRANTICA_SESSION_REQUEST_LOCK = threading.Lock()
 _FRAGRANTICA_SESSION = None
 _FRAGRANTICA_LAST_MINT_ERROR: str | None = None
 _FRAGRANTICA_NEXT_MINT_AFTER = 0.0
@@ -4132,7 +4134,18 @@ class RoutedScraper:
         return self.default_scraper
 
     def get(self, url: str, *args, **kwargs):
-        return self._for_url(url).get(url, *args, **kwargs)
+        client = self._for_url(url)
+        host = (urlparse(url).netloc or "").lower()
+        request_lock = None
+        if client is not self.default_scraper:
+            if host.endswith("fragrantica.com"):
+                request_lock = _FRAGRANTICA_SESSION_REQUEST_LOCK
+            elif host.endswith("basenotes.com"):
+                request_lock = _BASENOTES_SESSION_REQUEST_LOCK
+        if request_lock is None:
+            return client.get(url, *args, **kwargs)
+        with request_lock:
+            return client.get(url, *args, **kwargs)
 
     def __getattr__(self, name: str):
         return getattr(self.default_scraper, name)

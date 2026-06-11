@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from http.cookies import SimpleCookie
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -718,6 +719,44 @@ def test_stored_detail_completion_logic() -> None:
         db.upsert_fragrance_details = saved_upsert
 
 
+def test_detail_fetch_saturation_returns_retryable_503() -> None:
+    print("Detail fetch saturation checks (no DATABASE_URL required):")
+    old_gate = api._DETAIL_FETCH_SEMAPHORE
+    old_timeout = api._DETAIL_FETCH_QUEUE_TIMEOUT
+    old_fetch = api.engine.fetch_selected_details
+    gate = threading.BoundedSemaphore(1)
+    gate.acquire()
+    called = {"fetch": 0}
+    try:
+        api._DETAIL_FETCH_SEMAPHORE = gate
+        api._DETAIL_FETCH_QUEUE_TIMEOUT = 0.0
+
+        def fail_fetch(*args, **kwargs):
+            called["fetch"] += 1
+            raise AssertionError("detail fetch should not run when the gate is saturated")
+
+        api.engine.fetch_selected_details = fail_fetch
+        client = TestClient(api.app)
+        response = client.post(
+            "/api/fragrances/details",
+            json={
+                "id": "source:https://www.fragrantica.com/perfume/Le-Labo/Santal-33-12201.html"
+            },
+        )
+    finally:
+        try:
+            gate.release()
+        except ValueError:
+            pass
+        api._DETAIL_FETCH_SEMAPHORE = old_gate
+        api._DETAIL_FETCH_QUEUE_TIMEOUT = old_timeout
+        api.engine.fetch_selected_details = old_fetch
+
+    check("saturated detail fetch returns 503", response.status_code == 503, str(response.status_code))
+    check("saturated detail fetch sets Retry-After", response.headers.get("retry-after") == "2", str(response.headers))
+    check("saturated detail fetch does not call engine", called["fetch"] == 0, str(called))
+
+
 # ---------------------------------------------------------------------------
 # DB-backed checks (only when DATABASE_URL is set)
 # ---------------------------------------------------------------------------
@@ -922,6 +961,7 @@ def main() -> int:
     test_hydration_dedup()
     test_concentration_pipeline()
     test_stored_detail_completion_logic()
+    test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()
     else:

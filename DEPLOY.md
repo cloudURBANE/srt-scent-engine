@@ -54,11 +54,16 @@ return `503`. The existing bundled JSON detail cache keeps working unchanged.
 ## Notes
 
 - `$PORT` is provided by Railway; the start command binds to it.
-- Each request creates its own scraper session (`engine.get_scraper()`), so
-  there is no shared mutable state between requests.
+- Each request creates its own default scraper. Cloudflare-clearance sessions
+  for Basenotes/Fragrantica may be reused, but calls through those shared
+  sessions are serialized per host to avoid concurrent session mutation.
 - Search/detail are blocking; FastAPI runs the sync endpoints in its threadpool.
-  If you expect heavy concurrency, scale via Railway replicas or add
-  `--workers N` to the start command.
+  The API caps live upstream work per process with
+  `API_LIVE_SEARCH_MAX_CONCURRENT` (default `6`) and
+  `API_DETAIL_FETCH_MAX_CONCURRENT` (default `8`). Cache hits bypass those caps;
+  saturated uncached requests return `503` with `Retry-After: 2` instead of
+  piling up resolver threads. For heavy traffic, scale via Railway replicas or
+  add `--workers N` to the start command.
 
 ## Search provider env
 

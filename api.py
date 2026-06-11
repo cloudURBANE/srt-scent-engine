@@ -144,6 +144,17 @@ _ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 3.0)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
 _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
 
+_LIVE_SEARCH_MAX_CONCURRENT = max(1, _env_int("API_LIVE_SEARCH_MAX_CONCURRENT", 6))
+_LIVE_SEARCH_QUEUE_TIMEOUT = max(
+    0.0, _env_float("API_LIVE_SEARCH_QUEUE_TIMEOUT", 0.25)
+)
+_DETAIL_FETCH_MAX_CONCURRENT = max(1, _env_int("API_DETAIL_FETCH_MAX_CONCURRENT", 8))
+_DETAIL_FETCH_QUEUE_TIMEOUT = max(
+    0.0, _env_float("API_DETAIL_FETCH_QUEUE_TIMEOUT", 0.25)
+)
+_LIVE_SEARCH_SEMAPHORE = threading.BoundedSemaphore(_LIVE_SEARCH_MAX_CONCURRENT)
+_DETAIL_FETCH_SEMAPHORE = threading.BoundedSemaphore(_DETAIL_FETCH_MAX_CONCURRENT)
+
 
 _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
 _DERIVED_METRICS_LOCK_GUARD = threading.Lock()
@@ -193,6 +204,19 @@ def _require_diagnostics_token(authorization: str | None = Header(default=None))
             "Diagnostics endpoints are not configured (ENRICHMENT_WORKER_TOKEN unset)."
         ),
     )
+
+
+def _try_acquire_gate(gate: threading.BoundedSemaphore, timeout: float) -> bool:
+    if timeout <= 0:
+        return gate.acquire(blocking=False)
+    return gate.acquire(timeout=timeout)
+
+
+def _release_gate(gate: threading.BoundedSemaphore) -> None:
+    try:
+        gate.release()
+    except ValueError:
+        logger.error("attempted to release an unacquired concurrency gate")
 
 
 class ClearanceCookieRequest(BaseModel):
@@ -878,6 +902,11 @@ def _spawn_warm_refresh(query: str) -> bool:
             return False
         _warm_refresh_inflight.add(key)
 
+    if not _try_acquire_gate(_LIVE_SEARCH_SEMAPHORE, 0.0):
+        with _warm_refresh_lock:
+            _warm_refresh_inflight.discard(key)
+        return False
+
     def _run() -> None:
         try:
             scraper = engine.get_scraper()
@@ -892,12 +921,19 @@ def _spawn_warm_refresh(query: str) -> bool:
                 "warm-cache background refresh failed q=%r", query, exc_info=True
             )
         finally:
+            _release_gate(_LIVE_SEARCH_SEMAPHORE)
             with _warm_refresh_lock:
                 _warm_refresh_inflight.discard(key)
 
-    threading.Thread(
-        target=_run, name="warm-cache-refresh", daemon=True
-    ).start()
+    try:
+        threading.Thread(
+            target=_run, name="warm-cache-refresh", daemon=True
+        ).start()
+    except Exception:
+        _release_gate(_LIVE_SEARCH_SEMAPHORE)
+        with _warm_refresh_lock:
+            _warm_refresh_inflight.discard(key)
+        raise
     return True
 
 
@@ -1947,26 +1983,40 @@ def search(
     if warm_results:
         cache_disqualified_reasons.append("warm_missing_fragrantica_url")
 
-    scraper = engine.get_scraper()
     # `timing` is filled in place by the engine with per-stage wall-clock marks
     # (initial_fg_bn_fetch, link_attach, ...). Surfaced under
     # diagnostics.timing so latency can be attributed to a stage instead of
     # inferred from stdout. Cheap to collect; always on.
     timing: dict[str, Any] = {}
     fallback_source: str | None = None
-    try:
-        results = engine.search_once(scraper, query, _ARGS, timing=timing)
-    except Exception:
-        # A live-engine crash (transient provider fault, encoding error, etc.)
-        # must not rob the client of the DB-backed fallback below. Log loudly
-        # and degrade to the cache path instead of surfacing a bare 502 -- a
-        # crash here previously masked perfectly good DB results (e.g. the
-        # "Royal Sapphire" spell-repair UnicodeEncodeError).
-        logger.exception("engine.search_once failed for query %r; falling back to cache", query)
+    live_search_saturated = not _try_acquire_gate(
+        _LIVE_SEARCH_SEMAPHORE, _LIVE_SEARCH_QUEUE_TIMEOUT
+    )
+    if live_search_saturated:
         results = []
+    else:
+        try:
+            scraper = engine.get_scraper()
+            results = engine.search_once(scraper, query, _ARGS, timing=timing)
+        except Exception:
+            # A live-engine crash (transient provider fault, encoding error, etc.)
+            # must not rob the client of the DB-backed fallback below. Log loudly
+            # and degrade to the cache path instead of surfacing a bare 502 -- a
+            # crash here previously masked perfectly good DB results (e.g. the
+            # "Royal Sapphire" spell-repair UnicodeEncodeError).
+            logger.exception("engine.search_once failed for query %r; falling back to cache", query)
+            results = []
+        finally:
+            _release_gate(_LIVE_SEARCH_SEMAPHORE)
 
     if not results:
         results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
+        if live_search_saturated and not results:
+            raise HTTPException(
+                status_code=503,
+                detail="Search capacity is saturated; retry shortly.",
+                headers={"Retry-After": "2"},
+            )
 
     # Final wire-level guard: if a candidate still has no recoverable identity
     # after URL-based backfills, suppress it instead of surfacing a broken
@@ -1978,6 +2028,9 @@ def search(
     diagnostics = _search_diagnostics(results)
     if cache_disqualified_reasons:
         diagnostics["cache_fast_path_disqualified"] = cache_disqualified_reasons
+    if live_search_saturated:
+        diagnostics["live_search_saturated"] = True
+        diagnostics["live_search_skipped"] = True
     if timing:
         diagnostics["timing"] = timing
     if fallback_source:
@@ -1985,10 +2038,16 @@ def search(
         fallback_label = (
             "identity cache" if fallback_source == "identity" else f"{fallback_source} detail cache"
         )
-        diagnostics["warning"] = (
-            "Live providers returned zero candidates; results came from the "
-            f"{fallback_label}."
-        )
+        if live_search_saturated:
+            diagnostics["warning"] = (
+                "Live search capacity is saturated; results came from the "
+                f"{fallback_label}."
+            )
+        else:
+            diagnostics["warning"] = (
+                "Live providers returned zero candidates; results came from the "
+                f"{fallback_label}."
+            )
 
     return {
         "query": query,
@@ -4209,15 +4268,25 @@ def details(req: DetailRequest) -> dict[str, Any]:
             enrichment_requested_count=enrichment_requested_count,
         )
 
-    scraper = engine.get_scraper()
-    try:
-        detail_bundle = engine.fetch_selected_details(
-            scraper, selected, _ARGS.detail_timeout
-        )
-    except Exception as exc:
+    if not _try_acquire_gate(_DETAIL_FETCH_SEMAPHORE, _DETAIL_FETCH_QUEUE_TIMEOUT):
+        _enqueue_enrichment_job(selected, req)
         raise HTTPException(
-            status_code=502, detail=f"Detail fetch failed: {exc}"
-        ) from exc
+            status_code=503,
+            detail="Detail fetch capacity is saturated; retry shortly.",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        scraper = engine.get_scraper()
+        try:
+            detail_bundle = engine.fetch_selected_details(
+                scraper, selected, _ARGS.detail_timeout
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Detail fetch failed: {exc}"
+            ) from exc
+    finally:
+        _release_gate(_DETAIL_FETCH_SEMAPHORE)
 
     # Cache lookup order: live Fragrantica -> durable DB cache -> bundled JSON
     # cache -> partial BN-only response. Live data always wins (both overlay
