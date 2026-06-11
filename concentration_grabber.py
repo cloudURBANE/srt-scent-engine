@@ -196,6 +196,12 @@ class SemanticScentEngine:
 
     CACHE_PATH = os.path.join(tempfile.gettempdir(), "scent_engine_cache_v6.json")
     CACHE_TTL_SEC = 60 * 60 * 24 * 7
+    # Hard ceilings for the SERP consensus pass. Without them a blocked or
+    # stalling DuckDuckGo leaves the enrichment worker wedged inside analyze()
+    # with no feedback. Page-level timeouts bound each fetch; the budget bounds
+    # the whole multi-source loop.
+    SERP_PAGE_LOAD_TIMEOUT_SEC = float(os.environ.get("SCENT_SERP_PAGE_TIMEOUT_SECONDS", "20"))
+    SERP_TOTAL_BUDGET_SEC = float(os.environ.get("SCENT_SERP_BUDGET_SECONDS", "75"))
 
     @staticmethod
     def _normalize(s):
@@ -411,6 +417,8 @@ class SemanticScentEngine:
 
     @staticmethod
     def _fetch_serp(page, query, site_filter=""):
+        """Fetch one DDG SERP. Returns rows, [] for a loaded-but-empty SERP,
+        or None when the fetch/parse itself failed (the only retryable case)."""
         q = f"{query} {site_filter}".strip()
         safe_q = quote(q)
         try:
@@ -418,14 +426,14 @@ class SemanticScentEngine:
             page.wait.load_start()
             time.sleep(0.4)
         except Exception:
-            return []
+            return None
         rows = []
         try:
             titles   = [el.text for el in page.eles('css:.result__title')[:10]]
             snippets = [el.text for el in page.eles('css:.result__snippet')[:10]]
             urls_txt = [el.text for el in page.eles('css:.result__url')[:10]]
         except Exception:
-            return []
+            return None
         n = min(len(titles), len(snippets), len(urls_txt))
         for i in range(n):
             url_text = (urls_txt[i] or "").strip()
@@ -442,11 +450,15 @@ class SemanticScentEngine:
 
     @staticmethod
     def _retry_fetch(page, query, site_filter, attempts=3):
+        """Retry only on fetch/parse failures (None). A SERP that loaded fine
+        with zero results is a real answer -- retrying it just burns the job's
+        time budget and looks like a hang from the worker dashboard."""
         for attempt in range(attempts):
             rows = SemanticScentEngine._fetch_serp(page, query, site_filter)
-            if rows:
+            if rows is not None:
                 return rows
-            time.sleep(0.8 * (attempt + 1))
+            if attempt + 1 < attempts:
+                time.sleep(0.8 * (attempt + 1))
         return []
 
     @staticmethod
@@ -505,6 +517,18 @@ class SemanticScentEngine:
             co.set_argument('--disable-blink-features=AutomationControlled')
             co.incognito()
             page = ChromiumPage(co)
+            try:
+                # Bound every navigation; DrissionPage's defaults can leave a
+                # stalled DDG request blocking the worker far longer than the
+                # whole SERP pass is worth.
+                page.set.timeouts(
+                    base=10,
+                    page_load=SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
+                    script=10,
+                )
+                page.set.load_mode.eager()
+            except Exception:
+                pass
 
             try:
                 page.get("https://html.duckduckgo.com/html/")
@@ -514,6 +538,15 @@ class SemanticScentEngine:
                 pass
 
             for label, site_filter in source_queries:
+                elapsed = time.time() - t0
+                if elapsed > SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:
+                    print(
+                        f"  {E}[SYS] SERP budget exhausted "
+                        f"({elapsed:.0f}s > {SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:.0f}s); "
+                        f"skipping {label} and remaining sources.{Z}"
+                    )
+                    per_source_rows.setdefault(label, [])
+                    continue
                 print(f"  {C}[FETCH] {label:11s}...{Z}", end="")
                 sys.stdout.flush()
                 rows = SemanticScentEngine._retry_fetch(page, fragrance_name, site_filter)

@@ -991,6 +991,80 @@ def test_completeness_self_heal_sweep() -> None:
     )
 
 
+def test_worker_fact_summary_and_serp_retry() -> None:
+    print("Per-fragrance fact summary + bounded SERP retry checks (no DATABASE_URL required):")
+
+    # 1. The worker reports filled/missing facts with the same contract the
+    #    heal sweep audits stored records with.
+    payload = {
+        "name": "Layton",
+        "house": "Parfums de Marly",
+        "year": "2016",
+        "gender": "for men and women",
+        "frag_cards": {"longevity": {"long lasting": 10}},
+        "notes": {"top": ["apple"], "heart": [], "base": ["vanilla"], "flat": []},
+        "reviews": [{"text": "great"}],
+        "raw_identity": {"concentration": "Eau de Parfum"},
+        "concentration": "Eau de Parfum",
+    }
+    dm = {
+        "source_coverage": {
+            "performance_score": True,
+            "value_score": True,
+            "community_interest_score": True,
+            "wear_profile": True,
+        },
+        "main_accords": {"top_accords": ["vanilla", "woody"]},
+        "wear_profile": {"primary_seasons": ["Winter"], "primary_time": "Night"},
+    }
+    filled, missing = enrichment_worker._payload_fact_summary(payload, dm)
+    check("full payload reports every fact filled", not missing, str(missing))
+    check(
+        "full payload fills the whole FACT_FIELDS contract",
+        set(filled) == set(enrichment_worker.FACT_FIELDS),
+        str(filled),
+    )
+
+    sparse, sparse_missing = enrichment_worker._payload_fact_summary(
+        {"name": "X", "notes": {"top": [], "heart": [], "base": [], "flat": []}}, None
+    )
+    check(
+        "sparse payload reports concrete missing facts",
+        {"house", "concentration", "performance_score", "notes", "reviews"} <= set(sparse_missing),
+        str(sparse_missing),
+    )
+    check("quality gate rejects absent derived metrics", enrichment_worker._dm_metrics_complete(None) is False)
+    check("quality gate accepts full coverage", enrichment_worker._dm_metrics_complete(dm) is True)
+
+    # 2. A DDG SERP that loaded fine with zero results is a real answer:
+    #    _retry_fetch must not burn retries (and sleeps) on it. Only a fetch
+    #    failure (None) is retryable.
+    import concentration_grabber as cg
+
+    calls = {"n": 0}
+    orig = cg.SemanticScentEngine._fetch_serp
+    try:
+        def loaded_but_empty(page, q, sf):
+            calls["n"] += 1
+            return []
+
+        cg.SemanticScentEngine._fetch_serp = staticmethod(loaded_but_empty)
+        rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=3)
+        check("empty SERP is returned without retrying", rows == [] and calls["n"] == 1, str(calls))
+
+        calls["n"] = 0
+
+        def fetch_failed(page, q, sf):
+            calls["n"] += 1
+            return None
+
+        cg.SemanticScentEngine._fetch_serp = staticmethod(fetch_failed)
+        rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=2)
+        check("fetch failures retry up to the attempt cap", rows == [] and calls["n"] == 2, str(calls))
+    finally:
+        cg.SemanticScentEngine._fetch_serp = orig
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE

@@ -53,6 +53,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
+from enrichment_facts import FACT_FIELDS, record_fact_status  # noqa: E402
 
 DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
@@ -904,6 +905,24 @@ def _apply_concentration(
     )
 
 
+def _build_worker_derived_metrics(details: Any) -> dict[str, Any] | None:
+    """The derived metrics the API will recompute from this payload, or None."""
+    try:
+        from derived_metrics_adapter import build_derived_metrics
+
+        dm = build_derived_metrics(details)
+    except Exception:
+        return None
+    return dm if isinstance(dm, dict) else None
+
+
+def _dm_metrics_complete(dm: dict[str, Any] | None) -> bool:
+    if not isinstance(dm, dict):
+        return False
+    cov = dm.get("source_coverage") or {}
+    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+
 def _worker_metrics_complete(details: Any) -> bool:
     """True when all 4 Fragrantica status-derived metric groups parsed.
 
@@ -912,16 +931,38 @@ def _worker_metrics_complete(details: Any) -> bool:
     otherwise api._apply_fg_detail_cache_db would hydrate from it and the job
     would never be re-enqueued for a retry.
     """
-    try:
-        from derived_metrics_adapter import build_derived_metrics
+    return _dm_metrics_complete(_build_worker_derived_metrics(details))
 
-        dm = build_derived_metrics(details)
-    except Exception:
-        return False
-    if not isinstance(dm, dict):
-        return False
-    cov = dm.get("source_coverage") or {}
-    return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
+
+def _payload_fact_summary(
+    payload: dict[str, Any], dm: dict[str, Any] | None
+) -> tuple[list[str], list[str]]:
+    """(filled, missing) FACT_FIELDS for a /complete payload.
+
+    Judged with the exact contract the heal sweep audits stored records with
+    (enrichment_facts.record_fact_status), so the worker can report per
+    fragrance which facts this run actually delivered and which the sources
+    still lack -- the operator-facing answer to "what did this update?".
+    """
+    record = {
+        "name": payload.get("name"),
+        "house": payload.get("house"),
+        "year": payload.get("year"),
+        "gender": payload.get("gender"),
+        "fg_raw": {
+            "frag_cards": payload.get("frag_cards") or {},
+            "notes": payload.get("notes") or {},
+            "reviews": payload.get("reviews") or [],
+            "raw_identity": payload.get("raw_identity") or {},
+            "concentration": payload.get("concentration"),
+        },
+        "bn_raw": {},
+        "derived_metrics": dm if isinstance(dm, dict) else None,
+    }
+    status = record_fact_status(record)
+    filled = [field for field in FACT_FIELDS if status.get(field)]
+    missing = [field for field in FACT_FIELDS if not status.get(field)]
+    return filled, missing
 
 
 def fetch_payload(
@@ -993,6 +1034,7 @@ def fetch_payload(
     if image_url:
         raw_identity["image_url"] = image_url
 
+    dm = _build_worker_derived_metrics(details)
     payload = {
         "fg_url": candidate.frag_url,
         "name": identity["name"],
@@ -1011,7 +1053,10 @@ def fetch_payload(
         # "complete" only when all 4 status-derived metric groups parsed. A
         # "partial" entry is ignored by api._apply_fg_detail_cache_db, so the
         # job is naturally re-enqueued and retried on the next /details call.
-        "quality_status": "complete" if _worker_metrics_complete(details) else "partial",
+        "quality_status": "complete" if _dm_metrics_complete(dm) else "partial",
+        # Worker-side only: popped by process_job before upload so the fact
+        # summary does not have to recompute the metrics adapter.
+        "_derived_metrics": dm,
     }
     _apply_concentration(
         payload,
@@ -1091,6 +1136,7 @@ def process_job(
     index_label: str,
     config: WorkerConfig,
     already_claimed: bool = False,
+    result_sink: dict[str, Any] | None = None,
 ) -> bool:
     job_id = str(job.get("id") or "")
     label = _job_label(job)
@@ -1118,6 +1164,12 @@ def process_job(
             detail_timeout=config.detail_timeout,
             debug=config.debug,
         )
+        dm = payload.pop("_derived_metrics", None)
+        facts_filled, facts_missing = _payload_fact_summary(payload, dm)
+        if result_sink is not None:
+            result_sink["facts_filled"] = facts_filled
+            result_sink["facts_missing"] = facts_missing
+            result_sink["quality_status"] = payload.get("quality_status")
         notes = payload.get("notes") or {}
         note_count = sum(len(notes.get(k) or []) for k in ("top", "heart", "base", "flat"))
         target_url = payload.get("fg_url") or payload.get("parfumo_url") or "?"
@@ -1128,6 +1180,13 @@ def process_job(
                 f"{index_label} Parsed frag_cards={len(payload.get('frag_cards') or {})} "
                 f"notes={note_count} reviews={len(payload.get('reviews') or [])}"
             )
+        if facts_missing:
+            print(
+                f"{index_label} Facts {len(facts_filled)}/{len(FACT_FIELDS)} — "
+                f"missing: {', '.join(facts_missing)}"
+            )
+        else:
+            print(f"{index_label} Facts {len(FACT_FIELDS)}/{len(FACT_FIELDS)} — all present")
 
         if config.dry_run:
             print(f"{index_label} Dry run: would upload cache for {target_url}")
@@ -1150,6 +1209,8 @@ def process_job(
         print(f"{index_label} Interrupted while processing {label}; claim will expire naturally.")
         return False
     except WorkerError as exc:
+        if result_sink is not None:
+            result_sink["error"] = exc.code
         print(f"{index_label} Failed {label}: {exc.code}")
         if exc.code == "api_unavailable" and str(exc) != exc.code:
             detail = str(exc).split(":", 1)[-1].strip()
@@ -1167,6 +1228,8 @@ def process_job(
             print(f"{index_label} Could not report failure: {fail_exc.code}")
         return False
     except Exception as exc:
+        if result_sink is not None:
+            result_sink["error"] = "engine_exception"
         print(f"{index_label} Failed {label}: engine_exception")
         if config.debug:
             raise
@@ -1812,6 +1875,20 @@ def _run_auto_approve(
     if auto_state.get("scraper") is None:
         auto_state["scraper"] = engine.get_scraper()
         auto_state["args"] = _build_engine_args()
+        # Same preflight process_pending hard-fails on. Auto mode keeps going
+        # (jobs may still resolve via the API or Parfumo), but the operator
+        # must see WHY every FG detail fetch is about to fail.
+        try:
+            fg_scraper = engine.get_fragrantica_scraper(
+                auto_state["scraper"].default_scraper, mint_clearance=False
+            )
+            if not engine._validate_fragrantica_session(fg_scraper):
+                _log_event(
+                    "auto: FG clearance missing/invalid — detail fetches will fail until mint",
+                    "err",
+                )
+        except Exception:
+            _log_event("auto: FG clearance preflight errored (continuing)", "warn")
     target = job.get("name") or job.get("brand") or job.get("id") or "next job"
     if reclaiming:
         _log_event(f"auto: reclaiming stale {target}", "warn")
@@ -1830,6 +1907,8 @@ def _run_auto_approve(
     # It also catches its own scraping errors and returns False rather than
     # re-raising, so we MUST inspect the return value — otherwise a row that
     # silently fails-and-requeues looks identical to a success here.
+    sink: dict[str, Any] = {}
+    started = time.monotonic()
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             ok = process_job(
@@ -1839,6 +1918,7 @@ def _run_auto_approve(
                 job,
                 index_label="[auto]",
                 config=config,
+                result_sink=sink,
             )
     except KeyboardInterrupt:
         stop.stop_requested = True
@@ -1847,10 +1927,22 @@ def _run_auto_approve(
     except WorkerError as exc:
         _log_event(f"auto: failed ({exc.code})", "err")
         return
+    elapsed = int(time.monotonic() - started)
     if ok:
-        _log_event(f"auto: completed {target}", "ok")
+        filled = sink.get("facts_filled") or []
+        missing = sink.get("facts_missing") or []
+        _log_event(f"auto: completed {target} in {elapsed}s", "ok")
+        if missing:
+            shown = ", ".join(missing[:4]) + ("…" if len(missing) > 4 else "")
+            _log_event(
+                f"auto: {target}: {len(filled)}/{len(FACT_FIELDS)} facts — missing {shown}",
+                "warn",
+            )
+        else:
+            _log_event(f"auto: {target}: all {len(FACT_FIELDS)} facts captured", "ok")
     else:
-        _log_event(f"auto: failed {target}", "err")
+        reason = sink.get("error") or "see worker log"
+        _log_event(f"auto: failed {target} after {elapsed}s ({reason})", "err")
 
 
 def _execute_phone_command(
