@@ -195,6 +195,77 @@ def find_global_row(cur, brand: str, name: str) -> dict | None:
     return cur.fetchone()
 
 
+def _engine_concentration_from_fg_raw(fg_raw: dict) -> str | None:
+    raw_identity = fg_raw.get("raw_identity") if isinstance(fg_raw, dict) else None
+    if not isinstance(raw_identity, dict):
+        raw_identity = {}
+    return fg_raw.get("concentration") or raw_identity.get("concentration")
+
+
+def update_engine_cache_rows(
+    cur,
+    brand: str,
+    name: str,
+    concentration: str,
+    concentration_meta: dict,
+) -> tuple[int, int]:
+    """Fill missing concentration in durable engine cache tables."""
+    detail_updates = 0
+    record_updates = 0
+
+    cur.execute(
+        """
+        SELECT canonical_fg_url, raw_identity_json
+        FROM fg_detail_cache
+        WHERE LOWER(house) = LOWER(%s)
+          AND LOWER(name) = LOWER(%s)
+        """,
+        (brand, name),
+    )
+    for cache_row in cur.fetchall():
+        raw_identity = dict(cache_row["raw_identity_json"] or {})
+        if not _is_unknown(raw_identity.get("concentration")):
+            continue
+        raw_identity["concentration"] = concentration
+        raw_identity["concentration_meta"] = concentration_meta
+        cur.execute(
+            "UPDATE fg_detail_cache SET raw_identity_json = %s, updated_at = now() WHERE canonical_fg_url = %s",
+            (Json(raw_identity), cache_row["canonical_fg_url"]),
+        )
+        detail_updates += 1
+
+    cur.execute(
+        """
+        SELECT record_key, fg_raw_json
+        FROM fragrance_records
+        WHERE LOWER(house) = LOWER(%s)
+          AND LOWER(name) = LOWER(%s)
+        """,
+        (brand, name),
+    )
+    for record_row in cur.fetchall():
+        fg_raw = dict(record_row["fg_raw_json"] or {})
+        if not _is_unknown(_engine_concentration_from_fg_raw(fg_raw)):
+            continue
+        raw_identity = fg_raw.get("raw_identity")
+        if not isinstance(raw_identity, dict):
+            raw_identity = {}
+        else:
+            raw_identity = dict(raw_identity)
+        raw_identity["concentration"] = concentration
+        raw_identity["concentration_meta"] = concentration_meta
+        fg_raw["raw_identity"] = raw_identity
+        fg_raw["concentration"] = concentration
+        fg_raw["concentration_meta"] = concentration_meta
+        cur.execute(
+            "UPDATE fragrance_records SET fg_raw_json = %s, updated_at = now() WHERE record_key = %s",
+            (Json(fg_raw), record_row["record_key"]),
+        )
+        record_updates += 1
+
+    return detail_updates, record_updates
+
+
 def run(args: argparse.Namespace) -> None:
     if args.brand and args.name and not args.all_unknown and args.limit is None:
         print(f"[direct] {args.brand} - {args.name}")
@@ -282,6 +353,15 @@ def run(args: argparse.Namespace) -> None:
                         (Json(pdata), gf_row["id"]),
                     )
                     print(f"  Updated global_fragrances id={gf_row['id']}")
+
+                detail_updates, record_updates = update_engine_cache_rows(
+                    cur, brand, name, new_conc, meta
+                )
+                if detail_updates or record_updates:
+                    print(
+                        "  Updated engine cache rows "
+                        f"(fg_detail_cache={detail_updates}, fragrance_records={record_updates})"
+                    )
 
             conn.commit()
         print(f"  Wrote user_fragrances id={uf_id}")

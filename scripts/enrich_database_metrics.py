@@ -30,6 +30,12 @@ os.environ["SERP_API_PROVIDER"] = "serper"
 import db
 import fragrance_parser_full_rewrite_fixed as engine
 from derived_metrics_adapter import build_derived_metrics
+from enrichment_facts import (
+    derive_families,
+    derive_wear_profile,
+    is_fact_complete,
+    primary_season_from_wear_profile,
+)
 from psycopg.types.json import Json
 import psycopg
 from psycopg.rows import dict_row
@@ -81,18 +87,12 @@ def _base_field_value(payload: dict[str, Any], key: str) -> Any:
     return value
 
 def _base_fields_complete(payload: Any) -> bool:
-    """True when gender, year, and concentration are all present.
-
-    "Unknown" counts as present: it is an explicit sentinel written after an
-    enrichment attempt found no consensus, so the sweep does not re-queue the
-    same row forever (scripts/enrich_concentration.py targets "Unknown" rows
-    for deeper SERP passes).
-    """
+    """True when gender, year, and concentration are real facts."""
     if not isinstance(payload, dict):
         return False
     for key in _BASE_FIELDS:
         value = _base_field_value(payload, key)
-        if value is None or str(value).strip() == "":
+        if not is_fact_complete(value, key):
             return False
     return True
 
@@ -138,12 +138,38 @@ def _backfill_base_fields(payload: dict[str, Any], *, gender: Any, year: Any, br
     Without this the new _base_fields_complete check would flag the same rows
     incomplete again on every sweep, because the metric writes below never
     touched these fields."""
-    if str(payload.get("gender") or "").strip() == "" and gender:
+    if not is_fact_complete(payload.get("gender"), "gender") and is_fact_complete(gender, "gender"):
         payload["gender"] = gender
-    if not payload.get("year") and year:
+    if not is_fact_complete(payload.get("year"), "year") and is_fact_complete(year, "year"):
         payload["year"] = year
-    if str(payload.get("concentration") or "").strip() == "":
-        payload["concentration"] = _cheap_concentration(brand, name)
+    if not is_fact_complete(payload.get("concentration"), "concentration"):
+        concentration = _cheap_concentration(brand, name)
+        if is_fact_complete(concentration, "concentration"):
+            payload["concentration"] = concentration
+
+
+def _apply_derived_facts(payload: dict[str, Any], derived_metrics: dict[str, Any]) -> None:
+    """Project canonical engine-derived facts into app/profile payloads."""
+    families = derive_families(
+        derived_metrics,
+        existing_family=payload.get("family") or payload.get("primary_family"),
+    )
+    if families.get("primary_family"):
+        payload["family"] = families["primary_family"]
+        payload["primary_family"] = families["primary_family"]
+        payload["families"] = families["families"]
+        payload["accords"] = families["accords"]
+        payload["family_meta"] = families["provenance"]
+
+    wear_profile = derive_wear_profile(derived_metrics)
+    if wear_profile:
+        payload["wear_profile"] = wear_profile
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        context["wear_profile"] = wear_profile
+        payload["context"] = context
+        primary_season = primary_season_from_wear_profile(wear_profile)
+        if primary_season:
+            payload["season"] = primary_season
 
 def _global_profile_identity(row: dict[str, Any]) -> tuple[str, str]:
     pdata = row.get("profile_data") or {}
@@ -353,6 +379,10 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
     record_concentration = _cheap_concentration(brand, name)
 
     # 5. Construct cache row
+    raw_identity = {"name": name, "house": brand, "fg_url": resolved_fg_url, "bn_url": resolved_bn_url}
+    if record_concentration != "Unknown":
+        raw_identity["concentration"] = record_concentration
+
     cache_row = {
         "canonical_fg_url": canonical_fg_url,
         "name": name,
@@ -374,7 +404,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
         },
         "pros_cons": list(details.pros_cons) if details.pros_cons else [],
         "reviews": [{"text": r.text, "source": r.source} for r in details.reviews or []],
-        "raw_identity": {"name": name, "house": brand, "fg_url": resolved_fg_url, "bn_url": resolved_bn_url},
+        "raw_identity": raw_identity,
         "quality_status": "complete" if _fg_metrics_complete(details) else "partial",
     }
 
@@ -405,8 +435,8 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                     fdata["source_url"] = resolved_fg_url
                     # Also update notes and accords to match completed profile
                     fdata["notes"] = cache_row["notes"]["flat"]
-                    fdata["family"] = details.family if details.family else fdata.get("family")
                     fdata["pyramid"] = cache_row["notes"]
+                    _apply_derived_facts(fdata, dm)
                     _backfill_base_fields(fdata, gender=details.gender, year=record_year, brand=brand, name=name)
                     cur.execute("UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s", (Json(fdata), user_fragrance_id))
                     print(f"  Updated user_fragrances row ID {user_fragrance_id}")
@@ -423,6 +453,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                         fdata["source_url"] = resolved_fg_url
                         fdata["notes"] = cache_row["notes"]["flat"]
                         fdata["pyramid"] = cache_row["notes"]
+                        _apply_derived_facts(fdata, dm)
                         _backfill_base_fields(fdata, gender=details.gender, year=record_year, brand=brand, name=name)
                         cur.execute("UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s", (Json(fdata), r["id"]))
                         print(f"  Updated user_fragrances row ID {r['id']}")
@@ -437,6 +468,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                     pdata["source_url"] = resolved_fg_url
                     pdata["notes"] = cache_row["notes"]["flat"]
                     pdata["pyramid"] = cache_row["notes"]
+                    _apply_derived_facts(pdata, dm)
                     _backfill_base_fields(pdata, gender=details.gender, year=record_year, brand=brand, name=name)
                     cur.execute("UPDATE global_fragrances SET profile_data = %s WHERE id = %s", (Json(pdata), global_fragrance_id))
                     print(f"  Updated global_fragrances row ID {global_fragrance_id}")
@@ -454,6 +486,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                         pdata["source_url"] = resolved_fg_url
                         pdata["notes"] = cache_row["notes"]["flat"]
                         pdata["pyramid"] = cache_row["notes"]
+                        _apply_derived_facts(pdata, dm)
                         _backfill_base_fields(pdata, gender=details.gender, year=record_year, brand=brand, name=name)
                         cur.execute("UPDATE global_fragrances SET profile_data = %s WHERE id = %s", (Json(pdata), r["id"]))
                         print(f"  Updated global_fragrances row ID {r['id']}")

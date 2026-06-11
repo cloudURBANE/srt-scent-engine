@@ -514,8 +514,12 @@ def test_concentration_pipeline() -> None:
             sweeper._stored_metrics_complete(partial_row) is False,
         )
     check(
-        "sweeper treats explicit Unknown concentration as attempted",
-        sweeper._stored_metrics_complete({**full_row, "concentration": "Unknown"}) is True,
+        "sweeper treats explicit Unknown concentration as incomplete",
+        sweeper._stored_metrics_complete({**full_row, "concentration": "Unknown"}) is False,
+    )
+    check(
+        "sweeper treats default gender as incomplete",
+        sweeper._stored_metrics_complete({**full_row, "gender": "Unisex / Unspecified"}) is False,
     )
     nested_row = {
         "derived_metrics": complete_dm,
@@ -538,6 +542,71 @@ def test_concentration_pipeline() -> None:
         and row.get("year") == 2020
         and row.get("concentration") == "Extrait",
         str(row),
+    )
+
+    # 8. Fact helpers derive app-facing family/wear fields from derived_metrics.
+    import enrichment_facts
+
+    derived = {
+        "main_accords": {
+            "top_accords": ["woody", "aromatic", "citrus"],
+        },
+        "wear_profile": {
+            "primary_seasons": ["Spring", "Summer"],
+            "primary_time": "Day",
+        },
+    }
+    families = enrichment_facts.derive_families(derived, existing_family="Unknown Family")
+    check("family derivation maps main accords", families["primary_family"] == "Woody", str(families))
+    check(
+        "default family is not complete",
+        enrichment_facts.is_fact_complete("Unknown Family", "family") is False,
+    )
+    check(
+        "unsupported Universal season is not complete",
+        enrichment_facts.is_fact_complete("Universal", "season") is False,
+    )
+
+    payload = {}
+    sweeper._apply_derived_facts(payload, derived)
+    check(
+        "sweeper projects derived family and season",
+        payload.get("family") == "Woody" and payload.get("season") == "Spring",
+        str(payload),
+    )
+
+    selected = api.engine.UnifiedFragrance(name="Test", brand="House", year="2026")
+    detail_payload = api._details_to_dict(
+        selected,
+        api.engine.UnifiedDetails(
+            notes=api.engine.NotesList(),
+            derived_metrics=derived,
+        ),
+    )
+    check(
+        "details response projects family facts",
+        detail_payload.get("family") == "Woody"
+        and detail_payload.get("families") == ["Woody", "Aromatic", "Citrus"],
+        str(detail_payload),
+    )
+    check(
+        "details response projects wear profile",
+        detail_payload.get("wear_profile", {}).get("primary_time") == "Day",
+        str(detail_payload.get("wear_profile")),
+    )
+
+    merged_raw_identity = db._cache_row_raw_identity(
+        {
+            "raw_identity": {"name": "Test"},
+            "concentration": "Eau de Parfum",
+            "concentration_meta": {"source": "unit_test", "confidence": 99},
+        }
+    )
+    check(
+        "complete_job raw_identity merge keeps concentration durable",
+        merged_raw_identity.get("concentration") == "Eau de Parfum"
+        and merged_raw_identity.get("concentration_meta", {}).get("source") == "unit_test",
+        str(merged_raw_identity),
     )
 
 
@@ -841,6 +910,8 @@ def test_db_lifecycle() -> None:
             "pros_cons": ["smells good"],
             "reviews": [{"text": "nice", "source": "selftest"}],
             "raw_identity": {"name": "Enrichment Selftest"},
+            "concentration": "Eau de Parfum",
+            "concentration_meta": {"source": "selftest", "confidence": 99},
             "quality_status": "complete",
         }
         updated = db.complete_job(job["id"], cache_row)
@@ -855,6 +926,14 @@ def test_db_lifecycle() -> None:
         check(
             "cached entry quality_status is complete",
             bool(cached and cached.get("quality_status") == "complete"),
+        )
+        check(
+            "cached raw_identity carries top-level concentration",
+            bool(
+                cached
+                and cached.get("raw_identity", {}).get("concentration") == "Eau de Parfum"
+                and cached.get("raw_identity", {}).get("concentration_meta", {}).get("source") == "selftest"
+            ),
         )
 
         requeued = db.requeue_job(job["id"], priority=25)

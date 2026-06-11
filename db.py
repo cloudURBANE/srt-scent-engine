@@ -261,6 +261,33 @@ def _valid_uuid_text(value: Any) -> bool:
     return True
 
 
+def _cache_row_raw_identity(cache_row: dict[str, Any]) -> dict[str, Any]:
+    """Return raw_identity with top-level worker facts merged in.
+
+    fg_detail_cache has no dedicated concentration column. The worker/API
+    contract permits concentration at the cache row top level, nested under
+    raw_identity, or both; this normalizes those shapes before persistence.
+    """
+    raw = cache_row.get("raw_identity") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw_identity = dict(raw)
+
+    concentration = _clean_text(cache_row.get("concentration")) or _clean_text(
+        raw_identity.get("concentration")
+    )
+    if concentration:
+        raw_identity["concentration"] = concentration
+
+    concentration_meta = cache_row.get("concentration_meta") or raw_identity.get(
+        "concentration_meta"
+    )
+    if isinstance(concentration_meta, dict):
+        raw_identity["concentration_meta"] = concentration_meta
+
+    return raw_identity
+
+
 # ---------------------------------------------------------------------------
 # enrichment_jobs -- Pass 1 queue
 # ---------------------------------------------------------------------------
@@ -286,24 +313,29 @@ def _upsert_completed_fragrance_record(
             }
         ),
     )
+    raw_identity = _cache_row_raw_identity(cache_row)
     fg_raw = {
         "frag_cards": cache_row["frag_cards"],
         "notes": cache_row.get("notes") or {},
         "pros_cons": cache_row.get("pros_cons") or [],
         "reviews": cache_row.get("reviews") or [],
-        "raw_identity": cache_row.get("raw_identity") or {},
+        "raw_identity": raw_identity,
         "source": cache_row.get("source", "worker"),
         "quality_status": cache_row.get("quality_status", "complete"),
     }
     # Concentration rides in the JSONB payload (no dedicated column). Accept it
     # top-level on the cache_row or nested in raw_identity, so both the API
     # completion path and direct script callers persist it consistently.
-    raw_identity = cache_row.get("raw_identity")
     concentration = _clean_text(cache_row.get("concentration")) or _clean_text(
         raw_identity.get("concentration") if isinstance(raw_identity, dict) else None
     )
     if concentration:
         fg_raw["concentration"] = concentration
+    concentration_meta = cache_row.get("concentration_meta") or raw_identity.get(
+        "concentration_meta"
+    )
+    if isinstance(concentration_meta, dict):
+        fg_raw["concentration_meta"] = concentration_meta
     derived_metrics = cache_row.get("derived_metrics")
     conn.execute(
         """
@@ -848,7 +880,7 @@ def complete_job(job_id: str, cache_row: dict[str, Any]) -> dict[str, Any] | Non
                     Json(cache_row.get("notes") or {}),
                     Json(cache_row.get("pros_cons") or []),
                     Json(cache_row.get("reviews") or []),
-                    Json(cache_row.get("raw_identity") or {}),
+                    Json(_cache_row_raw_identity(cache_row)),
                     cache_row.get("quality_status", "complete"),
                 ),
             )

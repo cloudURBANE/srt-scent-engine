@@ -52,6 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import db
+from enrichment_facts import derive_families, derive_wear_profile
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
 import parfinity
@@ -1176,6 +1177,8 @@ def _details_to_dict(
     engine.heal_missing_gender_and_year(selected, details)
     notes = details.notes
     concentration = getattr(details, "concentration", None)
+    family_facts = derive_families(details)
+    wear_profile = derive_wear_profile(details)
     payload = {
         # Required top-level fields.
         "name": selected.name,
@@ -1184,6 +1187,9 @@ def _details_to_dict(
         "image_url": getattr(selected, "image_url", None),
         "gender": details.gender,
         "concentration": concentration,
+        "family": family_facts.get("primary_family"),
+        "families": family_facts.get("families") or [],
+        "wear_profile": wear_profile,
         "derived_metrics": details.derived_metrics,
         "source_coverage": _source_coverage(
             selected, details, fragrantica_cached, fragrantica_cache_source
