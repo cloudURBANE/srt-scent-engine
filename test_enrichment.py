@@ -1044,7 +1044,7 @@ def test_worker_fact_summary_and_serp_retry() -> None:
     calls = {"n": 0}
     orig = cg.SemanticScentEngine._fetch_serp
     try:
-        def loaded_but_empty(page, q, sf):
+        def loaded_but_empty(page, q, sf, timeout=None):
             calls["n"] += 1
             return []
 
@@ -1054,7 +1054,7 @@ def test_worker_fact_summary_and_serp_retry() -> None:
 
         calls["n"] = 0
 
-        def fetch_failed(page, q, sf):
+        def fetch_failed(page, q, sf, timeout=None):
             calls["n"] += 1
             return None
 
@@ -1063,6 +1063,56 @@ def test_worker_fact_summary_and_serp_retry() -> None:
         check("fetch failures retry up to the attempt cap", rows == [] and calls["n"] == 2, str(calls))
     finally:
         cg.SemanticScentEngine._fetch_serp = orig
+
+    class _FakeWait:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def load_start(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+            return None
+
+    class _EmptyPage:
+        def __init__(self, ok: bool) -> None:
+            self.ok = ok
+            self.wait = _FakeWait()
+            self.get_calls: list[dict[str, object]] = []
+            self.eles_calls: list[dict[str, object]] = []
+
+        def get(self, url, **kwargs):
+            self.get_calls.append({"url": url, **kwargs})
+            return self.ok
+
+        def eles(self, selector, **kwargs):
+            self.eles_calls.append({"selector": selector, **kwargs})
+            return []
+
+    page = _EmptyPage(ok=True)
+    rows = cg.SemanticScentEngine._fetch_serp(page, "nonexistent scent", "", timeout=3)
+    check("loaded empty page is a non-retryable empty result", rows == [], str(rows))
+    check(
+        "DDG navigation disables DrissionPage's hidden retries",
+        page.get_calls and page.get_calls[0].get("retry") == 0 and page.get_calls[0].get("timeout") == 3,
+        str(page.get_calls),
+    )
+    check(
+        "empty SERP does not wait on all result selectors",
+        len(page.eles_calls) == 1 and page.eles_calls[0].get("timeout") <= 3,
+        str(page.eles_calls),
+    )
+    check(
+        "load-start wait is bounded for DDG pages",
+        page.wait.calls and page.wait.calls[0].get("timeout") <= 3,
+        str(page.wait.calls),
+    )
+
+    failed_page = _EmptyPage(ok=False)
+    rows = cg.SemanticScentEngine._retry_fetch(failed_page, "q", "", attempts=2)
+    check(
+        "page.get(False) is treated as retryable fetch failure",
+        rows == [] and len(failed_page.get_calls) == 2,
+        str(failed_page.get_calls),
+    )
 
 
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
@@ -1318,6 +1368,7 @@ def main() -> int:
     test_concentration_pipeline()
     test_stored_detail_completion_logic()
     test_completeness_self_heal_sweep()
+    test_worker_fact_summary_and_serp_retry()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()
