@@ -203,6 +203,13 @@ or invalid token → `401`. `ENRICHMENT_WORKER_TOKEN` / `DATABASE_URL` unset →
 | `POST /api/enrichment/jobs/{id}/complete` | Upload parsed Fragrantica detail; rejects empty `frag_cards`. |
 | `POST /api/enrichment/jobs/{id}/fail` | Record a failure (`retryable: true` returns the job to `pending`). |
 | `POST /api/enrichment/jobs/{id}/ignore` | Permanently retire a bad job. |
+| `GET /api/enrichment/completeness?limit=200&offset=0` | Granular fact audit over `fragrance_records`: per fragrance, exactly which facts are missing (identity, gender, concentration, family, accords, wear profile, score groups, notes, reviews) plus the durable job state for that identity. Read-only. |
+| `POST /api/enrichment/heal` | Self-healing sweep: re-audits a page of records and idempotently reopens a job for every fragrance missing any fact. Body: `{"limit": 200, "offset": 0, "priority": 5, "dry_run": false, "fields": null, "max_requested_count": 8}`. Pending/processing jobs are untouched; `ignored` jobs stay retired; `max_requested_count` caps churn. |
+
+The offline worker triggers `POST /api/enrichment/heal` automatically whenever
+auto-approve finds the queue empty (throttled by `ENRICHMENT_HEAL_SWEEP_MINUTES`,
+default 30; set `0` to disable), so the pipeline continuously refills itself
+with fragrances whose stored facts are incomplete.
 
 `/complete` 5xx responses include a `detail` string with the underlying
 exception class so the worker can surface actionable failure logs.

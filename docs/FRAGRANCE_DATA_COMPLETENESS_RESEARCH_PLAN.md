@@ -432,13 +432,41 @@ Verification:
 - `python test_parfinity.py`
   - Passed.
 
+## Implementation Update 2 - 2026-06-11 (self-healing sweep)
+
+Completed in `search_engine`:
+
+- Added a granular per-fragrance fact contract in `enrichment_facts.py`:
+  `FACT_FIELDS` (name, house, year, gender, concentration, family,
+  main_accords, wear_profile, performance_score, value_score,
+  community_interest_score, notes, reviews), `record_fact_status()`, and
+  `missing_facts()` over `fragrance_records`-shaped rows.
+- Added `db.list_fragrance_records()` / `db.count_fragrance_records()` /
+  `db.get_jobs_by_keys()` for paged audits with batched job-state annotation.
+- Added two token-authed management endpoints (`ENRICHMENT_WORKER_TOKEN`):
+  - `GET /api/enrichment/completeness` -- read-only granular audit; per
+    fragrance it lists exactly which facts are missing and the durable job
+    state for that identity.
+  - `POST /api/enrichment/heal` -- the self-healing sweep; idempotently
+    reopens an enrichment job (via `recover_or_enqueue_job`) for every
+    fragrance missing any audited fact. Supports `dry_run`, `fields` filter,
+    `priority` (default 5, below interactive recoveries at 10),
+    `limit`/`offset` paging, and `max_requested_count` churn protection.
+- Wired the worker's auto-approve loop to call the heal sweep whenever the
+  queue is empty (`ENRICHMENT_HEAL_SWEEP_MINUTES`, default 30, `0` disables;
+  `ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED`, default 8), paging through the table
+  across idle ticks -- so a deployed API + running worker continuously detect
+  and repair incomplete fragrances with no operator action.
+- Added focused checks in `test_enrichment.py` for the granular fact audit,
+  endpoint auth, dry-run/field-filter/churn-guard behavior, and the worker's
+  throttled, paged idle-tick sweep.
+
 Still left:
 
-- Run a real DB dry-run/audit with `DATABASE_URL` configured to quantify post-change coverage.
+- Run a real DB dry-run/audit with `DATABASE_URL` configured to quantify post-change coverage (`GET /api/enrichment/completeness` now does this remotely).
 - Backfill existing historical rows:
   - run concentration tier-1 backfill against app rows and engine cache rows;
   - run metrics/profile projection from existing `fg_detail_cache` rows before re-scraping.
-- Add a read-only `scripts/audit_fragrance_completeness.py` so coverage can be measured consistently before and after sweeps.
 - Decide the app compatibility shape for legacy `environment` versus canonical `wear_profile`.
 - Update the adjacent app repo so save/profile paths stop persisting `Unknown Family` and unsupported `Universal`.
 - Decide whether `global_fragrances.profile_data.product` should duplicate year/gender/concentration or keep those facts only top-level.

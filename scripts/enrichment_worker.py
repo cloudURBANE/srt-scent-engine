@@ -71,6 +71,14 @@ HTTP_WRITE_TIMEOUT = 45.0
 DASHBOARD_ATTENTION_LIMIT = 25
 # Phone remote control heartbeat — not every 5s dashboard tick.
 PHONE_HEARTBEAT_INTERVAL = 30.0
+# Self-healing sweep: when auto_approve finds the queue empty, it asks the API
+# to audit stored fragrances for missing facts and requeue the incomplete ones
+# (POST /api/enrichment/heal). Throttled to once per interval; 0 disables.
+HEAL_SWEEP_INTERVAL_MINUTES = float(os.environ.get("ENRICHMENT_HEAL_SWEEP_MINUTES", "30"))
+HEAL_SWEEP_PAGE_LIMIT = 200
+# Churn guard: stop re-opening a job after this many total requests -- a row
+# whose upstream sources genuinely lack a fact should not loop forever.
+HEAL_SWEEP_MAX_REQUESTED = int(os.environ.get("ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED", "8"))
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -204,6 +212,22 @@ class ApiClient:
         if not isinstance(results, list):
             raise WorkerError("api_invalid_json", "search results was not a list", retryable=True)
         return [item for item in results if isinstance(item, dict)]
+
+    def heal_sweep(
+        self,
+        *,
+        limit: int = HEAL_SWEEP_PAGE_LIMIT,
+        offset: int = 0,
+        priority: int = 5,
+        max_requested_count: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit, "offset": offset, "priority": priority}
+        if max_requested_count is not None:
+            body["max_requested_count"] = max_requested_count
+        # The API audits a whole page of records in one call; give it headroom.
+        return self._request(
+            "POST", "/api/enrichment/heal", json=body, timeout=HTTP_WRITE_TIMEOUT
+        )
 
     def claim_job(self, job_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/enrichment/jobs/{job_id}/claim")
@@ -1717,6 +1741,43 @@ def _pick_stale_processing_job(client: ApiClient) -> dict[str, Any] | None:
     return stale[0] if stale else None
 
 
+def _maybe_run_heal_sweep(client: ApiClient, auto_state: dict[str, Any]) -> None:
+    """Idle-queue self-healing: requeue stored fragrances with missing facts.
+
+    Runs only when auto_approve finds nothing pending, at most once per
+    HEAL_SWEEP_INTERVAL_MINUTES. Pages through fragrance_records across
+    successive idle ticks (offset kept on auto_state) so big databases are
+    audited in slices, then wraps back to the start.
+    """
+    if HEAL_SWEEP_INTERVAL_MINUTES <= 0:
+        return
+    now = time.time()
+    last = float(auto_state.get("heal_last_at") or 0.0)
+    if now - last < HEAL_SWEEP_INTERVAL_MINUTES * 60.0:
+        return
+    auto_state["heal_last_at"] = now
+    offset = int(auto_state.get("heal_offset") or 0)
+    try:
+        result = client.heal_sweep(
+            limit=HEAL_SWEEP_PAGE_LIMIT,
+            offset=offset,
+            priority=5,
+            max_requested_count=HEAL_SWEEP_MAX_REQUESTED,
+        )
+    except WorkerError as exc:
+        _log_event(f"auto: heal sweep failed ({exc.code})", "err")
+        return
+    audited = int(result.get("audited") or 0)
+    queued = int(result.get("queued") or 0)
+    incomplete = int(result.get("incomplete") or 0)
+    auto_state["heal_offset"] = 0 if audited < HEAL_SWEEP_PAGE_LIMIT else offset + audited
+    _log_event(
+        f"auto: heal sweep audited {audited} (offset {offset}) — "
+        f"{incomplete} incomplete, {queued} requeued",
+        "ok" if queued else "info",
+    )
+
+
 def _run_auto_approve(
     client: ApiClient,
     config: WorkerConfig,
@@ -1744,6 +1805,7 @@ def _run_auto_approve(
             return
         if not jobs:
             _log_event("auto: queue empty — nothing to approve", "info")
+            _maybe_run_heal_sweep(client, auto_state)
             return
         job = jobs[0]
 
