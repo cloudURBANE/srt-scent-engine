@@ -4349,14 +4349,20 @@ def normalize_notes(notes: NotesList) -> NotesList:
     if notes.has_pyramid and all(levels) and keys[0] == keys[1] == keys[2]:
         notes.has_pyramid = False
         notes.flat = dedupe_notes(notes.top)[0]
-        notes.top = notes.heart = notes.base = []
+        notes.top = []
+        notes.heart = []
+        notes.base = []
     elif notes.has_pyramid and sum(bool(level) for level in levels) < 2:
         notes.has_pyramid = False
         notes.flat = dedupe_notes([*notes.top, *notes.heart, *notes.base, *notes.flat])[0]
-        notes.top = notes.heart = notes.base = []
+        notes.top = []
+        notes.heart = []
+        notes.base = []
     elif not notes.has_pyramid:
         notes.flat = dedupe_notes([*notes.flat, *notes.top, *notes.heart, *notes.base])[0]
-        notes.top = notes.heart = notes.base = []
+        notes.top = []
+        notes.heart = []
+        notes.base = []
     return notes
 
 def review_key(text: str, width: int = 420) -> str:

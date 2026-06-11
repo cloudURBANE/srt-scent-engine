@@ -112,6 +112,23 @@ def test_multi_token_name_requires_distinctive_coverage() -> None:
     check("true Creed Bayrhum Vétiver remains", names == ["Bayrhum Vétiver"], str(names))
 
 
+def test_normalize_notes_flattens_to_independent_layers() -> None:
+    print("Note normalization aliasing checks:")
+    notes = engine.NotesList(
+        has_pyramid=True,
+        top=["Rose"],
+        heart=["Rose"],
+        base=["Rose"],
+    )
+    engine.normalize_notes(notes)
+    notes.top.append("Bergamot")
+    check(
+        "top layer can change independently",
+        notes.heart == [] and notes.base == [],
+        str((notes.top, notes.heart, notes.base)),
+    )
+
+
 def test_cache_search_rejects_same_house_sibling() -> None:
     print("API cache sibling relevance checks:")
     old_record_search = api.db.search_fragrance_records
@@ -129,6 +146,7 @@ def test_cache_search_rejects_same_house_sibling() -> None:
                 "house": "Creed",
                 "bn_url": "https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
                 "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Bayrhum-Vetiver-30691.html",
+                "image_url": "https://cdn.example.test/wild-vetiver.jpg",
                 "source_captured_at": "2099-01-01T00:00:00+00:00",
             },
         ]
@@ -139,6 +157,56 @@ def test_cache_search_rejects_same_house_sibling() -> None:
     identities = [(row.brand, row.name) for row in rows]
     check("cached Wild Vétiver row is dropped", ("Creed", "Wild Vétiver") not in identities, str(identities))
     check("cached Bayrhum Vétiver row remains", identities == [("Creed", "Bayrhum Vétiver")], str(identities))
+
+
+def test_aggregate_cache_search_does_not_expose_unproven_image() -> None:
+    print("API aggregate image provenance checks:")
+    old_record_search = api.db.search_fragrance_records
+    try:
+        api.db.search_fragrance_records = lambda query, limit=15: [
+            {
+                "name": "Bayrhum Vetiver",
+                "house": "Creed",
+                "bn_url": "https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
+                "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Bayrhum-Vetiver-30691.html",
+                "image_url": "https://cdn.example.test/wild-vetiver.jpg",
+                "source_captured_at": "2099-01-01T00:00:00+00:00",
+            },
+        ]
+        rows = api._fragrance_record_search("Creed Bayrhum Vetiver", 10)
+    finally:
+        api.db.search_fragrance_records = old_record_search
+
+    check("matching aggregate row remains", len(rows) == 1, str(rows))
+    check(
+        "aggregate search does not expose unproven cached image",
+        bool(rows) and not getattr(rows[0], "image_url", ""),
+        str(getattr(rows[0], "image_url", "") if rows else ""),
+    )
+
+
+def test_cache_identity_fill_rejects_sibling_image() -> None:
+    print("API cache image identity checks:")
+    selected = engine.UnifiedFragrance(
+        name="Bayrhum Vetiver",
+        brand="Creed",
+        year="",
+        frag_url="https://www.fragrantica.com/perfume/Creed/Bayrhum-Vetiver-30691.html",
+    )
+    api._fill_selected_identity(
+        selected,
+        {
+            "name": "Wild Vetiver",
+            "house": "Creed",
+            "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Wild-Vetiver-125485.html",
+            "image_url": "https://cdn.example.test/wild-vetiver.jpg",
+        },
+    )
+    check(
+        "mismatched cache entry does not backfill image",
+        not getattr(selected, "image_url", ""),
+        str(getattr(selected, "image_url", "")),
+    )
 
 
 def test_api_cache_threshold_matches_engine() -> None:
@@ -932,7 +1000,10 @@ def main() -> int:
     test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_multi_token_name_requires_distinctive_coverage()
+    test_normalize_notes_flattens_to_independent_layers()
     test_cache_search_rejects_same_house_sibling()
+    test_aggregate_cache_search_does_not_expose_unproven_image()
+    test_cache_identity_fill_rejects_sibling_image()
     test_api_cache_threshold_matches_engine()
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
