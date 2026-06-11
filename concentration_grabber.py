@@ -778,7 +778,7 @@ def render(result):
           f"({second_color}{result.second_confidence}%{Z}, via {src_label})")
 
     if not result.is_explicit:
-        print(f"Resolution Vector:   Source Tier Scored Matrix + Modifier Gate filters")
+        print("Resolution Vector:   Source Tier Scored Matrix + Modifier Gate filters")
         print(f"Ballots:             {result.total_votes} total ({result.pillar_votes} pillar)")
         if result.sources_consulted:
             print(f"Sources Consulted:   {', '.join(result.sources_consulted)}")

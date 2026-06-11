@@ -25,7 +25,6 @@ Exit code is non-zero if any check fails.
 """
 from __future__ import annotations
 
-import os
 import sys
 import threading
 from http.cookies import SimpleCookie
@@ -1148,6 +1147,18 @@ def test_worker_query_normalization_and_retry_grace() -> None:
         w._canonical_house("Initio") == "Initio Parfums Privés",
     )
     check(
+        "longer alias key wins; no token duplication for sub-brand spellings",
+        w._apply_house_aliases("Initio Parfums Oud for Greatness")
+        == "Initio Parfums Privés Oud for Greatness",
+        detail=repr(w._apply_house_aliases("Initio Parfums Oud for Greatness")),
+    )
+    check(
+        "alias rewrite is idempotent on an already-canonical query",
+        w._apply_house_aliases("Initio Parfums Privés Oud for Greatness")
+        == "Initio Parfums Privés Oud for Greatness",
+        detail=repr(w._apply_house_aliases("Initio Parfums Privés Oud for Greatness")),
+    )
+    check(
         "house alias map canonicalizes Penhaligons",
         w._canonical_house("Penhaligons") == "Penhaligon's",
     )
@@ -1314,6 +1325,34 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
     check("catalog tier rejects below-accept identities", miss is None, detail=repr(miss))
     check("catalog tier needs both house and name", no_identity is None)
 
+    # Duplicate rows of the same perfume (same URL listed twice across designer
+    # label pages) must collapse before the sibling-margin check — a duplicate
+    # of the winner is not a sibling near-tie.
+    dup_catalog = [
+        engine.CatalogItem(
+            name="1872 Twist Geranium", brand="Clive Christian", year="", url=twist_urls["Geranium"]
+        ),
+        engine.CatalogItem(
+            name="1872 Twist Geranium", brand="Clive Christian", year="", url=twist_urls["Geranium"]
+        ),
+    ]
+
+    def fake_dup_catalog(scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None):
+        return dup_catalog
+
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(fake_dup_catalog)
+    try:
+        dup_hit = w._designer_catalog_candidate(
+            None, {"house": "Clive Christian", "name": "1872 Twist Geranium"}
+        )
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check(
+        "duplicate catalog rows do not fake a sibling collision",
+        dup_hit is not None and dup_hit.frag_url == twist_urls["Geranium"],
+        detail=repr(getattr(dup_hit, "frag_url", None)),
+    )
+
     check(
         "B&BW retires on terminal resolver miss",
         w._matches_no_fragrantica_line({"house": "Bath And Body Works", "name": "Brightest Bloom"}) is True,
@@ -1384,6 +1423,42 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
         any(jid == "job-2" and not retryable for jid, _err, retryable in stub.failed)
         and all(jid != "job-2" for jid, _ in stub.ignored),
         detail=f"ignored={stub.ignored} failed={stub.failed}",
+    )
+
+    # "Retry failed jobs": requeueing a terminal failure resets its
+    # failure_count to 0, so the retry batch must also match those rows by id —
+    # otherwise the action requeues them and then skips them in the same run.
+    pending = [
+        {"id": "fresh", "failure_count": 0},
+        {"id": "retryable-history", "failure_count": 2},
+        {"id": "just-requeued", "failure_count": 0},
+    ]
+    batch_ids = [j["id"] for j in w._retry_batch(pending, {"just-requeued"})]
+    check(
+        "retry batch keeps failure-history rows and just-requeued rows, skips fresh",
+        batch_ids == ["retryable-history", "just-requeued"],
+        detail=repr(batch_ids),
+    )
+
+    class _RequeueClient:
+        def __init__(self):
+            self.requeued: list[tuple[str, int]] = []
+
+        def list_jobs(self, status, limit=10, offset=0):
+            assert status == "failed"
+            return [{"id": "dead-1", "priority": 0}, {"id": "dead-2", "priority": 12}]
+
+        def requeue_job(self, job_id, *, priority=10):
+            self.requeued.append((job_id, priority))
+            return {"queued": True}
+
+    rq_client = _RequeueClient()
+    requeued_ids = w.requeue_terminal_failed_jobs(rq_client, config, limit=5)
+    check(
+        "requeue_terminal_failed_jobs returns the requeued ids",
+        requeued_ids == ["dead-1", "dead-2"]
+        and rq_client.requeued == [("dead-1", 10), ("dead-2", 13)],
+        detail=f"ids={requeued_ids} calls={rq_client.requeued}",
     )
 
 

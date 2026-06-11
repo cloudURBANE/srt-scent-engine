@@ -489,9 +489,17 @@ def _canonical_name(house: str, name: str) -> str:
 
 
 def _apply_house_aliases(query: str) -> str:
-    """Rewrite known-broken house spellings inside a free-text query."""
+    """Rewrite known-broken house spellings inside a free-text query.
+
+    Longest keys apply first so "initio parfums" wins over "initio", and a
+    query that already carries the canonical brand is left alone — otherwise a
+    shorter key matching inside an already-rewritten canonical value would
+    duplicate its tokens ("Initio Parfums Privés Privés …").
+    """
     out = query
-    for key, canonical in HOUSE_ALIASES.items():
+    for key, canonical in sorted(HOUSE_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if canonical.lower() in out.lower():
+            continue
         pattern = re.compile(r"\b" + r"\s+".join(re.escape(t) for t in key.split()) + r"\b", re.IGNORECASE)
         out = pattern.sub(canonical, out)
     return out
@@ -805,9 +813,17 @@ def _designer_catalog_candidate(
         return None
     if not scored:
         return None
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    best_score, best = scored[0]
-    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+    # Collapse duplicates before ranking: the same perfume frequently appears
+    # on more than one designer label page (parent house + line alias), and a
+    # duplicate of the best row must never masquerade as a sibling near-tie.
+    best_by_url: dict[str, tuple[float, engine.CatalogItem]] = {}
+    for score, item in scored:
+        key = engine.FragranticaEngine.dedupe_key(item.url)
+        if key not in best_by_url or score > best_by_url[key][0]:
+            best_by_url[key] = (score, item)
+    ranked = sorted(best_by_url.values(), key=lambda pair: pair[0], reverse=True)
+    best_score, best = ranked[0]
+    runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
     if best_score < engine.Orchestrator.CATALOG_ACCEPT:
         print(f"  [catalog] best {best.url} score={best_score:.2f} below accept; skipping")
         return None
@@ -1518,7 +1534,7 @@ def process_job(
         except WorkerError as fail_exc:
             print(f"{index_label} Could not report failure: {fail_exc.code}")
         return False
-    except Exception as exc:
+    except Exception:
         if result_sink is not None:
             result_sink["error"] = "engine_exception"
         print(f"{index_label} Failed {label}: engine_exception")
@@ -1536,23 +1552,44 @@ def requeue_terminal_failed_jobs(
     config: WorkerConfig,
     *,
     limit: int,
-) -> int:
-    """Move terminal `failed` rows back to `pending` so the worker can process them."""
+) -> list[str]:
+    """Move terminal `failed` rows back to `pending`; returns the requeued ids.
+
+    The ids matter to the caller: requeueing resets failure_count to 0, so the
+    only-retries filter in process_pending cannot recognize these rows by their
+    failure history and must match them by id instead.
+    """
     failed_jobs = client.list_jobs("failed", limit=max(limit, MAX_LIST_LIMIT))
-    requeued = 0
+    requeued: list[str] = []
     for job in failed_jobs[:limit]:
         job_id = str(job.get("id") or "").strip()
         if not job_id:
             continue
         if config.dry_run:
             print(f"Dry run: would requeue failed job {job_id}")
-            requeued += 1
+            requeued.append(job_id)
             continue
         client.requeue_job(job_id, priority=max(10, int(job.get("priority") or 0) + 1))
-        requeued += 1
+        requeued.append(job_id)
     if requeued:
-        print(f"Requeued {requeued} terminal failed job(s) to pending.")
+        print(f"Requeued {len(requeued)} terminal failed job(s) to pending.")
     return requeued
+
+
+def _retry_batch(jobs: list[dict[str, Any]], requeued_ids: set[str]) -> list[dict[str, Any]]:
+    """Pending rows that belong in a "Retry failed jobs" batch.
+
+    Two populations qualify: rows with a live failure history (retryable
+    failures keep their failure_count on the way back to pending), and rows
+    just requeued from terminal `failed` — requeueing resets failure_count to
+    0, so those are only recognizable by id.
+    """
+    return [
+        j
+        for j in jobs
+        if int(j.get("failure_count") or 0) > 0
+        or str(j.get("id") or "") in requeued_ids
+    ]
 
 
 def process_pending(
@@ -1565,14 +1602,15 @@ def process_pending(
     if not config.auth_configured:
         raise SystemExit("ENRICHMENT_WORKER_TOKEN is required for worker operations.")
 
+    requeued_ids: set[str] = set()
     if only_retries:
-        requeue_terminal_failed_jobs(client, config, limit=config.limit)
+        requeued_ids = set(requeue_terminal_failed_jobs(client, config, limit=config.limit))
 
     list_limit = max(config.limit, MAX_LIST_LIMIT if only_retries else config.limit)
     pending_all = client.list_jobs("pending", limit=list_limit)
     jobs = pending_all
     if only_retries:
-        jobs = [j for j in jobs if int(j.get("failure_count") or 0) > 0]
+        jobs = _retry_batch(jobs, requeued_ids)
     jobs = jobs[: config.limit]
     if not jobs:
         print("No matching pending jobs.")
@@ -1716,9 +1754,9 @@ def print_manager_header(client: ApiClient, config: WorkerConfig) -> None:
     if status.get("error"):
         print(f"Status endpoint: unavailable ({status['error']})")
     print(f"Pending jobs: {counts.get('pending', 'unavailable')}")
-    print(f"Processing stale: unavailable")
-    print(f"Failed retryable: unavailable")
-    print(f"Completed today: unavailable")
+    print("Processing stale: unavailable")
+    print("Failed retryable: unavailable")
+    print("Completed today: unavailable")
     print()
     print("1. List pending jobs")
     print("2. Process next job")
@@ -2180,7 +2218,7 @@ def _run_auto_approve(
                 )
         except Exception:
             _log_event("auto: FG clearance preflight errored (continuing)", "warn")
-    target = job.get("name") or job.get("brand") or job.get("id") or "next job"
+    target = job.get("name") or job.get("house") or job.get("id") or "next job"
     if reclaiming:
         _log_event(f"auto: reclaiming stale {target}", "warn")
     else:
