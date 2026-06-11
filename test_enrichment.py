@@ -788,6 +788,209 @@ def test_stored_detail_completion_logic() -> None:
         db.upsert_fragrance_details = saved_upsert
 
 
+def test_completeness_self_heal_sweep() -> None:
+    print("Completeness self-heal sweep checks (no DATABASE_URL required):")
+    import enrichment_facts
+
+    def make_complete_record() -> dict[str, object]:
+        return {
+            "record_key": "fg:https://www.fragrantica.com/perfume/Test-House/Complete-1.html",
+            "canonical_fg_url": "https://www.fragrantica.com/perfume/Test-House/Complete-1.html",
+            "bn_url": None,
+            "name": "Complete",
+            "house": "Test House",
+            "year": 2024,
+            "gender": "Unisex",
+            "image_url": None,
+            "search": {},
+            "fg_raw": {
+                "frag_cards": {"Community Interest": [{"label": "Have", "count": "9"}]},
+                "notes": {"top": ["bergamot"], "heart": ["rose"], "base": ["musk"], "flat": []},
+                "reviews": [{"text": "lovely", "source": "fragrantica"}],
+                "raw_identity": {"concentration": "Eau de Parfum"},
+            },
+            "bn_raw": {},
+            "derived_metrics": {
+                "main_accords": {"top_accords": ["woody", "citrus"]},
+                "wear_profile": {"primary_seasons": ["Spring"], "primary_time": "Day"},
+                "source_coverage": {
+                    "performance_score": True,
+                    "value_score": True,
+                    "community_interest_score": True,
+                    "wear_profile": True,
+                },
+            },
+        }
+
+    # 1. Granular fact audit: a fully-populated record has nothing missing.
+    check(
+        "complete record reports no missing facts",
+        enrichment_facts.missing_facts(make_complete_record()) == [],
+        str(enrichment_facts.missing_facts(make_complete_record())),
+    )
+
+    # 2. Each removed fact is reported by name -- granular down to reviews.
+    record = make_complete_record()
+    record["gender"] = "Unisex / Unspecified"
+    record["fg_raw"]["raw_identity"].pop("concentration")
+    record["fg_raw"]["reviews"] = []
+    record["derived_metrics"]["source_coverage"]["performance_score"] = False
+    missing = enrichment_facts.missing_facts(record)
+    check(
+        "missing facts are granular per field",
+        missing == ["gender", "concentration", "performance_score", "reviews"],
+        str(missing),
+    )
+    bare = make_complete_record()
+    bare["derived_metrics"] = None
+    bare_missing = enrichment_facts.missing_facts(bare)
+    check(
+        "absent derived_metrics flags family/accords/wear/scores",
+        {"family", "main_accords", "wear_profile", "performance_score",
+         "value_score", "community_interest_score"} <= set(bare_missing),
+        str(bare_missing),
+    )
+
+    # 3. Endpoint contract: token-gated, then granular audit + heal sweep.
+    saved_token = api._ENRICHMENT_WORKER_TOKEN
+    saved_enabled = db.ENABLED
+    saved_list = db.list_fragrance_records
+    saved_count = db.count_fragrance_records
+    saved_jobs_by_keys = db.get_jobs_by_keys
+    saved_recover = db.recover_or_enqueue_job
+    recover_calls: list[dict[str, object]] = []
+    client = TestClient(api.app)
+    auth = {"Authorization": "Bearer test-secret-token"}
+    try:
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
+        r = client.get("/api/enrichment/completeness")
+        check("completeness endpoint requires bearer token", r.status_code == 401, str(r.status_code))
+        r = client.post("/api/enrichment/heal", json={})
+        check("heal endpoint requires bearer token", r.status_code == 401, str(r.status_code))
+
+        db.ENABLED = True
+        incomplete_record = make_complete_record()
+        incomplete_record["fg_raw"]["raw_identity"].pop("concentration")
+        incomplete_record["fg_raw"]["reviews"] = []
+        ignored_record = make_complete_record()
+        ignored_record["record_key"] = "fg:https://www.fragrantica.com/perfume/Test-House/Ignored-2.html"
+        ignored_record["canonical_fg_url"] = "https://www.fragrantica.com/perfume/Test-House/Ignored-2.html"
+        ignored_record["gender"] = ""
+        db.list_fragrance_records = lambda limit=200, offset=0: [
+            make_complete_record(), incomplete_record, ignored_record,
+        ]
+        db.count_fragrance_records = lambda: 3
+        db.get_jobs_by_keys = lambda keys: {
+            ignored_record["canonical_fg_url"]: {
+                "status": "ignored", "priority": 0, "requested_count": 4,
+                "failure_count": 0, "last_error": None, "last_requested_at": None,
+            }
+        }
+
+        def fake_recover(**kwargs):
+            recover_calls.append(kwargs)
+            return {"id": "job-1", "status": "pending", "priority": kwargs.get("priority"),
+                    "requested_count": 2}
+
+        db.recover_or_enqueue_job = fake_recover
+
+        r = client.get("/api/enrichment/completeness", headers=auth)
+        check("completeness audit responds 200", r.status_code == 200, str(r.status_code))
+        body = r.json()
+        check("audit counts incomplete fragrances", body.get("incomplete") == 2, str(body))
+        check(
+            "audit reports granular missing facts per fragrance",
+            any(item["missing"] == ["concentration", "reviews"] for item in body.get("items", [])),
+            str(body.get("items")),
+        )
+        check(
+            "audit annotates existing durable job state",
+            any((item.get("job") or {}).get("status") == "ignored" for item in body.get("items", [])),
+            str(body.get("items")),
+        )
+
+        r = client.post("/api/enrichment/heal", json={"dry_run": True}, headers=auth)
+        body = r.json()
+        check("dry-run heal queues nothing durable", len(recover_calls) == 0 and body.get("queued") == 1, str(body))
+        check("dry-run heal skips ignored jobs", body.get("skipped") == 1, str(body.get("skipped_items")))
+
+        r = client.post("/api/enrichment/heal", json={"priority": 7}, headers=auth)
+        body = r.json()
+        check("heal sweep requeues each incomplete fragrance once", len(recover_calls) == 1, str(recover_calls))
+        check(
+            "heal sweep passes identity and priority to the durable queue",
+            recover_calls
+            and recover_calls[0].get("job_key") == incomplete_record["canonical_fg_url"]
+            and recover_calls[0].get("priority") == 7,
+            str(recover_calls),
+        )
+        check("heal sweep reports queued job state", body.get("queued") == 1 and body["queued_items"][0]["job"]["status"] == "pending", str(body))
+
+        recover_calls.clear()
+        r = client.post("/api/enrichment/heal", json={"fields": ["year"]}, headers=auth)
+        body = r.json()
+        check("field-filtered heal skips rows missing other facts", body.get("queued") == 0 and len(recover_calls) == 0, str(body))
+
+        r = client.post("/api/enrichment/heal", json={"fields": ["not_a_fact"]}, headers=auth)
+        check("heal rejects unknown fact fields", r.status_code == 400, str(r.status_code))
+
+        db.get_jobs_by_keys = lambda keys: {
+            incomplete_record["canonical_fg_url"]: {
+                "status": "completed", "priority": 0, "requested_count": 9,
+                "failure_count": 0, "last_error": None, "last_requested_at": None,
+            }
+        }
+        recover_calls.clear()
+        r = client.post("/api/enrichment/heal", json={"max_requested_count": 5}, headers=auth)
+        body = r.json()
+        check(
+            "heal honors max_requested_count churn protection",
+            all(c.get("job_key") != incomplete_record["canonical_fg_url"] for c in recover_calls)
+            and any(s["reason"] == "max_requested_count_reached" for s in body.get("skipped_items", [])),
+            str(body.get("skipped_items")),
+        )
+    finally:
+        api._ENRICHMENT_WORKER_TOKEN = saved_token
+        db.ENABLED = saved_enabled
+        db.list_fragrance_records = saved_list
+        db.count_fragrance_records = saved_count
+        db.get_jobs_by_keys = saved_jobs_by_keys
+        db.recover_or_enqueue_job = saved_recover
+
+    # 4. The worker's idle tick drives the sweep: throttled, paged, wrapping.
+    class FakeHealClient:
+        def __init__(self, audited: int) -> None:
+            self.audited = audited
+            self.calls: list[dict[str, object]] = []
+
+        def heal_sweep(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(kwargs)
+            return {"audited": self.audited, "incomplete": 5, "queued": 3}
+
+    full_page = FakeHealClient(enrichment_worker.HEAL_SWEEP_PAGE_LIMIT)
+    auto_state: dict[str, object] = {}
+    enrichment_worker._maybe_run_heal_sweep(full_page, auto_state)
+    check("idle worker tick triggers a heal sweep", len(full_page.calls) == 1, str(full_page.calls))
+    check(
+        "heal sweep advances the audit page",
+        auto_state.get("heal_offset") == enrichment_worker.HEAL_SWEEP_PAGE_LIMIT,
+        str(auto_state),
+    )
+    enrichment_worker._maybe_run_heal_sweep(full_page, auto_state)
+    check("heal sweep is throttled between idle ticks", len(full_page.calls) == 1, str(full_page.calls))
+
+    short_page = FakeHealClient(3)
+    auto_state = {"heal_offset": 400}
+    enrichment_worker._maybe_run_heal_sweep(short_page, auto_state)
+    check(
+        "final audit page wraps the sweep back to the start",
+        len(short_page.calls) == 1
+        and short_page.calls[0].get("offset") == 400
+        and auto_state.get("heal_offset") == 0,
+        f"{short_page.calls} {auto_state}",
+    )
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE
@@ -1040,6 +1243,7 @@ def main() -> int:
     test_hydration_dedup()
     test_concentration_pipeline()
     test_stored_detail_completion_logic()
+    test_completeness_self_heal_sweep()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()

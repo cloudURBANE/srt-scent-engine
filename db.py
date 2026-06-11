@@ -1448,6 +1448,81 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
         ctx.__exit__(None, None, None)
 
 
+def count_fragrance_records() -> int:
+    """Total aggregate fragrance identities. 0 when storage is disabled."""
+    if not ENABLED:
+        return 0
+    ctx, conn = _conn()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM fragrance_records").fetchone()
+        return int(row["n"]) if row else 0
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def list_fragrance_records(limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+    """Full fragrance records in stable record_key order, for completeness audits.
+
+    Unlike search_fragrance_records this intentionally fetches the heavy JSON
+    blobs -- the completeness sweep judges facts (concentration, accords, wear
+    profile, notes, reviews) that only live inside fg_raw_json /
+    derived_metrics_json. The limit is clamped so a sweep pages through the
+    table instead of pulling it in one egress-heavy query.
+    """
+    if not ENABLED:
+        return []
+    limit = max(1, min(int(limit or 200), 500))
+    offset = max(0, int(offset or 0))
+    ctx, conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM fragrance_records
+            ORDER BY record_key
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        ).fetchall()
+        return [_fragrance_record_to_dict(row) for row in rows]
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def get_jobs_by_keys(job_keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Map job_key -> queue state for a batch of keys. Empty when disabled.
+
+    One query for the whole sweep page, so the completeness audit can annotate
+    every fragrance with its durable job status without N per-row lookups.
+    """
+    keys = [k for k in (job_keys or []) if k]
+    if not ENABLED or not keys:
+        return {}
+    ctx, conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT job_key, status, priority, requested_count, failure_count,
+                   last_error, last_requested_at
+            FROM enrichment_jobs
+            WHERE job_key = ANY(%s)
+            """,
+            (keys,),
+        ).fetchall()
+        return {
+            row["job_key"]: {
+                "status": row["status"],
+                "priority": row["priority"],
+                "requested_count": row["requested_count"],
+                "failure_count": row["failure_count"],
+                "last_error": row["last_error"],
+                "last_requested_at": _iso(row["last_requested_at"]),
+            }
+            for row in rows
+        }
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # fg_detail_cache -- Pass 2 durable detail cache
 # ---------------------------------------------------------------------------

@@ -156,6 +156,101 @@ def derive_wear_profile(source: Any) -> dict[str, Any] | None:
     return wear if isinstance(wear, dict) and wear else None
 
 
+# Canonical, ordered list of per-fragrance facts the self-healing sweep audits.
+# Every name here is granular on purpose: a sweep response says exactly which
+# facts are missing for each fragrance, down to reviews.
+FACT_FIELDS = (
+    "name",
+    "house",
+    "year",
+    "gender",
+    "concentration",
+    "family",
+    "main_accords",
+    "wear_profile",
+    "performance_score",
+    "value_score",
+    "community_interest_score",
+    "notes",
+    "reviews",
+)
+
+_COVERAGE_FACTS = ("performance_score", "value_score", "community_interest_score")
+
+
+def _notes_have_content(notes: Any) -> bool:
+    if not isinstance(notes, dict):
+        return False
+    return any(
+        isinstance(notes.get(tier), list) and any(str(n or "").strip() for n in notes[tier])
+        for tier in ("top", "heart", "base", "flat")
+    )
+
+
+def _reviews_have_content(*review_lists: Any) -> bool:
+    for reviews in review_lists:
+        if not isinstance(reviews, list):
+            continue
+        for review in reviews:
+            if isinstance(review, dict) and str(review.get("text") or "").strip():
+                return True
+    return False
+
+
+def record_fact_status(record: dict[str, Any]) -> dict[str, bool]:
+    """Granular completeness per fact for a fragrance_records-shaped dict.
+
+    Accepts the dict produced by db._fragrance_record_to_dict (keys: name,
+    house, year, gender, fg_raw, bn_raw, derived_metrics). Default sentinels
+    (`Unknown`, `Unknown Family`, `Unisex / Unspecified`, unsupported
+    `Universal`) count as missing, matching is_fact_complete.
+    """
+    fg_raw = record.get("fg_raw") if isinstance(record.get("fg_raw"), dict) else {}
+    bn_raw = record.get("bn_raw") if isinstance(record.get("bn_raw"), dict) else {}
+    raw_identity = fg_raw.get("raw_identity")
+    if not isinstance(raw_identity, dict):
+        raw_identity = {}
+    dm = record.get("derived_metrics")
+    coverage = dm.get("source_coverage") if isinstance(dm, dict) else None
+    if not isinstance(coverage, dict):
+        coverage = {}
+
+    concentration = fg_raw.get("concentration") or raw_identity.get("concentration")
+    families = derive_families(record, existing_family=None)
+    wear = derive_wear_profile(record)
+    wear_complete = bool(
+        wear
+        and (
+            primary_season_from_wear_profile(wear)
+            or is_fact_complete(wear.get("primary_time"), "season")
+        )
+    )
+
+    status = {
+        "name": is_fact_complete(record.get("name")),
+        "house": is_fact_complete(record.get("house")),
+        "year": is_fact_complete(record.get("year"), "year"),
+        "gender": is_fact_complete(record.get("gender"), "gender")
+        or is_fact_complete(raw_identity.get("gender"), "gender"),
+        "concentration": is_fact_complete(concentration, "concentration"),
+        "family": is_fact_complete(families.get("primary_family"), "family"),
+        "main_accords": bool(top_accords_from(record)),
+        "wear_profile": wear_complete,
+        "notes": _notes_have_content(fg_raw.get("notes"))
+        or _notes_have_content(bn_raw.get("notes")),
+        "reviews": _reviews_have_content(fg_raw.get("reviews"), bn_raw.get("reviews")),
+    }
+    for group in _COVERAGE_FACTS:
+        status[group] = bool(coverage.get(group))
+    return {field: status[field] for field in FACT_FIELDS}
+
+
+def missing_facts(record: dict[str, Any]) -> list[str]:
+    """Ordered names of every incomplete fact for one fragrance record."""
+    status = record_fact_status(record)
+    return [field for field in FACT_FIELDS if not status[field]]
+
+
 def primary_season_from_wear_profile(wear_profile: Any) -> str | None:
     if not isinstance(wear_profile, dict):
         return None

@@ -52,7 +52,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import db
-from enrichment_facts import derive_families, derive_wear_profile
+from enrichment_facts import (
+    FACT_FIELDS,
+    derive_families,
+    derive_wear_profile,
+    missing_facts,
+)
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
 import parfinity
@@ -4673,6 +4678,237 @@ def add_serper_pool_keys(payload: SerperKeysRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Provide one or more keys in the `keys` field.")
     added = engine.serper_key_pool().add_keys(keys)
     return {"added": added, "snapshot": engine.serper_key_pool().snapshot()}
+
+
+class HealSweepRequest(BaseModel):
+    # Page through fragrance_records; db clamps limit to 500 per call.
+    limit: int = 200
+    offset: int = 0
+    # Heal-sweep jobs run below interactive /details recoveries (priority 10)
+    # so a background sweep never starves a user-facing refresh.
+    priority: int = 5
+    # Report what would be queued without writing anything.
+    dry_run: bool = False
+    # Restrict which missing facts count as heal-worthy (subset of FACT_FIELDS).
+    fields: list[str] | None = None
+    # Skip rows whose durable job has already been requested this many times --
+    # churn protection for fragrances that genuinely lack a fact upstream.
+    max_requested_count: int | None = None
+
+
+def _record_heal_job_key(record: dict[str, Any]) -> str:
+    """Job key for a stored fragrance record, mirroring _enqueue_enrichment_job.
+
+    Returns "" for Parfinity catalog rows (not worker-healable) and for rows
+    with no URL or name identity at all.
+    """
+    fg_url = _canonical_fg_url(str(record.get("canonical_fg_url") or ""))
+    if fg_url and parfinity.is_parfinity_url(fg_url):
+        return ""
+    bn_url = _canonical_fg_url(str(record.get("bn_url") or ""))
+    if fg_url:
+        return fg_url
+    if bn_url:
+        return bn_url
+    name = str(record.get("name") or "").strip().lower()
+    house = str(record.get("house") or "").strip().lower()
+    return f"id:{house}|{name}" if name else ""
+
+
+def _audit_fragrance_records(
+    limit: int, offset: int
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Audit one page of fragrance_records for granular fact completeness.
+
+    Returns (items, missing_field_counts). Every item carries its record
+    identity, its exact missing facts, its heal job_key (may be ""), and the
+    current durable job state for that key when one exists.
+    """
+    records = db.list_fragrance_records(limit=limit, offset=offset)
+    items: list[dict[str, Any]] = []
+    field_counts: dict[str, int] = {field: 0 for field in FACT_FIELDS}
+    job_keys: list[str] = []
+    for record in records:
+        missing = missing_facts(record)
+        for field in missing:
+            field_counts[field] += 1
+        job_key = _record_heal_job_key(record)
+        if missing and job_key:
+            job_keys.append(job_key)
+        items.append(
+            {
+                "record_key": record.get("record_key"),
+                "name": record.get("name"),
+                "house": record.get("house"),
+                "year": record.get("year"),
+                "canonical_fg_url": record.get("canonical_fg_url"),
+                "bn_url": record.get("bn_url"),
+                "job_key": job_key or None,
+                "missing": missing,
+                "job": None,
+            }
+        )
+    try:
+        jobs_by_key = db.get_jobs_by_keys(job_keys)
+    except Exception:
+        logger.exception("completeness audit: job-state batch lookup failed")
+        jobs_by_key = {}
+    for item in items:
+        if item["job_key"]:
+            item["job"] = jobs_by_key.get(item["job_key"])
+    return items, field_counts
+
+
+@app.get(
+    "/api/enrichment/completeness",
+    dependencies=[Depends(_require_worker_token)],
+)
+def enrichment_completeness(
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    include_complete: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Protected: granular per-fragrance fact audit over fragrance_records.
+
+    For every stored fragrance this reports exactly which canonical facts are
+    missing (see enrichment_facts.FACT_FIELDS -- identity, concentration,
+    family, accords, wear profile, the three status-derived score groups,
+    notes, and reviews), plus the current durable enrichment-job state for the
+    same identity. Read-only; pair with POST /api/enrichment/heal to requeue.
+    """
+    _require_db()
+    items, field_counts = _audit_fragrance_records(limit, offset)
+    incomplete = [item for item in items if item["missing"]]
+    return {
+        "total_records": db.count_fragrance_records(),
+        "limit": limit,
+        "offset": offset,
+        "audited": len(items),
+        "complete": len(items) - len(incomplete),
+        "incomplete": len(incomplete),
+        "fields": list(FACT_FIELDS),
+        "missing_field_counts": field_counts,
+        "items": items if include_complete else incomplete,
+    }
+
+
+@app.post(
+    "/api/enrichment/heal",
+    dependencies=[Depends(_require_worker_token)],
+)
+def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
+    """Protected: self-healing sweep -- requeue every incomplete fragrance.
+
+    Audits one page of fragrance_records with the same granular fact contract
+    as GET /api/enrichment/completeness, then idempotently reopens a durable
+    enrichment job for each fragrance missing any audited fact (or any fact in
+    `fields` when given). Reuses db.recover_or_enqueue_job, so pending and
+    processing jobs are left untouched, deliberately ignored jobs stay
+    retired, and worker leases/retry counters are never reset. The offline
+    worker then re-fetches detail, which heals every fact in one pass --
+    metrics, concentration, family, wear profile, notes, and reviews.
+    """
+    _require_db()
+    wanted: set[str] | None = None
+    if payload.fields is not None:
+        unknown = [f for f in payload.fields if f not in FACT_FIELDS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown fact field(s): {', '.join(sorted(unknown))}. "
+                f"Valid fields: {', '.join(FACT_FIELDS)}.",
+            )
+        wanted = set(payload.fields)
+
+    items, field_counts = _audit_fragrance_records(payload.limit, payload.offset)
+    queued: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def _skip(item: dict[str, Any], reason: str) -> None:
+        skipped.append(
+            {
+                "record_key": item["record_key"],
+                "job_key": item["job_key"],
+                "missing": item["missing"],
+                "reason": reason,
+            }
+        )
+
+    incomplete = 0
+    for item in items:
+        missing = item["missing"]
+        if wanted is not None:
+            missing = [f for f in missing if f in wanted]
+        if not missing:
+            continue
+        incomplete += 1
+        if not item["job_key"]:
+            _skip(item, "no_healable_identity")
+            continue
+        job = item["job"]
+        if job and job.get("status") == "ignored":
+            _skip(item, "job_ignored")
+            continue
+        if (
+            payload.max_requested_count is not None
+            and job
+            and int(job.get("requested_count") or 0) >= payload.max_requested_count
+        ):
+            _skip(item, "max_requested_count_reached")
+            continue
+        entry = {
+            "record_key": item["record_key"],
+            "job_key": item["job_key"],
+            "name": item["name"],
+            "house": item["house"],
+            "missing": missing,
+        }
+        if payload.dry_run:
+            entry["job"] = job
+            queued.append(entry)
+            continue
+        fg_url = _canonical_fg_url(str(item["canonical_fg_url"] or ""))
+        try:
+            job_row = db.recover_or_enqueue_job(
+                job_key=item["job_key"],
+                query=None,
+                name=item["name"] or None,
+                house=item["house"] or None,
+                year=_coerce_year(item["year"]),
+                bn_url=item["bn_url"] or None,
+                fg_url=fg_url or None,
+                priority=max(0, int(payload.priority or 0)),
+            )
+        except Exception:
+            logger.exception("heal sweep: recover_or_enqueue_job failed job_key=%s", item["job_key"])
+            _skip(item, "queue_write_failed")
+            continue
+        if job_row is None:
+            # recover_or_enqueue_job returns None when the upsert WHERE clause
+            # skipped an ignored row.
+            _skip(item, "job_ignored")
+            continue
+        entry["job"] = {
+            "id": job_row.get("id"),
+            "status": job_row.get("status"),
+            "priority": job_row.get("priority"),
+            "requested_count": job_row.get("requested_count"),
+        }
+        queued.append(entry)
+
+    return {
+        "dry_run": payload.dry_run,
+        "total_records": db.count_fragrance_records(),
+        "limit": payload.limit,
+        "offset": payload.offset,
+        "audited": len(items),
+        "incomplete": incomplete,
+        "queued": len(queued),
+        "skipped": len(skipped),
+        "missing_field_counts": field_counts,
+        "queued_items": queued,
+        "skipped_items": skipped,
+    }
 
 
 @app.get("/api/enrichment/jobs", dependencies=[Depends(_require_worker_token)])
