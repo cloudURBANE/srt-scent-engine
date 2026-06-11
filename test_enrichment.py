@@ -223,6 +223,88 @@ def test_no_db_contract() -> None:
         db.enqueue_job_state = saved_enqueue_state
 
 
+def test_fragrantica_challenge_and_static_parse() -> None:
+    print("Fragrantica detail parser checks:")
+    engine = enrichment_worker.engine
+
+    class FakeResponse:
+        def __init__(self, text: str, status_code: int = 200) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+            self.status_code = status_code
+
+    challenge = FakeResponse(
+        """
+        <html><head><title>Just a moment...</title></head>
+        <body>
+          Checking if the site connection is secure.
+          Verify you are human. Enable JavaScript and cookies to continue.
+          <div class="cf-turnstile"></div>
+        </body></html>
+        """
+    )
+    check(
+        "Fragrantica 200 challenge shell is detected",
+        bool(engine._response_has_challenge(challenge)),
+    )
+
+    original_get = engine.Http.get
+    try:
+        engine.Http.get = staticmethod(lambda *args, **kwargs: challenge)
+        details = engine.UnifiedDetails(notes=engine.NotesList())
+        engine.FragranticaEngine.fetch_details(
+            object(),
+            "https://www.fragrantica.com/perfume/Thameen/Royal-Sapphire-55049.html",
+            details,
+            deadline=engine.Deadline(5),
+        )
+        check(
+            "challenge shell is reported as fetch error",
+            details.fetch_errors.get("fg") == "challenge_page",
+            str(details.fetch_errors),
+        )
+        check(
+            "challenge shell does not masquerade as parser-empty cards",
+            not details.frag_cards,
+            str(details.frag_cards),
+        )
+    finally:
+        engine.Http.get = original_get
+
+    static_page = FakeResponse(
+        """
+        <html><body>
+          <h1>Royal Sapphire Thameen for women and men</h1>
+          <h6>main accords</h6>
+          <p>citrus white floral amber woody sweet</p>
+          <section>User Ratings Rating When To Wear</section>
+          <p>Perfume rating 4.21 out of 5 with 466 votes</p>
+        </body></html>
+        """
+    )
+    check(
+        "normal Fragrantica detail HTML is not a challenge",
+        not engine._response_has_challenge(static_page),
+    )
+
+    try:
+        engine.Http.get = staticmethod(lambda *args, **kwargs: static_page)
+        details = engine.UnifiedDetails(notes=engine.NotesList())
+        engine.FragranticaEngine.fetch_details(
+            object(),
+            "https://www.fragrantica.com/perfume/Thameen/Royal-Sapphire-55049.html",
+            details,
+            deadline=engine.Deadline(5),
+        )
+        check(
+            "static Fragrantica rating text yields a frag card",
+            "Fragrantica Rating" in details.frag_cards,
+            str(details.frag_cards),
+        )
+    finally:
+        engine.Http.get = original_get
+
+
 def test_mobile_new_device_session_binding() -> None:
     print("Mobile auth checks (no DATABASE_URL required):")
     now = datetime.now(timezone.utc)
@@ -1710,6 +1792,7 @@ def test_db_lifecycle() -> None:
 
 def main() -> int:
     test_no_db_contract()
+    test_fragrantica_challenge_and_static_parse()
     test_mobile_new_device_session_binding()
     test_hydration_dedup()
     test_concentration_pipeline()

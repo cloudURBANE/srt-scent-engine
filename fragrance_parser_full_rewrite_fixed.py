@@ -3221,12 +3221,21 @@ _BASENOTES_CACHE_FILE = Path(
         str(Path(__file__).with_name(".black_sun_cache.json")),
     )
 )
-_BASENOTES_CHALLENGE_MARKERS = (
+_HTTP_CHALLENGE_MARKERS = (
     "just a moment",
     "attention required",
     "cf-challenge",
     "cf-browser-verification",
     "/cdn-cgi/challenge-platform",
+    "challenge-platform",
+    "cf-turnstile",
+    "turnstile",
+    "checking if the site connection is secure",
+    "verify you are human",
+    "verifying you are human",
+    "enable javascript and cookies",
+    "enable cookies and javascript",
+    "cloudflare ray id",
 )
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION_REQUEST_LOCK = threading.Lock()
@@ -3650,7 +3659,8 @@ def _response_has_challenge(res: Any) -> bool:
     body = str(getattr(res, "text", "") or "")
     if status in {403, 429}:
         return True
-    return any(marker in body[:5000].lower() for marker in _BASENOTES_CHALLENGE_MARKERS)
+    head = body[:20000].lower()
+    return any(marker in head for marker in _HTTP_CHALLENGE_MARKERS)
 
 
 def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
