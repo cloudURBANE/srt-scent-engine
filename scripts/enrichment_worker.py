@@ -667,6 +667,120 @@ _FG_METRIC_GROUPS = (
 )
 
 
+def _resolve_concentration(
+    house: str, name: str, *, allow_serp: bool = True, debug: bool = False
+) -> dict[str, Any] | None:
+    """Resolve a ScentCast concentration label for "<house> <name>".
+
+    Tier order mirrors scripts/enrich_concentration.py: Parfinity catalog ->
+    explicit token in the query -> brand prior -> pillar prior -> (optionally)
+    the SemanticScentEngine DuckDuckGo SERP consensus. The SERP tier boots a
+    local Chromium instance, which is exactly why this runs in the worker and
+    never in the cloud api.py process. Never raises: concentration is a
+    best-effort enrichment and must not fail the job.
+    """
+    query = " ".join(
+        part for part in [str(house or "").strip(), str(name or "").strip()] if part
+    )
+    if not query:
+        return None
+
+    def _resolved(label: str, confidence: int, source: str, engine_label: str) -> dict[str, Any]:
+        return {
+            "concentration": label,
+            "concentration_meta": {
+                "confidence": confidence,
+                "source": source,
+                "engine_label": engine_label,
+                "resolved_at": _now_iso(),
+            },
+        }
+
+    try:
+        from concentration_grabber import SemanticScentEngine, to_scentcast_concentration
+
+        # Tier 0 -- Parfinity catalog (instant, no browser).
+        try:
+            from parfinity import lookup_concentration as _pf_lookup
+
+            hit = _pf_lookup(house or "", name or "")
+        except Exception:
+            hit = None
+        if hit:
+            return _resolved(hit, 95, "parfinity_catalog", hit)
+
+        # Tier 1a -- explicit concentration token in the name/query.
+        explicit = SemanticScentEngine._explicit_intent(query)
+        if explicit:
+            label = to_scentcast_concentration(explicit)
+            if label != "Unknown":
+                return _resolved(label, 100, "tier1_explicit", explicit)
+
+        # Tier 1b -- brand prior.
+        brand_hit, brand_conc = SemanticScentEngine._brand_prior(query)
+        if brand_hit and brand_conc:
+            label = to_scentcast_concentration(brand_conc)
+            if label != "Unknown":
+                return _resolved(label, 70, "tier1_brand_prior", brand_conc)
+
+        # Tier 1c -- pillar prior.
+        pillar = SemanticScentEngine._query_pillar_prior(query)
+        if pillar:
+            label = to_scentcast_concentration(pillar)
+            if label != "Unknown":
+                return _resolved(label, 80, "tier1_pillar", pillar)
+
+        if not allow_serp:
+            return None
+
+        # Tier 2 -- SERP engine (slow; spins a local headless browser).
+        profile = _run_engine_call(
+            lambda: SemanticScentEngine.analyze(query), debug=debug
+        )
+        if profile and profile.primary_confidence >= 50:
+            label = to_scentcast_concentration(profile.primary_concentration)
+            if label != "Unknown":
+                return _resolved(
+                    label,
+                    profile.primary_confidence,
+                    "semantic_engine_v6",
+                    profile.primary_concentration,
+                )
+    except Exception as exc:
+        print(f"  [concentration] resolution failed for {query!r}: {exc}")
+    return None
+
+
+def _apply_concentration(
+    payload: dict[str, Any], house: str, name: str, *, debug: bool = False
+) -> None:
+    """Attach the resolved concentration to a /complete payload in place.
+
+    Rides both top-level (`concentration`, consumed by api.py's payload model)
+    and inside `raw_identity` (the durable JSONB home -- fg_detail_cache has no
+    concentration column, so the value survives there without a migration).
+    Set ENRICHMENT_CONCENTRATION_SERP=0 to skip the slow browser tier.
+    """
+    resolved = _resolve_concentration(
+        house,
+        name,
+        allow_serp=_env_bool("ENRICHMENT_CONCENTRATION_SERP", True),
+        debug=debug,
+    )
+    if not resolved:
+        return
+    payload["concentration"] = resolved["concentration"]
+    raw_identity = payload.get("raw_identity")
+    if isinstance(raw_identity, dict):
+        raw_identity.setdefault("concentration", resolved["concentration"])
+        raw_identity.setdefault("concentration_meta", resolved["concentration_meta"])
+    print(
+        f"  [concentration] {resolved['concentration']} "
+        f"(conf={resolved['concentration_meta']['confidence']}, "
+        f"src={resolved['concentration_meta']['source']})"
+    )
+
+
 def _worker_metrics_complete(details: Any) -> bool:
     """True when all 4 Fragrantica status-derived metric groups parsed.
 
@@ -756,7 +870,7 @@ def fetch_payload(
     if image_url:
         raw_identity["image_url"] = image_url
 
-    return {
+    payload = {
         "fg_url": candidate.frag_url,
         "name": identity["name"],
         "house": identity["house"],
@@ -776,6 +890,13 @@ def fetch_payload(
         # job is naturally re-enqueued and retried on the next /details call.
         "quality_status": "complete" if _worker_metrics_complete(details) else "partial",
     }
+    _apply_concentration(
+        payload,
+        identity["house"] or candidate.brand,
+        identity["name"] or candidate.name,
+        debug=debug,
+    )
+    return payload
 
 
 def _build_parfumo_payload(
@@ -818,7 +939,7 @@ def _build_parfumo_payload(
     }
     raw_identity = {k: v for k, v in raw_identity.items() if v not in ("", None, [])}
 
-    return {
+    payload = {
         "source": "parfumo",
         "parfumo_url": rec.url,
         "fg_url": None,
@@ -834,6 +955,8 @@ def _build_parfumo_payload(
         # Parfumo is never FG-complete; persist as a terminal partial.
         "quality_status": "partial",
     }
+    _apply_concentration(payload, candidate.brand, candidate.name)
+    return payload
 
 
 def process_job(

@@ -64,10 +64,86 @@ def _derived_metrics_complete(dm: Any) -> bool:
         return all(bool(cov.get(g)) for g in _FG_METRIC_GROUPS)
     return all(dm.get(g) is not None for g in _FG_METRIC_GROUPS)
 
+_BASE_FIELDS = ("gender", "year", "concentration")
+
+def _base_field_value(payload: dict[str, Any], key: str) -> Any:
+    """Read a base field from a stored payload, flat or product-nested.
+
+    user_fragrances.fragrance_data keeps these flat; global_fragrances
+    .profile_data nests identity under `product`.
+    """
+    value = payload.get(key)
+    if value not in (None, "", 0):
+        return value
+    product = payload.get("product")
+    if isinstance(product, dict):
+        return product.get(key)
+    return value
+
+def _base_fields_complete(payload: Any) -> bool:
+    """True when gender, year, and concentration are all present.
+
+    "Unknown" counts as present: it is an explicit sentinel written after an
+    enrichment attempt found no consensus, so the sweep does not re-queue the
+    same row forever (scripts/enrich_concentration.py targets "Unknown" rows
+    for deeper SERP passes).
+    """
+    if not isinstance(payload, dict):
+        return False
+    for key in _BASE_FIELDS:
+        value = _base_field_value(payload, key)
+        if value is None or str(value).strip() == "":
+            return False
+    return True
+
 def _stored_metrics_complete(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    return _derived_metrics_complete(payload.get("derived_metrics"))
+    return _derived_metrics_complete(payload.get("derived_metrics")) and _base_fields_complete(payload)
+
+def _cheap_concentration(brand: str, name: str) -> str:
+    """Tier-1 concentration resolution (no browser): Parfinity catalog,
+    explicit token, brand prior, pillar prior. Returns "Unknown" when
+    unresolved so the row records an attempt instead of being re-queued
+    forever by the completeness sweep."""
+    query = f"{brand} {name}".strip()
+    try:
+        from parfinity import lookup_concentration as _pf_lookup
+
+        hit = _pf_lookup(brand, name)
+        if hit:
+            return hit
+    except Exception:
+        pass
+    try:
+        from concentration_grabber import SemanticScentEngine, to_scentcast_concentration
+
+        for label in (
+            SemanticScentEngine._explicit_intent(query),
+            SemanticScentEngine._brand_prior(query)[1],
+            SemanticScentEngine._query_pillar_prior(query),
+        ):
+            if not label:
+                continue
+            scentcast = to_scentcast_concentration(label)
+            if scentcast != "Unknown":
+                return scentcast
+    except Exception:
+        pass
+    return "Unknown"
+
+def _backfill_base_fields(payload: dict[str, Any], *, gender: Any, year: Any, brand: str, name: str) -> None:
+    """Fill missing gender/year/concentration on a stored row, in place.
+
+    Without this the new _base_fields_complete check would flag the same rows
+    incomplete again on every sweep, because the metric writes below never
+    touched these fields."""
+    if str(payload.get("gender") or "").strip() == "" and gender:
+        payload["gender"] = gender
+    if not payload.get("year") and year:
+        payload["year"] = year
+    if str(payload.get("concentration") or "").strip() == "":
+        payload["concentration"] = _cheap_concentration(brand, name)
 
 def _global_profile_identity(row: dict[str, Any]) -> tuple[str, str]:
     pdata = row.get("profile_data") or {}
@@ -269,12 +345,21 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
         print(f"  Detail fetch failed: {e}")
         return False
 
+    # Heal gender/year from the fetched cards, exactly like the worker does,
+    # so the base-field backfill below has real values to write.
+    engine.heal_missing_gender_and_year(candidate, details)
+    healed_year = existing_year or candidate.year
+    record_year = int(healed_year) if (healed_year and str(healed_year).isdigit()) else None
+    record_concentration = _cheap_concentration(brand, name)
+
     # 5. Construct cache row
     cache_row = {
         "canonical_fg_url": canonical_fg_url,
         "name": name,
         "house": brand,
-        "year": int(existing_year) if (existing_year and str(existing_year).isdigit()) else None,
+        "year": record_year,
+        "gender": details.gender,
+        "concentration": record_concentration if record_concentration != "Unknown" else None,
         "image_url": existing_image_url if existing_image_url else None,
         "schema_version": 1,
         "source": "manual_enrichment_script",
@@ -322,6 +407,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                     fdata["notes"] = cache_row["notes"]["flat"]
                     fdata["family"] = details.family if details.family else fdata.get("family")
                     fdata["pyramid"] = cache_row["notes"]
+                    _backfill_base_fields(fdata, gender=details.gender, year=record_year, brand=brand, name=name)
                     cur.execute("UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s", (Json(fdata), user_fragrance_id))
                     print(f"  Updated user_fragrances row ID {user_fragrance_id}")
             else:
@@ -337,6 +423,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                         fdata["source_url"] = resolved_fg_url
                         fdata["notes"] = cache_row["notes"]["flat"]
                         fdata["pyramid"] = cache_row["notes"]
+                        _backfill_base_fields(fdata, gender=details.gender, year=record_year, brand=brand, name=name)
                         cur.execute("UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s", (Json(fdata), r["id"]))
                         print(f"  Updated user_fragrances row ID {r['id']}")
 
@@ -350,6 +437,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                     pdata["source_url"] = resolved_fg_url
                     pdata["notes"] = cache_row["notes"]["flat"]
                     pdata["pyramid"] = cache_row["notes"]
+                    _backfill_base_fields(pdata, gender=details.gender, year=record_year, brand=brand, name=name)
                     cur.execute("UPDATE global_fragrances SET profile_data = %s WHERE id = %s", (Json(pdata), global_fragrance_id))
                     print(f"  Updated global_fragrances row ID {global_fragrance_id}")
             else:
@@ -366,6 +454,7 @@ def enrich_fragrance(scraper, args, brand, name, fg_url=None, bn_url=None, user_
                         pdata["source_url"] = resolved_fg_url
                         pdata["notes"] = cache_row["notes"]["flat"]
                         pdata["pyramid"] = cache_row["notes"]
+                        _backfill_base_fields(pdata, gender=details.gender, year=record_year, brand=brand, name=name)
                         cur.execute("UPDATE global_fragrances SET profile_data = %s WHERE id = %s", (Json(pdata), r["id"]))
                         print(f"  Updated global_fragrances row ID {r['id']}")
             conn.commit()
