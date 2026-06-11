@@ -68,7 +68,8 @@ Notes:
   the resolved value.
 - `year` is an integer when the engine has a clean year, otherwise `null`.
 
-**Errors:** `400` empty query · `502` resolver failure.
+**Errors:** `400` empty query · `503` live-search capacity saturated with no
+cache fallback.
 
 ---
 
@@ -144,7 +145,7 @@ single-source detail.
   cache), or `null` (live data, or no Fragrantica contribution at all).
 
 **Errors:** `400` missing/invalid `id` and no usable `source_url` · `502`
-detail fetch failure.
+detail fetch failure · `503` live detail-fetch capacity saturated.
 
 ---
 

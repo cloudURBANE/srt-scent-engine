@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -444,6 +445,70 @@ def test_api_identity_cache_rescues_bn_only_precheck() -> None:
             for row in results
         ),
         str(results),
+    )
+
+
+def test_api_live_search_saturation_uses_cache_fallback() -> None:
+    print("API live-search saturation checks:")
+    old_gate = api._LIVE_SEARCH_SEMAPHORE
+    old_timeout = api._LIVE_SEARCH_QUEUE_TIMEOUT
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    gate = threading.BoundedSemaphore(1)
+    gate.acquire()
+    calls = {"record": 0, "live": 0}
+    try:
+        api._LIVE_SEARCH_SEMAPHORE = gate
+        api._LIVE_SEARCH_QUEUE_TIMEOUT = 0.0
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+
+        def fake_record_search(query, limit=15):
+            calls["record"] += 1
+            if calls["record"] <= 2:
+                return []
+            return [
+                {
+                    "name": "Bayrhum Vetiver",
+                    "house": "Creed",
+                    "bn_url": "https://basenotes.com/fragrances/bayrhum-vetiver-by-creed.26120009",
+                    "canonical_fg_url": "https://www.fragrantica.com/perfume/Creed/Bayrhum-Vetiver-30691.html",
+                    "source_captured_at": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+
+        def fail_live_search(*args, **kwargs):
+            calls["live"] += 1
+            raise AssertionError("live search should not run when the gate is saturated")
+
+        api.db.search_fragrance_records = fake_record_search
+        api.db.search_detail_cache = lambda query, limit=15: []
+        api.engine.search_once = fail_live_search
+        response = api.search(q="creed bayrhum vetiver")
+    finally:
+        try:
+            gate.release()
+        except ValueError:
+            pass
+        api._LIVE_SEARCH_SEMAPHORE = old_gate
+        api._LIVE_SEARCH_QUEUE_TIMEOUT = old_timeout
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    diagnostics = response.get("diagnostics", {})
+    check("saturated live search does not call engine.search_once", calls["live"] == 0, str(calls))
+    check("saturated live search falls back to cache", diagnostics.get("fallback_source") == "aggregate_db", str(diagnostics))
+    check("saturation is reported in diagnostics", diagnostics.get("live_search_saturated") is True, str(diagnostics))
+    check(
+        "cache fallback still returns the fragrance",
+        any(row.get("name") == "Bayrhum Vetiver" for row in response.get("results", [])),
+        str(response.get("results", [])),
     )
 
 
@@ -1032,6 +1097,7 @@ def main() -> int:
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_api_bn_only_cache_hit_does_not_skip_live_search()
     test_api_identity_cache_rescues_bn_only_precheck()
+    test_api_live_search_saturation_uses_cache_fallback()
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()
