@@ -29,7 +29,7 @@ import os
 import sys
 from http.cookies import SimpleCookie
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -67,14 +67,22 @@ def test_no_db_contract() -> None:
     # Worker endpoints reject a missing token. With ENRICHMENT_WORKER_TOKEN
     # unset the dependency returns 503 (unconfigured); with it set, 401.
     saved = api._ENRICHMENT_WORKER_TOKEN
+    saved_public_diagnostics = api._PUBLIC_DIAGNOSTICS
     try:
+        api._PUBLIC_DIAGNOSTICS = False
         api._ENRICHMENT_WORKER_TOKEN = ""
         r = client.get("/api/enrichment/jobs")
         check("worker endpoint 503 when token unconfigured", r.status_code == 503, str(r.status_code))
 
+        r = client.get("/api/diagnostics/memory")
+        check("diagnostics endpoint 503 when token unconfigured", r.status_code == 503, str(r.status_code))
+
         api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
         r = client.get("/api/enrichment/jobs")
         check("worker endpoint 401 without bearer token", r.status_code == 401, str(r.status_code))
+
+        r = client.get("/api/diagnostics/memory")
+        check("diagnostics endpoint 401 without bearer token", r.status_code == 401, str(r.status_code))
 
         r = client.get(
             "/api/enrichment/jobs",
@@ -94,6 +102,19 @@ def test_no_db_contract() -> None:
             str(r.status_code),
         )
 
+        r = client.get(
+            "/api/diagnostics/memory",
+            headers={"Authorization": "Bearer test-secret-token"},
+        )
+        check("diagnostics endpoint accepts valid token", r.status_code == 200, str(r.status_code))
+
+        api._ENRICHMENT_WORKER_TOKEN = ""
+        api._PUBLIC_DIAGNOSTICS = True
+        r = client.get("/api/diagnostics/memory")
+        check("diagnostics endpoint supports explicit public override", r.status_code == 200, str(r.status_code))
+
+        api._PUBLIC_DIAGNOSTICS = False
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
         r = client.patch(
             "/api/enrichment/jobs/does-not-exist",
             headers={"Authorization": "Bearer test-secret-token"},
@@ -116,6 +137,7 @@ def test_no_db_contract() -> None:
         )
     finally:
         api._ENRICHMENT_WORKER_TOKEN = saved
+        api._PUBLIC_DIAGNOSTICS = saved_public_diagnostics
 
     @dataclass
     class ParserLeak:
@@ -203,6 +225,26 @@ def test_no_db_contract() -> None:
 
 def test_mobile_new_device_session_binding() -> None:
     print("Mobile auth checks (no DATABASE_URL required):")
+    now = datetime.now(timezone.utc)
+    account_row = {
+        "id": "account-1",
+        "email": "worker@example.test",
+        "label": "Worker",
+        "pin_hash": "stored",
+        "disabled": False,
+        "pin_strikes": 5,
+        "created_at": now,
+        "last_login_at": None,
+    }
+    expired = db._account_to_dict(
+        {**account_row, "locked_until": now - timedelta(seconds=1)}
+    )
+    active = db._account_to_dict(
+        {**account_row, "locked_until": now + timedelta(minutes=15)}
+    )
+    check("expired mobile lockout is inactive", expired["locked_until"] is None)
+    check("active mobile lockout remains visible", active["locked_until"] is not None)
+
     saved = {
         "enabled": db.ENABLED,
         "consume_magic_link": db.consume_magic_link,
