@@ -1115,6 +1115,101 @@ def test_worker_fact_summary_and_serp_retry() -> None:
     )
 
 
+def test_worker_query_normalization_and_retry_grace() -> None:
+    """Resolver-input hygiene: alias houses, strip concentration suffixes,
+    dedupe duplicated tokens, promote URL-bearing queries, and keep the first
+    resolver misses retryable. Pure functions — no network, no DB."""
+    print("\nWorker query normalization + retry grace:")
+    w = enrichment_worker
+
+    check(
+        "concentration suffix stripped from query",
+        w._normalize_query_text("Hermes 24 Faubourg Eau De Parfum") == "Hermes 24 Faubourg",
+    )
+    check(
+        "EDT abbreviation stripped",
+        w._normalize_query_text("Tom Ford Black Orchid EDT") == "Tom Ford Black Orchid",
+    )
+    check(
+        "bare concentration query is preserved, not emptied",
+        w._normalize_query_text("Eau de Cologne") == "Eau de Cologne",
+    )
+    check(
+        "duplicated tokens collapsed",
+        w._normalize_query_text("Classique Eau De Toilette Jean Paul Gaultier Classique")
+        == "Classique Jean Paul Gaultier",
+    )
+    check(
+        "house alias rewrites inside a query",
+        w._normalize_query_text("Lataffa Liam Grey") == "Lattafa Liam Grey",
+    )
+    check(
+        "house alias map canonicalizes Initio",
+        w._canonical_house("Initio") == "Initio Parfums Privés",
+    )
+    check(
+        "house alias map canonicalizes Penhaligons",
+        w._canonical_house("Penhaligons") == "Penhaligon's",
+    )
+    check(
+        "unknown house passes through untouched",
+        w._canonical_house("Chanel") == "Chanel",
+    )
+
+    variants = w._query_variants({"query": "Black Orchid Eau De Parfum", "house": "Tom Ford"})
+    check(
+        "query variants: normalized first, raw fallback second",
+        variants == ["Black Orchid", "Black Orchid Eau De Parfum"],
+        detail=repr(variants),
+    )
+
+    check(
+        "garbled name repaired via NAME_ALIASES",
+        w._canonical_name("Le Jardin Retrouve", "Verveine Dete") == "Verveine d'Été",
+    )
+    check(
+        "unknown name passes through untouched",
+        w._canonical_name("Chanel", "Allure Homme") == "Allure Homme",
+    )
+    repaired_variants = w._query_variants({"house": "Le Jardin Retrouve", "name": "Verveine Dete"})
+    check(
+        "repaired identity is the first search variant",
+        repaired_variants
+        and repaired_variants[0] == "Le Jardin Retrouvé Verveine d'Été"
+        and "Le Jardin Retrouve Verveine Dete" in repaired_variants,
+        detail=repr(repaired_variants),
+    )
+
+    fg = "https://www.fragrantica.com/perfume/Chanel/Allure-Homme-Edition-Blanche-Eau-de-Parfum-15660.html"
+    promoted = w._fg_url_from_job_query({"query": fg})
+    check(
+        "URL-bearing query promoted to fg_url",
+        promoted.startswith("https://www.fragrantica.com/perfume/"),
+        detail=repr(promoted),
+    )
+    check(
+        "non-perfume URL query is not promoted",
+        w._fg_url_from_job_query({"query": "https://www.fragrantica.com/designers/Chanel.html"}) == "",
+    )
+    check(
+        "plain-text query is not promoted",
+        w._fg_url_from_job_query({"query": "Chanel Allure Homme"}) == "",
+    )
+
+    check(
+        "resolver miss retryable on first attempt",
+        w._resolver_miss_retryable({"failure_count": 0}) is True,
+    )
+    check(
+        "resolver miss retryable within grace window",
+        w._resolver_miss_retryable({"failure_count": w.RESOLVER_RETRY_GRACE - 1}) is True,
+    )
+    check(
+        "resolver miss terminal once grace exhausted",
+        w._resolver_miss_retryable({"failure_count": w.RESOLVER_RETRY_GRACE}) is False,
+    )
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE
@@ -1369,6 +1464,7 @@ def main() -> int:
     test_stored_detail_completion_logic()
     test_completeness_self_heal_sweep()
     test_worker_fact_summary_and_serp_retry()
+    test_worker_query_normalization_and_retry_grace()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()

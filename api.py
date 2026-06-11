@@ -4884,12 +4884,16 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
 def list_enrichment_jobs(
     status: str = Query(default="pending"),
     limit: int = Query(default=db.DEFAULT_JOB_LIMIT, ge=1, le=db.MAX_JOB_LIMIT),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    """Protected: list jobs for the worker, priority-first. Defaults to pending."""
+    """Protected: list jobs for the worker, priority-first. Defaults to pending.
+
+    `offset` pages past MAX_JOB_LIMIT so large queues stay fully inspectable.
+    """
     _require_db()
     if status not in db.VALID_JOB_STATUSES:
         raise HTTPException(status_code=400, detail=f"Unknown status '{status}'.")
-    return {"jobs": db.list_jobs(status=status, limit=limit)}
+    return {"jobs": db.list_jobs(status=status, limit=limit, offset=offset)}
 
 
 @app.post(

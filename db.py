@@ -727,14 +727,19 @@ def get_status_counts() -> dict[str, int]:
         ctx.__exit__(None, None, None)
 
 
-def list_jobs(status: str = "pending", limit: int = DEFAULT_JOB_LIMIT) -> list[dict[str, Any]]:
-    """Worker job list, newest-priority first. limit is clamped to MAX_JOB_LIMIT.
+def list_jobs(
+    status: str = "pending", limit: int = DEFAULT_JOB_LIMIT, offset: int = 0
+) -> list[dict[str, Any]]:
+    """Worker job list, newest-priority first. limit is clamped to MAX_JOB_LIMIT;
+    offset allows paging past MAX_JOB_LIMIT so queues larger than one page stay
+    fully visible to operators.
 
     Projects only the columns _job_to_dict surfaces (excludes the unused
     metadata_json blob) -- the mobile dashboard polls this every 4s, so the
     dropped column would otherwise be steady Supabase egress for nothing.
     """
     limit = max(1, min(int(limit or DEFAULT_JOB_LIMIT), MAX_JOB_LIMIT))
+    offset = max(0, int(offset or 0))
     ctx, conn = _conn()
     try:
         rows = conn.execute(
@@ -742,9 +747,9 @@ def list_jobs(status: str = "pending", limit: int = DEFAULT_JOB_LIMIT) -> list[d
             SELECT {_ENRICHMENT_JOB_COLUMNS} FROM enrichment_jobs
             WHERE status = %s
             ORDER BY priority DESC, last_requested_at ASC, created_at ASC
-            LIMIT %s
+            LIMIT %s OFFSET %s
             """,
-            (status, limit),
+            (status, limit, offset),
         ).fetchall()
         return [_job_to_dict(r) for r in rows]
     finally:
