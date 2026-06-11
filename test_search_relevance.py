@@ -920,6 +920,31 @@ def test_serper_caches_responses() -> None:
     )
 
 
+def test_initio_prives_serper_url_survives_merge() -> None:
+    print("Initio Prives merge checks:")
+    bn = engine.UnifiedFragrance(
+        name="High Frequency",
+        brand="Initio",
+        year="2016",
+        bn_url="https://basenotes.com/fragrances/high-frequency-by-initio.26158110",
+    )
+    fg = engine.UnifiedFragrance(
+        name="High Frequency",
+        brand="Initio Parfums Prives",
+        year="2016",
+        frag_url="https://www.fragrantica.com/perfume/Initio-Parfums-Prives/High-Frequency-42259.html",
+        resolver_source="serper_fragrantica_search",
+    )
+    merged = engine.Orchestrator.match_and_merge([bn], [fg])
+
+    check(
+        "generic house suffixes do not block the Serper Fragrantica URL",
+        merged[0].frag_url == fg.frag_url
+        and merged[0].resolver_source == "serper_fragrantica_search",
+        f"{merged[0].brand} | {merged[0].name} | {merged[0].frag_url}",
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
@@ -944,6 +969,7 @@ def main() -> int:
     test_serper_rotates_after_exhausted_key()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
+    test_initio_prives_serper_url_survives_merge()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
     test_dolce_gabbana_identity_recovery_and_persistence()

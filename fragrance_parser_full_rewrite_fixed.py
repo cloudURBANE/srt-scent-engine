@@ -574,6 +574,8 @@ class IdentityTools:
         "paris",
         "perfume",
         "perfumes",
+        "prive",
+        "prives",
     })
     PARTIAL_HOUSE_REMAINDER_STARTERS = frozenset({"and", "de", "du", "di", "et", "van", "von"})
     MIN_FUZZY_TOKEN_LEN = 3

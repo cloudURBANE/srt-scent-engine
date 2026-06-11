@@ -192,6 +192,19 @@ class ApiClient:
             raise WorkerError("api_invalid_json", "jobs was not a list", retryable=True)
         return [j for j in jobs if isinstance(j, dict)]
 
+    def search_fragrances(self, query: str) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/api/fragrances/search",
+            params={"q": query},
+            auth=False,
+            timeout=HTTP_READ_TIMEOUT + 8.0,
+        )
+        results = payload.get("results") or []
+        if not isinstance(results, list):
+            raise WorkerError("api_invalid_json", "search results was not a list", retryable=True)
+        return [item for item in results if isinstance(item, dict)]
+
     def claim_job(self, job_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/enrichment/jobs/{job_id}/claim")
 
@@ -494,6 +507,74 @@ def _first_linked_result(results: list[engine.UnifiedFragrance]) -> engine.Unifi
     return None
 
 
+def _api_result_to_candidate(item: dict[str, Any]) -> engine.UnifiedFragrance | None:
+    fg_url = _canonical_fg_url(
+        str(
+            item.get("fg_url")
+            or item.get("fragrantica_url")
+            or item.get("source_url")
+            or ""
+        )
+    )
+    if not fg_url:
+        return None
+    return engine.UnifiedFragrance(
+        name=str(item.get("name") or ""),
+        brand=str(item.get("house") or item.get("brand") or ""),
+        year=_coerce_year(item.get("year")),
+        bn_url=str(item.get("bn_url") or ""),
+        frag_url=fg_url,
+        resolver_source="api_search",
+        resolver_score=0.95,
+    )
+
+
+def _candidate_matches_job(candidate: engine.UnifiedFragrance, job: dict[str, Any]) -> bool:
+    job_name = str(job.get("name") or "").strip()
+    job_house = str(job.get("house") or "").strip()
+    if not job_name and not job_house:
+        return True
+    probe = engine.UnifiedFragrance(
+        name=job_name or candidate.name,
+        brand=job_house or candidate.brand,
+        year=_coerce_year(job.get("year")),
+    )
+    catalog_item = engine.CatalogItem(
+        name=candidate.name,
+        brand=candidate.brand,
+        year=candidate.year,
+        url=candidate.frag_url,
+    )
+    return engine.Orchestrator.identity_score(probe, catalog_item) >= engine.Orchestrator.CATALOG_ACCEPT
+
+
+def _api_linked_candidates(
+    client: ApiClient,
+    query: str,
+    job: dict[str, Any],
+    *,
+    debug: bool = False,
+) -> list[engine.UnifiedFragrance]:
+    try:
+        rows = client.search_fragrances(query)
+    except WorkerError as exc:
+        if debug:
+            print(f"  [resolve] API search skipped: {exc.code}")
+        return []
+    linked: list[engine.UnifiedFragrance] = []
+    seen: set[str] = set()
+    for row in rows:
+        candidate = _api_result_to_candidate(row)
+        if not candidate or not _candidate_matches_job(candidate, job):
+            continue
+        dedupe = engine.FragranticaEngine.dedupe_key(candidate.frag_url)
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        linked.append(candidate)
+    return linked
+
+
 def _normalize_fg_url_input(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
@@ -607,6 +688,24 @@ def resolve_candidate(
         return parfumo_candidate
 
     raise WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
+
+
+def resolve_candidate_for_job(
+    client: ApiClient,
+    scraper,
+    args: argparse.Namespace,
+    job: dict[str, Any],
+    *,
+    debug: bool = False,
+) -> engine.UnifiedFragrance:
+    if not _job_missing_fg_url(job):
+        return resolve_candidate(scraper, args, job, debug=debug)
+    query = _build_query(job)
+    if query:
+        linked = _api_linked_candidates(client, query, job, debug=debug)
+        if linked:
+            return linked[0]
+    return resolve_candidate(scraper, args, job, debug=debug)
 
 
 def _try_parfumo_fallback(
@@ -987,7 +1086,7 @@ def process_job(
         else:
             print(f"{index_label} Processing claimed job {label}")
 
-        candidate = resolve_candidate(scraper, args, job, debug=config.debug)
+        candidate = resolve_candidate_for_job(client, scraper, args, job, debug=config.debug)
         payload = fetch_payload(
             scraper,
             candidate,
@@ -2303,8 +2402,10 @@ def resolve_missing_url_for_job(
     scraper = engine.get_scraper()
     engine_args = _build_engine_args(enhanced=True)
     print(f"\nSearching (enhanced) for {query!r}…")
-    results = _search_candidates(scraper, query, engine_args, debug=config.debug)
-    linked = [item for item in results if item.frag_url]
+    linked = _api_linked_candidates(client, query, job, debug=config.debug)
+    if not linked:
+        results = _search_candidates(scraper, query, engine_args, debug=config.debug)
+        linked = [item for item in results if item.frag_url]
     if not linked:
         print("No Fragrantica URLs found.")
         paste = input("Paste a URL manually, or Enter to cancel: ").strip()
