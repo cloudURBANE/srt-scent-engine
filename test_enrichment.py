@@ -1210,6 +1210,183 @@ def test_worker_query_normalization_and_retry_grace() -> None:
     )
 
 
+def test_worker_url_gating_catalog_tier_and_retirement() -> None:
+    """Bad-URL hygiene, args isolation, the deterministic designer-catalog
+    tier, and no-Fragrantica retirement. No network, no DB."""
+    print("\nWorker URL gating + catalog tier + retirement:")
+    w = enrichment_worker
+    engine = w.engine
+
+    perfume = "https://www.fragrantica.com/perfume/Chanel/Allure-Homme-15660.html"
+    designer = "https://www.fragrantica.com/designers/Chanel.html"
+    check(
+        "perfume URL canonicalized",
+        w._canonical_fg_url(perfume).startswith("https://www.fragrantica.com/perfume/"),
+    )
+    check("designer URL rejected as fg_url", w._canonical_fg_url(designer) == "")
+    check("empty URL rejected", w._canonical_fg_url("") == "")
+    check(
+        "job with designer fg_url counts as missing",
+        w._job_missing_fg_url({"fg_url": designer}) is True,
+    )
+    check(
+        "job with perfume fg_url counts as present",
+        w._job_missing_fg_url({"fg_url": perfume}) is False,
+    )
+
+    results = [
+        engine.UnifiedFragrance(name="bad", brand="Chanel", year="", frag_url=designer),
+        engine.UnifiedFragrance(name="good", brand="Chanel", year="", frag_url=perfume),
+    ]
+    linked = w._first_linked_result(results)
+    check(
+        "first linked result skips non-perfume URLs",
+        linked is not None and linked.frag_url == perfume,
+        detail=repr(getattr(linked, "frag_url", None)),
+    )
+
+    # resolve_candidate must ignore a stored non-perfume fg_url (resolve by
+    # query instead) and must not mutate the shared args namespace.
+    search_calls: list[tuple[str, str]] = []
+
+    def fake_search(scraper, query, args, *, debug=False):
+        search_calls.append((query, getattr(args, "brand", "")))
+        return [engine.UnifiedFragrance(name="Allure Homme", brand="Chanel", year="", frag_url=perfume)]
+
+    shared_args = w._build_engine_args()
+    shared_brand_before = getattr(shared_args, "brand", "<unset>")
+    old_search = w._search_candidates
+    w._search_candidates = fake_search
+    try:
+        candidate = w.resolve_candidate(
+            None, shared_args, {"fg_url": designer, "house": "Chanel", "name": "Allure Homme"}
+        )
+    finally:
+        w._search_candidates = old_search
+    check(
+        "stored designer fg_url is ignored; job resolved by query",
+        candidate.frag_url == perfume and search_calls,
+        detail=repr(search_calls),
+    )
+    check(
+        "search ran with the job's brand on a per-job args copy",
+        search_calls and search_calls[0][1] == "Chanel",
+        detail=repr(search_calls),
+    )
+    check(
+        "shared args namespace is not mutated across jobs",
+        getattr(shared_args, "brand", "<unset>") == shared_brand_before,
+        detail=repr(getattr(shared_args, "brand", "<unset>")),
+    )
+
+    # Deterministic designer-catalog tier: the house catalog is enumerated and
+    # identity-scored, so sibling flankers resolve to the right URL.
+    twist_urls = {
+        "Basil": "https://www.fragrantica.com/perfume/Clive-Christian/1872-Twist-Basil-90001.html",
+        "Geranium": "https://www.fragrantica.com/perfume/Clive-Christian/1872-Twist-Geranium-90002.html",
+        "Vetiver": "https://www.fragrantica.com/perfume/Clive-Christian/1872-Twist-Vetiver-90003.html",
+    }
+    catalog = [
+        engine.CatalogItem(name=f"1872 Twist {flavor}", brand="Clive Christian", year="", url=url)
+        for flavor, url in twist_urls.items()
+    ]
+
+    def fake_catalog(scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None):
+        return catalog
+
+    old_catalog = engine.SearchSniper.catalog_candidates_for_brand
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(fake_catalog)
+    try:
+        hit = w._designer_catalog_candidate(
+            None, {"house": "Clive Christian", "name": "1872 Twist Geranium"}
+        )
+        miss = w._designer_catalog_candidate(
+            None, {"house": "Clive Christian", "name": "Totally Unrelated Nonexistent Thing"}
+        )
+        no_identity = w._designer_catalog_candidate(None, {"house": "", "name": "1872 Twist Geranium"})
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check(
+        "catalog tier resolves the exact sibling flanker",
+        hit is not None and hit.frag_url == twist_urls["Geranium"],
+        detail=repr(getattr(hit, "frag_url", None)),
+    )
+    check("catalog tier rejects below-accept identities", miss is None, detail=repr(miss))
+    check("catalog tier needs both house and name", no_identity is None)
+
+    check(
+        "B&BW retires on terminal resolver miss",
+        w._matches_no_fragrantica_line({"house": "Bath And Body Works", "name": "Brightest Bloom"}) is True,
+    )
+    check(
+        "VS Pink line retires",
+        w._matches_no_fragrantica_line({"house": "Victorias Secret", "name": "Pink Hot Petals"}) is True,
+    )
+    check(
+        "VS real perfumes do not retire",
+        w._matches_no_fragrantica_line({"house": "Victorias Secret", "name": "Bombshell"}) is False,
+    )
+    check(
+        "CK body mists retire",
+        w._matches_no_fragrantica_line({"house": "Calvin Klein", "name": "Silky Coconut Body Mist"}) is True,
+    )
+    check(
+        "CK real perfumes do not retire",
+        w._matches_no_fragrantica_line({"house": "Calvin Klein", "name": "Eternity"}) is False,
+    )
+    check(
+        "unrelated houses never retire",
+        w._matches_no_fragrantica_line({"house": "Chanel", "name": "Pink"}) is False,
+    )
+
+    # process_job: a terminal resolver miss on a no-Fragrantica line calls
+    # ignore_job, not fail_job.
+    class _StubClient:
+        def __init__(self):
+            self.ignored: list[tuple[str, str]] = []
+            self.failed: list[tuple[str, str, bool]] = []
+
+        def claim_job(self, job_id):
+            return {"claimed": True}
+
+        def ignore_job(self, job_id, note=None):
+            self.ignored.append((job_id, note or ""))
+            return {"ignored": True}
+
+        def fail_job(self, job_id, error, retryable):
+            self.failed.append((job_id, error, retryable))
+            return {"failed": True}
+
+    def raise_terminal_miss(client, scraper, args, job, *, debug=False):
+        raise w.WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
+
+    config = w.WorkerConfig(
+        api_base_url="http://localhost", token="t", delay=0, jitter=0,
+        limit=1, detail_timeout=1.0, debug=False, dry_run=False,
+    )
+    stub = _StubClient()
+    old_resolve = w.resolve_candidate_for_job
+    w.resolve_candidate_for_job = raise_terminal_miss
+    try:
+        bbw_job = {"id": "job-1", "house": "Bath And Body Works", "name": "Brightest Bloom"}
+        w.process_job(stub, None, None, bbw_job, index_label="[t]", config=config)
+        chanel_job = {"id": "job-2", "house": "Chanel", "name": "Some Real Perfume"}
+        w.process_job(stub, None, None, chanel_job, index_label="[t]", config=config)
+    finally:
+        w.resolve_candidate_for_job = old_resolve
+    check(
+        "terminal miss on no-FG line is retired via ignore_job",
+        stub.ignored and stub.ignored[0][0] == "job-1" and all(jid != "job-1" for jid, *_ in stub.failed),
+        detail=f"ignored={stub.ignored} failed={stub.failed}",
+    )
+    check(
+        "terminal miss on a real house still goes to fail_job",
+        any(jid == "job-2" and not retryable for jid, _err, retryable in stub.failed)
+        and all(jid != "job-2" for jid, _ in stub.ignored),
+        detail=f"ignored={stub.ignored} failed={stub.failed}",
+    )
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE
@@ -1465,6 +1642,7 @@ def main() -> int:
     test_completeness_self_heal_sweep()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
+    test_worker_url_gating_catalog_tier_and_retirement()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()

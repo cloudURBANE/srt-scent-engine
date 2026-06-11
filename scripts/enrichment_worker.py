@@ -108,6 +108,37 @@ HOUSE_ALIASES: dict[str, str] = {
     "bath and body works": "Bath & Body Works",
 }
 
+# Product lines with essentially no Fragrantica coverage (mass-market body
+# mists). When one of these exhausts the resolver (terminal
+# fg_url_missing_after_resolution), the worker retires the job to `ignored`
+# instead of `failed`, so it stops polluting the failure counts and is never
+# requeued by "Retry failed jobs". Mode: "any" retires the whole house,
+# "prefix"/"contains" match against the alias-normalized name.
+NO_FRAGRANTICA_LINES: tuple[tuple[str, str, str], ...] = (
+    ("bath and body works", "any", ""),
+    ("bath body works", "any", ""),
+    ("victorias secret", "prefix", "pink"),
+    ("calvin klein", "contains", "body mist"),
+)
+
+
+def _matches_no_fragrantica_line(job: dict[str, Any]) -> bool:
+    house = _alias_key(str(job.get("house") or ""))
+    name = _alias_key(str(job.get("name") or ""))
+    if not house:
+        return False
+    for house_key, mode, marker in NO_FRAGRANTICA_LINES:
+        if house != house_key:
+            continue
+        if mode == "any":
+            return True
+        if mode == "prefix" and name.startswith(marker):
+            return True
+        if mode == "contains" and marker in name:
+            return True
+    return False
+
+
 # Garbled Basenotes names that cannot be repaired generically (accents and
 # punctuation were stripped at import). Keyed by (alias-normalized house,
 # alias-normalized name) -> the Fragrantica display name.
@@ -414,20 +445,20 @@ def _now_iso() -> str:
 
 
 def _canonical_fg_url(url: str) -> str:
+    """Canonical perfume-page URL, or "" when the input is not one.
+
+    Non-perfume Fragrantica URLs (designer pages, search pages) must never be
+    treated as a usable fg_url: feeding one to fetch_payload yields an instant
+    parser_empty_frag_cards that repeats identically on every retry. Returning
+    "" here makes every caller fall through to real query resolution instead.
+    """
     text = (url or "").strip()
     if not text:
         return ""
     canonical = engine.FragranticaEngine.canonical_url(text)
     if engine.FragranticaEngine.is_perfume_url(canonical):
         return canonical.rstrip("/")
-    if "://" in text:
-        scheme, rest = text.split("://", 1)
-        if "/" in rest:
-            host, path = rest.split("/", 1)
-            text = f"{scheme.lower()}://{host.lower()}/{path}"
-        else:
-            text = f"{scheme.lower()}://{rest.lower()}"
-    return text.rstrip("/")
+    return ""
 
 
 def _job_label(job: dict[str, Any]) -> str:
@@ -674,7 +705,7 @@ def _build_engine_args(*, enhanced: bool = False) -> argparse.Namespace:
 
 def _first_linked_result(results: list[engine.UnifiedFragrance]) -> engine.UnifiedFragrance | None:
     for item in results:
-        if item.frag_url:
+        if item.frag_url and _canonical_fg_url(item.frag_url):
             return engine.UnifiedFragrance(
                 name=item.name,
                 brand=item.brand,
@@ -727,6 +758,71 @@ def _candidate_matches_job(candidate: engine.UnifiedFragrance, job: dict[str, An
         url=candidate.frag_url,
     )
     return engine.Orchestrator.identity_score(probe, catalog_item) >= engine.Orchestrator.CATALOG_ACCEPT
+
+
+CATALOG_TIER_BUDGET = float(os.environ.get("ENRICHMENT_CATALOG_TIER_BUDGET", "12") or 12)
+CATALOG_TIER_SIBLING_MARGIN = 0.06
+
+
+def _designer_catalog_candidate(
+    scraper,
+    job: dict[str, Any],
+    *,
+    debug: bool = False,
+) -> engine.UnifiedFragrance | None:
+    """Deterministic Fragrantica tier: crawl the house's designer page(s).
+
+    The engine's own designer-catalog fallback only runs behind the
+    QueryRepair.needs_repair gate under a small shared deadline, which is how
+    sibling flankers flake ("1872 Twist Basil" resolved while "1872 Twist
+    Geranium" exhausted its retries). This tier always runs for house+name
+    jobs once search came up empty: a designer page enumerates the whole
+    line, so if the perfume exists on Fragrantica it is in this list. Scored
+    with the engine's own identity acceptor plus a sibling margin so
+    near-ties (EDT vs EDP rows) are never guessed.
+    """
+    house = _canonical_house(str(job.get("house") or ""))
+    name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
+    if not house or not name:
+        return None
+    probe = engine.UnifiedFragrance(name=name, brand=house, year=_coerce_year(job.get("year")))
+    scored: list[tuple[float, engine.CatalogItem]] = []
+    try:
+        for label in engine.IdentityTools.catalog_brand_keys(house, name):
+            deadline = engine.Deadline(CATALOG_TIER_BUDGET)
+            items = _run_engine_call(
+                lambda: engine.SearchSniper.catalog_candidates_for_brand(
+                    scraper, label, deadline, slug_limit=8, page_timeout=6.0
+                ),
+                debug=debug,
+            )
+            for item in items:
+                scored.append((engine.Orchestrator.identity_score(probe, item), item))
+            if scored and max(score for score, _ in scored) >= engine.Orchestrator.CATALOG_ACCEPT:
+                break
+    except Exception as exc:
+        print(f"  [catalog] designer-catalog tier failed: {exc}")
+        return None
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    best_score, best = scored[0]
+    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score < engine.Orchestrator.CATALOG_ACCEPT:
+        print(f"  [catalog] best {best.url} score={best_score:.2f} below accept; skipping")
+        return None
+    if runner_up >= engine.Orchestrator.CATALOG_ACCEPT and best_score - runner_up < CATALOG_TIER_SIBLING_MARGIN:
+        print(f"  [catalog] sibling collision ({best_score:.2f} vs {runner_up:.2f}); skipping")
+        return None
+    print(f"  [catalog] accepted {best.url} score={best_score:.2f}")
+    return engine.UnifiedFragrance(
+        name=best.name,
+        brand=best.brand,
+        year=best.year,
+        frag_url=best.url,
+        resolver_source="worker_designer_catalog",
+        resolver_score=best_score,
+    )
 
 
 def _api_linked_candidates(
@@ -823,7 +919,12 @@ def resolve_candidate(
     *,
     debug: bool = False,
 ) -> engine.UnifiedFragrance:
-    fg_url = engine.FragranticaEngine.canonical_url(str(job.get("fg_url") or "").strip())
+    raw_fg_url = str(job.get("fg_url") or "").strip()
+    fg_url = _canonical_fg_url(raw_fg_url)
+    if raw_fg_url and not fg_url:
+        # A stored non-perfume URL (designer/search page) would fail parsing
+        # instantly on every attempt; ignore it and resolve by query instead.
+        print(f"  [resolve] ignoring non-perfume fg_url on job: {raw_fg_url!r}")
     if not fg_url:
         fg_url = _fg_url_from_job_query(job)
     if fg_url:
@@ -840,8 +941,11 @@ def resolve_candidate(
         raise WorkerError("fg_url_missing_after_resolution", "job has no fg_url or usable query", retryable=False)
 
     house = _canonical_house(str(job.get("house") or ""))
-    if house:
-        args.brand = house
+    # Work on a per-job copy: mutating the shared engine args would leak this
+    # job's brand into every later job's search (the catalog fallback keys off
+    # args.brand, so a stale brand sends house-less jobs to the wrong catalog).
+    args = argparse.Namespace(**vars(args))
+    args.brand = house
 
     for query in queries:
         results = _search_candidates(scraper, query, args, debug=debug)
@@ -851,14 +955,19 @@ def resolve_candidate(
 
     if not getattr(args, "external_search", False):
         enhanced_args = _build_engine_args(enhanced=True)
-        if house:
-            enhanced_args.brand = house
+        enhanced_args.brand = house
         for query in queries:
             print(f"  [resolve] retrying with enhanced search for {query!r}")
             results = _search_candidates(scraper, query, enhanced_args, debug=debug)
             candidate = _first_linked_result(results)
             if _accept_candidate(candidate, job):
                 return candidate
+
+    # Deterministic designer-catalog tier: search missed, so enumerate the
+    # house's Fragrantica catalog directly and identity-match against it.
+    catalog_candidate = _designer_catalog_candidate(scraper, job, debug=debug)
+    if catalog_candidate is not None:
+        return catalog_candidate
 
     # Parfumo fallback (§6.B): Fragrantica resolution found no URL. When enabled,
     # try the Parfumo factual-field resolver before giving up. On accept this
@@ -1382,9 +1491,27 @@ def process_job(
                 print(f"{index_label} Server: {detail[:200]}")
         elif config.debug and str(exc) != exc.code:
             print(f"{index_label} {exc}")
+        retire = (
+            exc.code == "fg_url_missing_after_resolution"
+            and not exc.retryable
+            and _matches_no_fragrantica_line(job)
+        )
         if config.dry_run:
-            print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
+            if retire:
+                print(f"{index_label} Dry run: would retire to ignored (no Fragrantica coverage)")
+            else:
+                print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
             return False
+        if retire:
+            try:
+                client.ignore_job(
+                    job_id,
+                    "no Fragrantica coverage for this product line; retired after resolver exhausted retries",
+                )
+                print(f"{index_label} Retired {label} to ignored (no Fragrantica coverage)")
+                return False
+            except WorkerError as ignore_exc:
+                print(f"{index_label} Could not retire to ignored: {ignore_exc.code}")
         try:
             client.fail_job(job_id, str(exc), exc.retryable)
             print(f"{index_label} Marked {'retryable' if exc.retryable else 'non-retryable'} failure")
