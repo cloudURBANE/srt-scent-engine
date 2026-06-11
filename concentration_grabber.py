@@ -15,6 +15,16 @@ C, G, Y, E, M, Z = '\033[36m', '\033[32m', '\033[33m', '\033[31m', '\033[35m', '
 B, W, D = '\033[34m', '\033[37m', '\033[90m'
 
 
+def _env_float(name, default, *, minimum=0.0):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+    if value < minimum:
+        return float(minimum)
+    return value
+
+
 @dataclass
 class ScentProfile:
     query: str
@@ -200,8 +210,9 @@ class SemanticScentEngine:
     # stalling DuckDuckGo leaves the enrichment worker wedged inside analyze()
     # with no feedback. Page-level timeouts bound each fetch; the budget bounds
     # the whole multi-source loop.
-    SERP_PAGE_LOAD_TIMEOUT_SEC = float(os.environ.get("SCENT_SERP_PAGE_TIMEOUT_SECONDS", "20"))
-    SERP_TOTAL_BUDGET_SEC = float(os.environ.get("SCENT_SERP_BUDGET_SECONDS", "75"))
+    SERP_PAGE_LOAD_TIMEOUT_SEC = _env_float("SCENT_SERP_PAGE_TIMEOUT_SECONDS", 20, minimum=1.0)
+    SERP_TOTAL_BUDGET_SEC = _env_float("SCENT_SERP_BUDGET_SECONDS", 75, minimum=1.0)
+    SERP_RESULT_WAIT_TIMEOUT_SEC = _env_float("SCENT_SERP_RESULT_WAIT_SECONDS", 0.75, minimum=0.1)
 
     @staticmethod
     def _normalize(s):
@@ -416,22 +427,36 @@ class SemanticScentEngine:
         return hashlib.sha1(query.lower().strip().encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _fetch_serp(page, query, site_filter=""):
+    def _fetch_serp(page, query, site_filter="", timeout=None):
         """Fetch one DDG SERP. Returns rows, [] for a loaded-but-empty SERP,
         or None when the fetch/parse itself failed (the only retryable case)."""
         q = f"{query} {site_filter}".strip()
         safe_q = quote(q)
+        page_timeout = SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC
+        if timeout is not None:
+            page_timeout = max(1.0, min(page_timeout, float(timeout)))
         try:
-            page.get(f"https://html.duckduckgo.com/html/?q={safe_q}")
-            page.wait.load_start()
+            ok = page.get(
+                f"https://html.duckduckgo.com/html/?q={safe_q}",
+                retry=0,
+                interval=0,
+                timeout=page_timeout,
+            )
+            if ok is False:
+                return None
+            page.wait.load_start(timeout=min(SemanticScentEngine.SERP_RESULT_WAIT_TIMEOUT_SEC, page_timeout))
             time.sleep(0.4)
         except Exception:
             return None
         rows = []
         try:
-            titles   = [el.text for el in page.eles('css:.result__title')[:10]]
-            snippets = [el.text for el in page.eles('css:.result__snippet')[:10]]
-            urls_txt = [el.text for el in page.eles('css:.result__url')[:10]]
+            dom_timeout = min(SemanticScentEngine.SERP_RESULT_WAIT_TIMEOUT_SEC, page_timeout)
+            title_elements = page.eles('css:.result__title', timeout=dom_timeout)[:10]
+            if not title_elements:
+                return []
+            titles   = [el.text for el in title_elements]
+            snippets = [el.text for el in page.eles('css:.result__snippet', timeout=dom_timeout)[:10]]
+            urls_txt = [el.text for el in page.eles('css:.result__url', timeout=dom_timeout)[:10]]
         except Exception:
             return None
         n = min(len(titles), len(snippets), len(urls_txt))
@@ -449,16 +474,29 @@ class SemanticScentEngine:
         return rows
 
     @staticmethod
-    def _retry_fetch(page, query, site_filter, attempts=3):
+    def _retry_fetch(page, query, site_filter, attempts=3, deadline=None):
         """Retry only on fetch/parse failures (None). A SERP that loaded fine
         with zero results is a real answer -- retrying it just burns the job's
         time budget and looks like a hang from the worker dashboard."""
         for attempt in range(attempts):
-            rows = SemanticScentEngine._fetch_serp(page, query, site_filter)
+            timeout = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < 1.0:
+                    break
+                timeout = remaining
+            rows = SemanticScentEngine._fetch_serp(page, query, site_filter, timeout=timeout)
             if rows is not None:
                 return rows
             if attempt + 1 < attempts:
-                time.sleep(0.8 * (attempt + 1))
+                sleep_for = 0.8 * (attempt + 1)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sleep_for = min(sleep_for, remaining)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
         return []
 
     @staticmethod
@@ -497,7 +535,8 @@ class SemanticScentEngine:
 
         # 4. Multi-source engine data pulling loops
         print(f"{Y}[SYS] Booting browser & fetching sources...{Z}")
-        t0 = time.time()
+        t0 = time.monotonic()
+        deadline = t0 + SemanticScentEngine.SERP_TOTAL_BUDGET_SEC
 
         source_queries = [
             ("fragrantica", "site:fragrantica.com"),
@@ -531,25 +570,40 @@ class SemanticScentEngine:
                 pass
 
             try:
-                page.get("https://html.duckduckgo.com/html/")
-                page.wait.load_start()
+                warmup_timeout = min(
+                    SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
+                    max(1.0, deadline - time.monotonic()),
+                )
+                page.get(
+                    "https://html.duckduckgo.com/html/",
+                    retry=0,
+                    interval=0,
+                    timeout=warmup_timeout,
+                )
+                page.wait.load_start(
+                    timeout=min(SemanticScentEngine.SERP_RESULT_WAIT_TIMEOUT_SEC, warmup_timeout)
+                )
                 time.sleep(0.3)
             except Exception:
                 pass
 
             for label, site_filter in source_queries:
-                elapsed = time.time() - t0
-                if elapsed > SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:
+                elapsed = time.monotonic() - t0
+                if elapsed >= SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:
                     print(
                         f"  {E}[SYS] SERP budget exhausted "
-                        f"({elapsed:.0f}s > {SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:.0f}s); "
+                        f"({elapsed:.0f}s >= {SemanticScentEngine.SERP_TOTAL_BUDGET_SEC:.0f}s); "
                         f"skipping {label} and remaining sources.{Z}"
                     )
-                    per_source_rows.setdefault(label, [])
-                    continue
+                    break
                 print(f"  {C}[FETCH] {label:11s}...{Z}", end="")
                 sys.stdout.flush()
-                rows = SemanticScentEngine._retry_fetch(page, fragrance_name, site_filter)
+                rows = SemanticScentEngine._retry_fetch(
+                    page,
+                    fragrance_name,
+                    site_filter,
+                    deadline=deadline,
+                )
                 per_source_rows[label] = rows
                 if rows:
                     sources_consulted.append(label)
@@ -592,7 +646,7 @@ class SemanticScentEngine:
 
         active = {k: round(v, 3) for k, v in votes.items() if v > 0}
         ranked = sorted(active.items(), key=lambda kv: kv[1], reverse=True)
-        dt = time.time() - t0
+        dt = time.monotonic() - t0
         print(f"{G}[SYS] Voting complete in {dt:.2f}s. {total_vote_count} ballots.{Z}")
 
         # Precise query-level structural check matching modifications override rules
