@@ -1196,6 +1196,73 @@ def test_decodo_structured_spell_repair_evidence() -> None:
     )
 
 
+def test_decodo_url_discovery_budget_gate() -> None:
+    print("Decodo URL-discovery budget gate checks:")
+    # Mirrors the spell-repair gate: an abandoned provider call still spends a
+    # credit, so a first-pass FG budget below MIN_VIABLE_BUDGET must skip the
+    # request entirely instead of starting one that cannot finish.
+    saved = _set_decodo_env(enabled=True)
+    old_post = engine.requests.post
+    posts: list[str] = []
+    try:
+        def counting_post(url, json=None, headers=None, timeout=None, **kwargs):
+            posts.append(str((json or {}).get("query") or ""))
+            return _FakeDecodoResponse(_DECODO_SAMPLE_PAYLOAD)
+
+        engine.requests.post = counting_post
+        starved = engine.DecodoScraperClient.search_fragrantica_urls(
+            "creed aventus", deadline=engine.Deadline(0.4)
+        )
+        check(
+            "starved Fragrantica discovery budget skips the provider call",
+            starved == [] and posts == [],
+            str(posts),
+        )
+        urls = engine.DecodoScraperClient.search_fragrantica_urls(
+            "creed aventus", deadline=engine.Deadline(4.5)
+        )
+        check(
+            "viable Fragrantica discovery budget performs the call",
+            len(posts) == 1 and any("Aventus" in url for url in urls),
+            f"{posts} {urls}",
+        )
+        parfumo_starved = engine.DecodoScraperClient.search_parfumo_urls(
+            "Creed", "Aventus", deadline=engine.Deadline(0.4)
+        )
+        check(
+            "starved Parfumo discovery budget skips the provider call",
+            parfumo_starved == [] and len(posts) == 1,
+            str(posts),
+        )
+    finally:
+        engine.requests.post = old_post
+        _restore_decodo_env(saved)
+
+
+def test_decodo_url_discovery_failure_degrades_without_caching() -> None:
+    print("Decodo URL-discovery failure handling checks:")
+    saved = _set_decodo_env(enabled=True)
+    old_post = engine.requests.post
+    attempts = {"n": 0}
+    try:
+        def timing_out_post(url, json=None, headers=None, timeout=None, **kwargs):
+            attempts["n"] += 1
+            raise engine.requests.exceptions.ReadTimeout("Read timed out. (read timeout=3.0)")
+
+        engine.requests.post = timing_out_post
+        first = engine.DecodoScraperClient.search_fragrantica_urls("xerjoff naxos")
+        second = engine.DecodoScraperClient.search_fragrantica_urls("xerjoff naxos")
+        check("provider timeout degrades to no URLs", first == [] and second == [], f"{first} {second}")
+        check(
+            "a failed discovery call is retried, not cached as empty",
+            attempts["n"] == 2,
+            str(attempts["n"]),
+        )
+    finally:
+        engine.requests.post = old_post
+        _restore_decodo_env(saved)
+
+
 def test_initio_prives_decodo_url_survives_merge() -> None:
     print("Initio Prives merge checks:")
     bn = engine.UnifiedFragrance(
