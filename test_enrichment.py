@@ -1700,6 +1700,7 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
         def __init__(self):
             self.ignored: list[tuple[str, str]] = []
             self.failed: list[tuple[str, str, bool]] = []
+            self.requeued: list[tuple[str, int]] = []
 
         def claim_job(self, job_id):
             return {"claimed": True}
@@ -1711,6 +1712,10 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
         def fail_job(self, job_id, error, retryable):
             self.failed.append((job_id, error, retryable))
             return {"failed": True}
+
+        def requeue_job(self, job_id, *, priority=10):
+            self.requeued.append((job_id, priority))
+            return {"queued": True}
 
     def raise_terminal_miss(client, scraper, args, job, *, debug=False):
         raise w.WorkerError("fg_url_missing_after_resolution", "resolver returned no Fragrantica URL", retryable=False)
@@ -1739,6 +1744,28 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
         any(jid == "job-2" and not retryable for jid, _err, retryable in stub.failed)
         and all(jid != "job-2" for jid, _ in stub.ignored),
         detail=f"ignored={stub.ignored} failed={stub.failed}",
+    )
+
+    def raise_blocked_miss(client, scraper, args, job, *, debug=False):
+        raise w.WorkerError("fg_resolver_blocked", "designer catalog unreachable", retryable=True)
+
+    stub = _StubClient()
+    w.resolve_candidate_for_job = raise_blocked_miss
+    try:
+        w.process_job(
+            stub,
+            None,
+            None,
+            {"id": "job-3", "house": "Pull Bear", "name": "Frosted Pink", "priority": 7},
+            index_label="[t]",
+            config=config,
+        )
+    finally:
+        w.resolve_candidate_for_job = old_resolve
+    check(
+        "blocked resolver miss requeues without fail_job",
+        stub.requeued == [("job-3", 10)] and not stub.failed and not stub.ignored,
+        detail=f"requeued={stub.requeued} failed={stub.failed} ignored={stub.ignored}",
     )
 
     # "Retry failed jobs": requeueing a terminal failure resets its
@@ -1776,6 +1803,59 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
         and rq_client.requeued == [("dead-1", 10), ("dead-2", 13)],
         detail=f"ids={requeued_ids} calls={rq_client.requeued}",
     )
+
+    class _DiagClient:
+        def list_jobs(self, status, limit=10, offset=0):
+            rows = {
+                "failed": [
+                    {
+                        "id": "failed-bbw",
+                        "status": "failed",
+                        "house": "Bath & Body Works",
+                        "name": "Pink Body Mist",
+                        "failure_count": 3,
+                        "last_error": "resolver returned no Fragrantica URL",
+                        "fg_url": None,
+                    }
+                ],
+                "pending": [
+                    {
+                        "id": "pending-blocked",
+                        "status": "pending",
+                        "house": "Chanel",
+                        "name": "No 5",
+                        "failure_count": 1,
+                        "last_error": "fg_resolver_blocked",
+                    },
+                    {"id": "pending-clean", "status": "pending", "failure_count": 0},
+                ],
+                "ignored": [{"id": "ignored-1", "status": "ignored", "last_error": ""}],
+            }
+            return rows.get(status, [])
+
+    diag = w._queue_diagnostic_rows(_DiagClient())
+    check(
+        "queue diagnostics separates pending retry history from terminal failed rows",
+        diag["counts"]["failed"] == 1
+        and diag["counts"]["pending_with_failures"] == 1
+        and diag["buckets"]["pending_with_failures"] == {"fg_resolver_blocked": 1},
+        detail=repr(diag.get("counts")),
+    )
+    check(
+        "queue diagnostics only marks conservative no-FG rows as ignored candidates",
+        diag["counts"]["ignored_candidates"] == 1
+        and diag["ignored_candidates"][0]["id"] == "failed-bbw",
+        detail=repr(diag.get("ignored_candidates")),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        json_path, csv_path = w.export_queue_diagnostics(_DiagClient(), tmp)
+        check("queue diagnostics writes JSON", json_path.exists(), str(json_path))
+        csv_text = csv_path.read_text(encoding="utf-8")
+        check(
+            "queue diagnostics writes CSV buckets",
+            "pending_with_failures" in csv_text and "fg_resolver_blocked" in csv_text,
+            detail=csv_text,
+        )
 
 
 def test_worker_resolver_hardening() -> None:

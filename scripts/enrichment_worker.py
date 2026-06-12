@@ -27,6 +27,7 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 import io
 import json
@@ -139,6 +140,43 @@ def _matches_no_fragrantica_line(job: dict[str, Any]) -> bool:
         if mode == "contains" and marker in name:
             return True
     return False
+
+
+def _error_bucket(job: dict[str, Any]) -> str:
+    """Stable, non-secret bucket for queue diagnostics and dashboard summaries."""
+    raw = str(job.get("last_error") or job.get("error") or "").strip()
+    if not raw:
+        return "none"
+    text = _ANSI_RE.sub("", raw).lower()
+    if "fg_resolver_blocked" in text or "rate-limited" in text or "rate limited" in text:
+        return "fg_resolver_blocked"
+    if "resolver returned no fragrantica url" in text or "fg_url_missing_after_resolution" in text:
+        return "fg_url_missing_after_resolution"
+    if "parser_empty_frag_cards" in text or "empty frag" in text:
+        return "parser_empty_frag_cards"
+    if "api_unavailable" in text:
+        return "api_unavailable"
+    if "engine_exception" in text:
+        return "engine_exception"
+    return text[:80]
+
+
+def _job_identity(job: dict[str, Any]) -> str:
+    house = str(job.get("house") or "").strip()
+    name = str(job.get("name") or "").strip()
+    query = str(job.get("query") or "").strip()
+    if house or name:
+        return f"{house} - {name}".strip(" -")
+    return query or str(job.get("id") or "unknown")
+
+
+def _job_attention_line(job: dict[str, Any]) -> str:
+    label = _job_identity(job)
+    failures = int(job.get("failure_count") or 0)
+    bucket = _error_bucket(job)
+    if len(label) > 32:
+        label = label[:29] + "..."
+    return f"{label} ({bucket}, failures={failures})"
 
 
 # Garbled Basenotes names that cannot be repaired generically (accents and
@@ -1729,11 +1767,21 @@ def process_job(
             and _matches_no_fragrantica_line(job)
         )
         if config.dry_run:
+            if exc.code == "fg_resolver_blocked":
+                print(f"{index_label} Dry run: would requeue without consuming failure budget")
+                return False
             if retire:
                 print(f"{index_label} Dry run: would retire to ignored (no Fragrantica coverage)")
             else:
                 print(f"{index_label} Dry run: would mark retryable={exc.retryable}")
             return False
+        if exc.code == "fg_resolver_blocked":
+            try:
+                client.requeue_job(job_id, priority=max(10, int(job.get("priority") or 0)))
+                print(f"{index_label} Requeued without consuming failure budget (Fragrantica blocked)")
+                return False
+            except WorkerError as requeue_exc:
+                print(f"{index_label} Could not requeue blocked resolver miss: {requeue_exc.code}")
         if retire:
             try:
                 client.ignore_job(
@@ -1971,6 +2019,112 @@ def warm_list(client: ApiClient, config: WorkerConfig, path: str, stop: StopCont
     return completed
 
 
+def _queue_diagnostic_rows(client: ApiClient) -> dict[str, Any]:
+    """Read enough queue state to distinguish terminal failures from retry history."""
+    failed = client.list_jobs("failed", limit=MAX_LIST_LIMIT)
+    pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
+    ignored = client.list_jobs("ignored", limit=MAX_LIST_LIMIT)
+    pending_with_failures = [
+        job
+        for job in pending
+        if int(job.get("failure_count") or 0) > 0 or _error_bucket(job) != "none"
+    ]
+    failed_or_retry = failed + pending_with_failures
+    ignored_candidates = [
+        job
+        for job in failed_or_retry
+        if _error_bucket(job) == "fg_url_missing_after_resolution"
+        and not str(job.get("fg_url") or "").strip()
+        and _matches_no_fragrantica_line(job)
+    ]
+
+    buckets: dict[str, dict[str, int]] = {}
+    for status, jobs in (
+        ("failed", failed),
+        ("pending_with_failures", pending_with_failures),
+        ("ignored", ignored),
+    ):
+        status_buckets: dict[str, int] = {}
+        for job in jobs:
+            bucket = _error_bucket(job)
+            status_buckets[bucket] = status_buckets.get(bucket, 0) + 1
+        buckets[status] = status_buckets
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "counts": {
+            "failed": len(failed),
+            "pending_with_failures": len(pending_with_failures),
+            "ignored": len(ignored),
+            "ignored_candidates": len(ignored_candidates),
+        },
+        "buckets": buckets,
+        "failed": failed,
+        "pending_with_failures": pending_with_failures,
+        "ignored": ignored,
+        "ignored_candidates": ignored_candidates,
+    }
+
+
+def _queue_diag_flat_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for group in ("failed", "pending_with_failures", "ignored", "ignored_candidates"):
+        for job in snapshot.get(group) or []:
+            if not isinstance(job, dict):
+                continue
+            rows.append(
+                {
+                    "group": group,
+                    "id": job.get("id") or "",
+                    "status": job.get("status") or "",
+                    "house": job.get("house") or "",
+                    "name": job.get("name") or "",
+                    "query": job.get("query") or "",
+                    "failure_count": job.get("failure_count") or 0,
+                    "error_bucket": _error_bucket(job),
+                    "last_error": job.get("last_error") or "",
+                    "fg_url": job.get("fg_url") or "",
+                    "bn_url": job.get("bn_url") or "",
+                    "priority": job.get("priority") or "",
+                    "last_requested_at": job.get("last_requested_at") or "",
+                }
+            )
+    return rows
+
+
+def export_queue_diagnostics(client: ApiClient, output_dir: str | Path = "diagnostics") -> tuple[Path, Path]:
+    """Export failed/retry-history/ignored queue state to timestamped files."""
+    snapshot = _queue_diagnostic_rows(client)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    json_path = out_dir / f"enrichment_queue_{stamp}.json"
+    csv_path = out_dir / f"enrichment_queue_{stamp}.csv"
+
+    json_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+    rows = _queue_diag_flat_rows(snapshot)
+    fieldnames = [
+        "group",
+        "id",
+        "status",
+        "house",
+        "name",
+        "query",
+        "failure_count",
+        "error_bucket",
+        "last_error",
+        "fg_url",
+        "bn_url",
+        "priority",
+        "last_requested_at",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return json_path, csv_path
+
+
 def _status_counts(client: ApiClient) -> dict[str, Any]:
     try:
         status = client.status()
@@ -2001,9 +2155,10 @@ def print_manager_header(client: ApiClient, config: WorkerConfig) -> None:
     print("4. Process jobs slowly with delay")
     print("5. Retry failed jobs")
     print("6. Resolve missing Fragrantica URL")
-    print("7. Show cache stats")
-    print("8. Warm from manual query list")
-    print("9. Exit")
+    print("7. Export queue diagnostics")
+    print("8. Show cache stats")
+    print("9. Warm from manual query list")
+    print("0. Exit")
 
 
 def _print_jobs(jobs: list[dict[str, Any]]) -> None:
@@ -2053,13 +2208,19 @@ def dispatch_management_action(
     elif choice == "6":
         resolve_missing_urls(client, config, stop=stop)
     elif choice == "7":
-        print("Cache stats endpoint is unavailable in the current API contract.")
+        ensure_token(config)
+        raw = input("Output directory [diagnostics]: ").strip()
+        json_path, csv_path = export_queue_diagnostics(client, raw or "diagnostics")
+        print(f"Wrote {json_path}")
+        print(f"Wrote {csv_path}")
     elif choice == "8":
+        print("Cache stats endpoint is unavailable in the current API contract.")
+    elif choice == "9":
         ensure_token(config)
         path = input("Query list path: ").strip()
         if path:
             warm_list(client, config, path, stop=stop)
-    elif choice == "9" or choice == "0":
+    elif choice == "0":
         return "exit"
     else:
         print("Unknown option.")
@@ -2176,6 +2337,8 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
         "error": status.get("error"),
         "retryable_failures": None,
         "stale_processing": None,
+        "pending_retry_reasons": [],
+        "failed_reasons": [],
     }
     if snapshot["error"]:
         return snapshot
@@ -2190,10 +2353,23 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
     if processing_n <= 0:
         snapshot["stale_processing"] = 0
 
-    def _pending_retries() -> int:
+    def _pending_retries() -> dict[str, Any]:
         limit = min(DASHBOARD_ATTENTION_LIMIT, max(5, pending_n))
         pending = client.list_jobs("pending", limit=limit)
-        return sum(1 for j in pending if int(j.get("failure_count") or 0) > 0)
+        retry_rows = [
+            j
+            for j in pending
+            if int(j.get("failure_count") or 0) > 0 or _error_bucket(j) != "none"
+        ]
+        return {
+            "count": len(retry_rows),
+            "recent": [_job_attention_line(j) for j in retry_rows[:3]],
+        }
+
+    def _failed_reasons() -> list[str]:
+        limit = min(DASHBOARD_ATTENTION_LIMIT, max(5, terminal_failed))
+        failed = client.list_jobs("failed", limit=limit)
+        return [_job_attention_line(j) for j in failed[:3]]
 
     def _stale_count() -> int:
         limit = min(DASHBOARD_ATTENTION_LIMIT, max(5, processing_n))
@@ -2206,11 +2382,13 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
         )
 
     futures: dict[Any, str] = {}
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         if pending_n > 0:
             futures[pool.submit(_pending_retries)] = "retryable"
         if processing_n > 0:
             futures[pool.submit(_stale_count)] = "stale"
+        if terminal_failed > 0:
+            futures[pool.submit(_failed_reasons)] = "failed_reasons"
         for fut in as_completed(futures):
             kind = futures[fut]
             try:
@@ -2218,9 +2396,13 @@ def _gather_dashboard_snapshot(client: ApiClient) -> dict[str, Any]:
             except WorkerError:
                 continue
             if kind == "retryable":
-                snapshot["retryable_failures"] = int(result) + terminal_failed
-            else:
+                retry_count = int((result or {}).get("count") or 0)
+                snapshot["retryable_failures"] = retry_count + terminal_failed
+                snapshot["pending_retry_reasons"] = list((result or {}).get("recent") or [])
+            elif kind == "stale":
                 snapshot["stale_processing"] = int(result)
+            else:
+                snapshot["failed_reasons"] = list(result or [])
 
     if snapshot["retryable_failures"] is None:
         snapshot["retryable_failures"] = terminal_failed if pending_n <= 0 else None
@@ -2322,6 +2504,12 @@ def _render_dashboard(
         return f"{c['B']}{col}{n}{c['Z']}"
     print(f"  {c['G']}│{c['Z']}  {c['G']}>{c['Z']} retryable_failures   {_alert(rf)}")
     print(f"  {c['G']}│{c['Z']}  {c['G']}>{c['Z']} stale_processing     {_alert(sp)}")
+    failed_reasons = list(snapshot.get("failed_reasons") or [])
+    pending_reasons = list(snapshot.get("pending_retry_reasons") or [])
+    if failed_reasons:
+        print(f"  {c['G']}│{c['Z']}  {c['Y']}!{c['Z']} failed_latest        {failed_reasons[0]}")
+    if pending_reasons:
+        print(f"  {c['G']}│{c['Z']}  {c['Y']}!{c['Z']} pending_retry       {pending_reasons[0]}")
 
     # ── ACTIONS ───────────────────────────────────────────────────────────
     print(_section_header("ACTIONS", c, width))
@@ -3211,6 +3399,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--process-pending", action="store_true", help="Process pending enrichment jobs.")
     parser.add_argument("--warm-list", help="Path to one-query-per-line warm list.")
+    parser.add_argument(
+        "--queue-diagnostics",
+        nargs="?",
+        const="diagnostics",
+        metavar="DIR",
+        help="Export failed, retry-history, and ignored queue rows to timestamped JSON/CSV files.",
+    )
     parser.add_argument("--api-base-url", default=os.environ.get("SCENT_API_BASE_URL", DEFAULT_API_BASE_URL))
     parser.add_argument("--limit", type=int, default=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT))
     parser.add_argument("--delay", type=float, default=_env_float("ENRICHMENT_DEFAULT_DELAY", DEFAULT_DELAY))
@@ -3284,6 +3479,12 @@ def main() -> int:
         if opts.warm_list:
             ensure_token(config)
             warm_list(client, config, opts.warm_list, stop=stop)
+            return 0
+        if opts.queue_diagnostics:
+            ensure_token(config)
+            json_path, csv_path = export_queue_diagnostics(client, opts.queue_diagnostics)
+            print(f"Wrote {json_path}")
+            print(f"Wrote {csv_path}")
             return 0
         return run_management(client, config, stop)
     except KeyboardInterrupt:
