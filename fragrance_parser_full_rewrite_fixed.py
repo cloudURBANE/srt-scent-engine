@@ -3193,6 +3193,10 @@ class DecodoScraperClient:
     PROVIDER_NAME = "decodo"
     ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
     MAX_TIMEOUT = 8.0
+    # An abandoned call still spends a Decodo credit, and URL discovery
+    # measures ~2-4s per call: below this remaining budget the client skips
+    # the request instead of starting one that cannot plausibly finish.
+    MIN_VIABLE_BUDGET = 1.2
     _RESOLVER_SCORE = 0.9
     _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
     _BASIC_TOKEN_ENV = (
@@ -3274,6 +3278,24 @@ class DecodoScraperClient:
         if image_search:
             payload["google_tbm"] = "isch"
         return payload
+
+    @classmethod
+    def _viable_budget(cls, timeout: float, deadline: "Deadline | None") -> float:
+        """Request budget in seconds, or 0.0 when too starved to finish."""
+        budget = min(float(timeout), cls.MAX_TIMEOUT)
+        if deadline is not None:
+            if deadline.expired():
+                return 0.0
+            budget = min(budget, deadline.timeout(budget))
+        return budget if budget >= cls.MIN_VIABLE_BUDGET else 0.0
+
+    @staticmethod
+    def _log_request_failure(kind: str, exc: Exception) -> None:
+        # URL discovery deliberately degrades to [] on provider errors, but the
+        # cause must stay visible in operator logs: a read timeout (budget too
+        # tight), an auth failure, and an empty SERP are different problems.
+        detail = str(exc) or type(exc).__name__
+        print(f"{Y}[SYS] Decodo {kind} failed ({type(exc).__name__}): {detail[:200]}{Z}")
 
     @classmethod
     def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
@@ -3446,7 +3468,8 @@ class DecodoScraperClient:
         try:
             payload = cls._post_google(query, timeout, image_search=True)
             candidates = cls.image_candidates_from_payload(payload, max_results=max_results)
-        except Exception:
+        except Exception as exc:
+            cls._log_request_failure("image search", exc)
             return []
         with cls._cache_lock:
             cls._image_cache[cache_key] = [dict(item) for item in candidates]
@@ -3467,11 +3490,7 @@ class DecodoScraperClient:
             cached = cls._cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        budget = min(float(timeout), cls.MAX_TIMEOUT)
-        if deadline is not None:
-            if deadline.expired():
-                return []
-            budget = min(budget, deadline.timeout(budget))
+        budget = cls._viable_budget(timeout, deadline)
         if budget <= 0:
             return []
         urls: list[str] = []
@@ -3487,7 +3506,8 @@ class DecodoScraperClient:
                     continue
                 seen.add(dedupe)
                 urls.append(canonical)
-        except Exception:
+        except Exception as exc:
+            cls._log_request_failure("Fragrantica URL discovery", exc)
             return []
         with cls._cache_lock:
             cls._cache[cache_key] = list(urls)
@@ -3535,11 +3555,7 @@ class DecodoScraperClient:
             cached = cls._parfumo_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        budget = min(float(timeout), cls.MAX_TIMEOUT)
-        if deadline is not None:
-            if deadline.expired():
-                return []
-            budget = min(budget, deadline.timeout(budget))
+        budget = cls._viable_budget(timeout, deadline)
         if budget <= 0:
             return []
         urls: list[str] = []
@@ -3555,7 +3571,8 @@ class DecodoScraperClient:
                     continue
                 seen.add(canonical)
                 urls.append(canonical)
-        except Exception:
+        except Exception as exc:
+            cls._log_request_failure("Parfumo URL discovery", exc)
             return []
         with cls._cache_lock:
             cls._parfumo_cache[cache_key] = list(urls)

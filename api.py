@@ -148,8 +148,11 @@ def _env_float(name: str, default: float) -> float:
 # and candidate metrics are left to /details.
 _ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 5.5)
 # 1-C: FG/provider first pass gets a tighter independent cap than the BN-bearing
-# initial_timeout; clamped to initial_timeout inside the engine.
-_ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 3.0)
+# initial_timeout; clamped to initial_timeout inside the engine. Decodo URL
+# discovery measures ~2-4s per call, so the cap must clear that upper bound:
+# at the old 3.0s default the structured leg read-timed out on slow calls,
+# returning zero first-pass links while still spending the provider credit.
+_ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 4.5)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
 # Spell repair only fires after a clearly bad first pass (the alternative is
 # returning nothing), so it can afford a real budget. Structured-provider SERP
