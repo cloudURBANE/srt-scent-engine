@@ -461,6 +461,39 @@ Completed in `search_engine`:
   endpoint auth, dry-run/field-filter/churn-guard behavior, and the worker's
   throttled, paged idle-tick sweep.
 
+## Implementation Update 3 - 2026-06-12 (Parfumo partials vs the sweep)
+
+The Parfumo fallback (see `PARFUMO_FALLBACK_RESOLVER_DESIGN.md`) stores terminal
+`quality_status="partial"` rows, which exposed two disconnects in the
+self-healing loop:
+
+- **Parfumo accords never reached `derived_metrics`.** The worker put accords
+  only in `raw_identity.accords`; `api._build_parfumo_cache_row` built derived
+  metrics from empty `frag_cards`, so `main_accords` (and therefore `family`)
+  counted as permanently missing for every Parfumo partial. Fixed at the
+  completion write path: raw accords are now projected into the canonical
+  `derived_metrics.main_accords` slot (`enrichment_facts.expand_raw_accords`
+  flattens Parfumo compounds like `fruity-sweet` into the engine vocabulary).
+  Existing stored partials converge through one ordinary heal requeue: the
+  worker re-resolves Parfumo and the rewritten row carries the projection.
+- **The sweep churned on facts Parfumo can never supply.** A terminal partial
+  permanently lacks FG-status facts (wear_profile, performance/value/
+  community-interest scores, reviews), so the sweep requeued it every interval
+  -- each cycle burning a full FG resolution (Decodo queries + designer-catalog
+  crawl) before the pinned-Parfumo path idempotently rewrote the same row,
+  bounded only by `max_requested_count`. Fixed with a source-capability
+  contract: `enrichment_facts.SOURCE_UNSUPPLIABLE_FACTS` lists per-source
+  unsuppliable facts; the audit annotates each item with its `source`; the heal
+  endpoint skips rows whose entire missing set is unsuppliable for their source
+  (skip reason `source_cannot_supply`). Healable gaps (e.g. a missing
+  concentration) still requeue normally.
+- The worker's per-job fact summary (`_payload_fact_summary`) now judges
+  Parfumo payloads with the same projection the API stores, so operator logs
+  match the audit.
+- Coverage in `test_enrichment.py::test_parfumo_partial_self_heal_alignment`:
+  accord expansion, write-path projection, terminal-partial fact contract,
+  sweep retirement vs healable requeue, and worker summary parity.
+
 Still left:
 
 - Run a real DB dry-run/audit with `DATABASE_URL` configured to quantify post-change coverage (`GET /api/enrichment/completeness` now does this remotely).

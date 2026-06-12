@@ -1363,6 +1363,167 @@ def test_completeness_self_heal_sweep() -> None:
     )
 
 
+def test_parfumo_partial_self_heal_alignment() -> None:
+    print("Parfumo partial vs self-heal alignment checks (no DATABASE_URL required):")
+    import enrichment_facts
+
+    # 1. Compound source accords expand to the flat engine vocabulary.
+    expanded = enrichment_facts.expand_raw_accords(["fruity-sweet", "Synthetic-Aquatic", "sweet"])
+    check(
+        "compound accords expand, dedupe, and lowercase",
+        expanded == ["fruity", "sweet", "synthetic", "aquatic"],
+        str(expanded),
+    )
+    check("non-list accords expand to nothing", enrichment_facts.expand_raw_accords(None) == [])
+
+    # 2. The Parfumo completion write path projects raw accords into the
+    #    canonical derived_metrics.main_accords slot, so family/main_accords
+    #    count as real facts instead of permanently-missing ones.
+    parfumo_url = "https://www.parfumo.com/Perfumes/Clive_Christian/miami-poolside"
+    payload = api.CompleteJobRequest(
+        source="parfumo",
+        parfumo_url=parfumo_url,
+        name="Miami Poolside",
+        house="Clive Christian",
+        year=2019,
+        gender="Unisex",
+        notes={"has_pyramid": False, "top": [], "heart": [], "base": [], "flat": ["lime"]},
+        raw_identity={"parfumo_url": parfumo_url, "accords": ["synthetic-aquatic"]},
+        quality_status="partial",
+    )
+    row = api._build_parfumo_cache_row(payload, {"name": "Miami Poolside"}, parfumo_url)
+    dm = row.get("derived_metrics")
+    main = (dm if isinstance(dm, dict) else {}).get("main_accords") or {}
+    check(
+        "parfumo cache row projects accords into derived_metrics.main_accords",
+        main.get("top_accords") == ["synthetic", "aquatic"]
+        and main.get("source") == "parfumo_accords",
+        str(dm),
+    )
+
+    def make_parfumo_record(*, with_concentration: bool = True) -> dict[str, object]:
+        raw_identity: dict[str, object] = {
+            "parfumo_url": parfumo_url,
+            "accords": ["synthetic-aquatic"],
+        }
+        if with_concentration:
+            raw_identity["concentration"] = "Eau de Parfum"
+        return {
+            "record_key": f"fg:{parfumo_url}",
+            "canonical_fg_url": parfumo_url,
+            "bn_url": None,
+            "name": "Miami Poolside",
+            "house": "Clive Christian",
+            "year": 2019,
+            "gender": "Unisex",
+            "image_url": None,
+            "search": {},
+            "fg_raw": {
+                "source": "parfumo",
+                "frag_cards": {},
+                "notes": {"top": ["lime"], "heart": [], "base": [], "flat": []},
+                "reviews": [],
+                "raw_identity": raw_identity,
+            },
+            "bn_raw": {},
+            "derived_metrics": {
+                "main_accords": {
+                    "top_accords": ["synthetic", "aquatic"],
+                    "source": "parfumo_accords",
+                },
+            },
+        }
+
+    # 3. With accords projected, a Parfumo partial misses only what Parfumo
+    #    can never supply -- all listed in SOURCE_UNSUPPLIABLE_FACTS.
+    missing = enrichment_facts.missing_facts(make_parfumo_record())
+    unsuppliable = enrichment_facts.SOURCE_UNSUPPLIABLE_FACTS["parfumo"]
+    check(
+        "terminal parfumo partial misses only unsuppliable facts",
+        bool(missing) and set(missing) <= unsuppliable,
+        str(missing),
+    )
+
+    # 4. The heal sweep retires terminal partials instead of requeueing them,
+    #    but still requeues a parfumo row with a healable gap (concentration).
+    saved_token = api._ENRICHMENT_WORKER_TOKEN
+    saved_enabled = db.ENABLED
+    saved_list = db.list_fragrance_records
+    saved_count = db.count_fragrance_records
+    saved_jobs_by_keys = db.get_jobs_by_keys
+    saved_recover = db.recover_or_enqueue_job
+    recover_calls: list[dict[str, object]] = []
+    client = TestClient(api.app)
+    auth = {"Authorization": "Bearer test-secret-token"}
+    try:
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
+        db.ENABLED = True
+        terminal = make_parfumo_record()
+        healable = make_parfumo_record(with_concentration=False)
+        healable["record_key"] = "fg:https://www.parfumo.com/Perfumes/Lattafa/ramz-lattafa-gold"
+        healable["canonical_fg_url"] = "https://www.parfumo.com/Perfumes/Lattafa/ramz-lattafa-gold"
+        db.list_fragrance_records = lambda limit=200, offset=0: [terminal, healable]
+        db.count_fragrance_records = lambda: 2
+        db.get_jobs_by_keys = lambda keys: {}
+
+        def fake_recover(**kwargs):
+            recover_calls.append(kwargs)
+            return {"id": "job-p1", "status": "pending", "priority": kwargs.get("priority"),
+                    "requested_count": 1}
+
+        db.recover_or_enqueue_job = fake_recover
+
+        r = client.get("/api/enrichment/completeness", headers=auth)
+        body = r.json()
+        check(
+            "completeness audit annotates the record source",
+            any(item.get("source") == "parfumo" for item in body.get("items", [])),
+            str(body.get("items")),
+        )
+
+        r = client.post("/api/enrichment/heal", json={}, headers=auth)
+        body = r.json()
+        check(
+            "heal retires terminal parfumo partials (source_cannot_supply)",
+            any(s.get("reason") == "source_cannot_supply" for s in body.get("skipped_items", [])),
+            str(body.get("skipped_items")),
+        )
+        check(
+            "heal still requeues a parfumo row with a healable gap",
+            len(recover_calls) == 1
+            and recover_calls[0].get("job_key") == healable["canonical_fg_url"],
+            str(recover_calls),
+        )
+    finally:
+        api._ENRICHMENT_WORKER_TOKEN = saved_token
+        db.ENABLED = saved_enabled
+        db.list_fragrance_records = saved_list
+        db.count_fragrance_records = saved_count
+        db.get_jobs_by_keys = saved_jobs_by_keys
+        db.recover_or_enqueue_job = saved_recover
+
+    # 5. The worker's fact summary judges a parfumo payload the way the API
+    #    will store it: projected accords fill main_accords + family.
+    worker_payload = {
+        "source": "parfumo",
+        "parfumo_url": parfumo_url,
+        "name": "Miami Poolside",
+        "house": "Clive Christian",
+        "year": 2019,
+        "gender": "Unisex",
+        "notes": {"top": ["lime"], "heart": [], "base": [], "flat": []},
+        "raw_identity": {"parfumo_url": parfumo_url, "accords": ["synthetic-aquatic"]},
+        "concentration": "Eau de Parfum",
+        "quality_status": "partial",
+    }
+    filled, missing = enrichment_worker._payload_fact_summary(worker_payload, None)
+    check(
+        "worker fact summary counts projected parfumo accords as filled",
+        "main_accords" in filled and "family" in filled and "main_accords" not in missing,
+        f"filled={filled} missing={missing}",
+    )
+
+
 def test_worker_fact_summary_and_serp_retry() -> None:
     print("Per-fragrance fact summary + bounded SERP retry checks (no DATABASE_URL required):")
 
@@ -1414,8 +1575,14 @@ def test_worker_fact_summary_and_serp_retry() -> None:
     import concentration_grabber as cg
 
     calls = {"n": 0}
+    sleeps: list[float] = []
     orig = cg.SemanticScentEngine._fetch_serp
+    orig_sleep = cg.time.sleep
     try:
+        # Record backoff sleeps instead of serving them: the contract under
+        # test is *when* the backoff fires, not wall-clock waiting.
+        cg.time.sleep = sleeps.append
+
         def loaded_but_empty(page, q, sf, timeout=None):
             calls["n"] += 1
             return []
@@ -1423,8 +1590,10 @@ def test_worker_fact_summary_and_serp_retry() -> None:
         cg.SemanticScentEngine._fetch_serp = staticmethod(loaded_but_empty)
         rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=3)
         check("empty SERP is returned without retrying", rows == [] and calls["n"] == 1, str(calls))
+        check("empty SERP never triggers backoff sleeps", sleeps == [], str(sleeps))
 
         calls["n"] = 0
+        sleeps.clear()
 
         def fetch_failed(page, q, sf, timeout=None):
             calls["n"] += 1
@@ -1433,8 +1602,10 @@ def test_worker_fact_summary_and_serp_retry() -> None:
         cg.SemanticScentEngine._fetch_serp = staticmethod(fetch_failed)
         rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=2)
         check("fetch failures retry up to the attempt cap", rows == [] and calls["n"] == 2, str(calls))
+        check("failed fetches back off once between attempts", sleeps == [0.8], str(sleeps))
     finally:
         cg.SemanticScentEngine._fetch_serp = orig
+        cg.time.sleep = orig_sleep
 
     class _FakeWait:
         def __init__(self) -> None:
@@ -2454,6 +2625,7 @@ def main() -> int:
     test_concentration_pipeline()
     test_stored_detail_completion_logic()
     test_completeness_self_heal_sweep()
+    test_parfumo_partial_self_heal_alignment()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
     test_worker_url_gating_catalog_tier_and_retirement()

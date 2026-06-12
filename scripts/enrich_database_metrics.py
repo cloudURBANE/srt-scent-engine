@@ -25,7 +25,7 @@ if env_path.exists():
                 key, val = line.split("=", 1)
                 os.environ[key.strip()] = val.strip()
 
-os.environ["SERP_API_PROVIDER"] = "serper"
+os.environ["SERP_API_PROVIDER"] = "decodo"
 
 import db
 import fragrance_parser_full_rewrite_fixed as engine

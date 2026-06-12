@@ -1052,6 +1052,9 @@ class QueryRepair:
     MIN_TITLE_ONLY_CONFIDENCE = 0.96
     MAX_SUGGESTION_WORDS = 8
     MAX_CANONICAL_WORDS = 12
+    # Minimum remaining repair budget (s) before a structured-provider SERP
+    # call is attempted; Decodo URL discovery measures ~2-4s per call.
+    STRUCTURED_MIN_BUDGET = 1.2
 
     BAD_SUGGESTION_PARTS = {
         # search/result UI
@@ -2635,6 +2638,27 @@ class QueryRepair:
 
         anchor_queries = list(dict.fromkeys(anchor_queries))[:5]
 
+        # Structured SERP evidence. The Google/Bing HTML scrapes below return
+        # JS-shell pages on datacenter hosts, so when the structured provider is
+        # configured it supplies the canonical Fragrantica perfume URLs the
+        # markup harvest was designed to find. Google spell-corrects the typo'd
+        # query inside the site-scoped search itself, so the returned URLs carry
+        # the corrected identity. Responses are cached per query inside the
+        # provider, bounding spend on repeated repairs of the same input.
+        # Decodo URL discovery measures ~2-4s per call, so each call is gated on
+        # enough remaining budget to plausibly finish: a request that will be
+        # abandoned client-side still spends a provider credit.
+        provider = structured_search_provider()
+        if provider is not None:
+            structured_queries = list(dict.fromkeys([query, *anchor_queries[:1]]))[:2]
+            for structured_query in structured_queries:
+                if deadline.remaining(QueryRepair.STRUCTURED_MIN_BUDGET) < QueryRepair.STRUCTURED_MIN_BUDGET:
+                    break
+                for url in provider.search_fragrantica_urls(structured_query, deadline=deadline):
+                    candidate, domain, is_canonical = QueryRepair._canonical_candidate_from_url(url)
+                    if is_canonical:
+                        QueryRepair._add_candidate(records, candidate, source=domain, canonical=True)
+
         canonical_queries = (
             *[f"{anchor} site:fragrantica.com/perfume" for anchor in anchor_queries],
             *[f"{anchor} site:basenotes.com/fragrances" for anchor in anchor_queries[:2]],
@@ -2858,20 +2882,10 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}…{key[-4:]}"
 
 
+# Deprecated: Serper is no longer selected by the engine. The pool remains only
+# so older imports or diagnostics references fail soft during the migration.
 class SerperKeyPool:
-    """Rotating pool of Serper.dev API keys with automatic failover.
-
-    Mirrors the Express api-server's key pool so the Python engine survives
-    free-tier exhaustion without a redeploy: set ``SERPER_API_KEYS`` to a
-    comma-separated list (the legacy singular ``SERPER_API_KEY`` is merged in).
-    One key is drained until it returns 401/402/403 (retired for the process) or
-    429 (short cooldown, retried later), then the pool rotates to the next key.
-
-    The *key list* is read fresh from the environment on every access so tests
-    that swap ``SERPER_API_KEY`` at runtime keep working; per-key retire/cooldown
-    *state* persists in memory. Hot-added keys (via ``add_keys``) live alongside
-    the env keys. Thread-safe — the engine resolves on a ThreadPoolExecutor.
-    """
+    """Deprecated compatibility shim for old Serper pool imports."""
 
     def __init__(self, rate_limit_cooldown_s: float = 60.0) -> None:
         self._lock = threading.Lock()
@@ -2881,13 +2895,9 @@ class SerperKeyPool:
         self._cooldown_s = rate_limit_cooldown_s
 
     def _current_keys(self) -> list[str]:
-        env_keys = _parse_key_list(
-            os.environ.get("SERPER_API_KEYS"),
-            os.environ.get("SERPER_API_KEY"),
-        )
         out: list[str] = []
         seen: set[str] = set()
-        for k in (*env_keys, *self._extra):
+        for k in self._extra:
             if k and k not in seen:
                 seen.add(k)
                 out.append(k)
@@ -3007,24 +3017,12 @@ def serper_key_pool() -> SerperKeyPool:
     return _SERPER_POOL
 
 
+# Deprecated: DecodoScraperClient is the sole structured search provider.
+# SerperClient remains temporarily to avoid breaking external imports.
 class SerperClient:
-    """Structured Fragrantica URL discovery via Serper.dev.
+    """Deprecated compatibility shim. Decodo is the only structured provider."""
 
-    Google/Bing SERP HTML scraping is permanently dead from datacenter hosts
-    (JS-shell pages with no result links). This client moves Fragrantica
-    perfume-URL discovery onto a structured API (https://google.serper.dev).
-
-    Env-gated: active only when ``SERP_API_PROVIDER=serper`` and
-    ``SERPER_API_KEY`` is set. With the env unset, ``enabled()`` is False and
-    the engine keeps its current behavior (no HTTP call is made).
-
-    The first pass is latency-bound, so this client makes a single attempt,
-    caps its timeout at 1.5 s (further capped by the shared first-pass
-    Deadline), and caches responses per normalized query to limit spend
-    (Serper bills ~$1 / 1000 queries).
-    """
-
-    ENDPOINT = "https://google.serper.dev/search"
+    ENDPOINT = ""
     MAX_TIMEOUT = 1.5
     _RESOLVER_SCORE = 0.9
     _cache: dict[str, list[str]] = {}
@@ -3035,12 +3033,7 @@ class SerperClient:
 
     @staticmethod
     def enabled() -> bool:
-        provider = (os.environ.get("SERP_API_PROVIDER", "") or "serper").strip().lower()
-        if provider != "serper":
-            return False
-        # Active when at least one key is configured (SERPER_API_KEYS pool or the
-        # legacy singular SERPER_API_KEY, both read by the pool).
-        return serper_key_pool().size() > 0
+        return False
 
     @staticmethod
     def _cache_key(query: str) -> str:
@@ -3054,6 +3047,7 @@ class SerperClient:
         then transparently retries with the next usable key. Raises on a fully
         exhausted pool or a non-key upstream error — callers degrade to ``[]``.
         """
+        raise RuntimeError("Serper provider is deprecated; use Decodo")
         pool = serper_key_pool()
         body = {"q": f"{query} site:{site}"}
         tried: set[str] = set()
@@ -3183,7 +3177,7 @@ class SerperClient:
         """Return canonical Parfumo perfume URLs for ``house`` / ``name``.
 
         Parfumo fallback discovery (PARFUMO_FALLBACK_RESOLVER_DESIGN.md §3). Uses
-        the same SERPER_API_KEY as the Fragrantica path but scopes the query to
+        the deprecated structured provider but scopes the query to
         ``site:parfumo.com/Perfumes`` and quotes the house + name so the SERP
         favors the exact perfume. Returns ``[]`` when disabled or on any error;
         successful lookups are cached per normalized house+name (failures are
@@ -3224,6 +3218,387 @@ class SerperClient:
         with cls._cache_lock:
             cls._parfumo_cache[cache_key] = list(urls)
         return urls
+
+
+class DecodoScraperClient:
+    """Structured Google SERP discovery via Decodo Web Scraping API."""
+
+    PROVIDER_NAME = "decodo"
+    ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
+    MAX_TIMEOUT = 8.0
+    _RESOLVER_SCORE = 0.9
+    _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
+    _BASIC_TOKEN_ENV = (
+        "DECODO_API_BASIC_TOKEN",
+        "DECODO_SCRAPER_BASIC_TOKEN",
+        "DECODO_BASIC_TOKEN",
+    )
+    _USERNAME_PASSWORD_ENV = (
+        ("DECODO_API_USERNAME", "DECODO_API_PASSWORD"),
+        ("DECODO_SCRAPER_USERNAME", "DECODO_SCRAPER_PASSWORD"),
+        ("DECODO_USERNAME", "DECODO_PASSWORD"),
+    )
+    _RESULT_ARRAY_KEYS = ("organic", "organic_results", "images", "image_results", "items")
+    _RESULT_CONTAINER_KEYS = ("content", "results", "data")
+    _ENTRY_FIELD_KEYS = (
+        "link",
+        "url",
+        "href",
+        "image",
+        "image_url",
+        "imageUrl",
+        "high_res_image",
+        "thumbnail_url",
+        "thumbnailUrl",
+        "source_url",
+        "sourceUrl",
+        "title",
+        "alt",
+    )
+    _cache: dict[str, list[str]] = {}
+    _parfumo_cache: dict[str, list[str]] = {}
+    _image_cache: dict[str, list[dict]] = {}
+    _cache_lock = threading.Lock()
+
+    @staticmethod
+    def enabled() -> bool:
+        raw_provider = (os.environ.get("SERP_API_PROVIDER") or "").strip().lower()
+        provider = raw_provider or "decodo"
+        if provider not in DecodoScraperClient._PROVIDER_ALIASES:
+            return False
+        return bool(DecodoScraperClient._auth_header())
+
+    @staticmethod
+    def _cache_key(query: str) -> str:
+        return TextSanitizer.normalize_identity(query)
+
+    @staticmethod
+    def _auth_header() -> str:
+        for name in DecodoScraperClient._BASIC_TOKEN_ENV:
+            token = (os.environ.get(name) or "").strip()
+            if token:
+                if token.lower().startswith("basic "):
+                    token = token[6:].strip()
+                return f"Basic {token}"
+        for user_key, password_key in DecodoScraperClient._USERNAME_PASSWORD_ENV:
+            username = (os.environ.get(user_key) or "").strip()
+            password = os.environ.get(password_key) or ""
+            if username and password:
+                token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                return f"Basic {token}"
+        return ""
+
+    @staticmethod
+    def _locale() -> str:
+        return (
+            os.environ.get("DECODO_SCRAPER_LOCALE")
+            or os.environ.get("DECODO_API_LOCALE")
+            or "en-us"
+        ).strip() or "en-us"
+
+    @classmethod
+    def _payload(cls, query: str, *, image_search: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "target": "google_search",
+            "query": query,
+            "parse": True,
+            "locale": cls._locale(),
+        }
+        if image_search:
+            payload["google_tbm"] = "isch"
+        return payload
+
+    @classmethod
+    def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
+        if not cls.enabled():
+            raise RuntimeError("Decodo Scraper API is not enabled")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": cls._auth_header(),
+        }
+        res = requests.post(
+            cls.ENDPOINT,
+            json=cls._payload(query, image_search=image_search),
+            headers=headers,
+            timeout=min(float(timeout), cls.MAX_TIMEOUT),
+        )
+        res.raise_for_status()
+        return res.json() or {}
+
+    @classmethod
+    def _decode_jsonish(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return value
+        return value
+
+    @classmethod
+    def _looks_like_entry(cls, value: Any) -> bool:
+        return isinstance(value, dict) and any(key in value for key in cls._ENTRY_FIELD_KEYS)
+
+    @classmethod
+    def _collect_entries(cls, node: Any, *, depth: int = 0) -> list[dict]:
+        if depth > 8:
+            return []
+        node = cls._decode_jsonish(node)
+        if isinstance(node, list):
+            dict_items = [item for item in node if isinstance(item, dict)]
+            if dict_items and any(cls._looks_like_entry(item) for item in dict_items):
+                return [item for item in dict_items if cls._looks_like_entry(item)]
+            out: list[dict] = []
+            for item in node:
+                out.extend(cls._collect_entries(item, depth=depth + 1))
+            return out
+        if not isinstance(node, dict):
+            return []
+
+        out = []
+        for key in cls._RESULT_ARRAY_KEYS:
+            value = node.get(key)
+            if isinstance(value, list):
+                out.extend(item for item in value if isinstance(item, dict))
+
+        for key in cls._RESULT_CONTAINER_KEYS:
+            if key in node:
+                out.extend(cls._collect_entries(node.get(key), depth=depth + 1))
+        return out
+
+    @classmethod
+    def _search_entries(cls, payload: dict) -> list[dict]:
+        return cls._collect_entries(payload)
+
+    @staticmethod
+    def _entry_link(entry: dict) -> str:
+        for key in ("url", "link", "href", "destination"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            match = re.search(r"\d+", value)
+            if match:
+                return int(match.group(0))
+        return None
+
+    @staticmethod
+    def _first_http_url(entry: dict, keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = entry.get(key)
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
+            if value.startswith(("http://", "https://")):
+                return value
+        return ""
+
+    @classmethod
+    def image_candidates_from_payload(cls, payload: dict, *, max_results: int = 20) -> list[dict]:
+        candidates: list[dict] = []
+        seen: set[str] = set()
+        for entry in cls._search_entries(payload):
+            image_url = cls._first_http_url(
+                entry,
+                (
+                    "high_res_image",
+                    "image_url",
+                    "imageUrl",
+                    "original",
+                    "original_url",
+                    "image",
+                    "thumbnail_url",
+                    "thumbnailUrl",
+                ),
+            )
+            if not image_url or image_url in seen:
+                continue
+            seen.add(image_url)
+            link = cls._first_http_url(entry, ("source_url", "sourceUrl", "link", "url", "contextLink"))
+            source = str(
+                entry.get("source")
+                or entry.get("source_name")
+                or entry.get("displayed_link")
+                or entry.get("domain")
+                or ""
+            ).strip()
+            if not source and link:
+                source = (urlparse(link).netloc or "").removeprefix("www.")
+            candidate = {
+                "title": str(entry.get("title") or entry.get("alt") or "").strip(),
+                "imageUrl": image_url,
+                "source_provider": cls.PROVIDER_NAME,
+            }
+            thumbnail = cls._first_http_url(entry, ("thumbnail_url", "thumbnailUrl", "thumbnail", "image_thumbnail"))
+            if thumbnail:
+                candidate["thumbnailUrl"] = thumbnail
+            if link:
+                candidate["link"] = link
+            if source:
+                candidate["source"] = source
+            width = cls._coerce_int(entry.get("imageWidth") or entry.get("width"))
+            height = cls._coerce_int(entry.get("imageHeight") or entry.get("height"))
+            if width is not None:
+                candidate["imageWidth"] = width
+            if height is not None:
+                candidate["imageHeight"] = height
+            position = cls._coerce_int(entry.get("position") or entry.get("pos"))
+            if position is not None:
+                candidate["position"] = position
+            candidates.append(candidate)
+            if max_results and len(candidates) >= max_results:
+                break
+        return candidates
+
+    @classmethod
+    def search_image_candidates(
+        cls,
+        query: str,
+        *,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 20,
+    ) -> list[dict]:
+        query = (query or "").strip()
+        if not query or not cls.enabled():
+            return []
+        cache_key = f"{cls._cache_key(query)}|{max_results}"
+        with cls._cache_lock:
+            cached = cls._image_cache.get(cache_key)
+        if cached is not None:
+            return [dict(item) for item in cached]
+        try:
+            payload = cls._post_google(query, timeout, image_search=True)
+            candidates = cls.image_candidates_from_payload(payload, max_results=max_results)
+        except Exception:
+            return []
+        with cls._cache_lock:
+            cls._image_cache[cache_key] = [dict(item) for item in candidates]
+        return candidates
+
+    @classmethod
+    def search_fragrantica_urls(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> list[str]:
+        query = (query or "").strip()
+        if not query or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(query)
+        with cls._cache_lock:
+            cached = cls._cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        budget = min(float(timeout), cls.MAX_TIMEOUT)
+        if deadline is not None:
+            if deadline.expired():
+                return []
+            budget = min(budget, deadline.timeout(budget))
+        if budget <= 0:
+            return []
+        urls: list[str] = []
+        try:
+            payload = cls._post_google(f"{query} site:fragrantica.com/perfume", budget)
+            seen: set[str] = set()
+            for entry in cls._search_entries(payload):
+                canonical = FragranticaEngine.canonical_url(cls._entry_link(entry))
+                if not canonical or not FragranticaEngine.is_perfume_url(canonical):
+                    continue
+                dedupe = FragranticaEngine.dedupe_key(canonical)
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                urls.append(canonical)
+        except Exception:
+            return []
+        with cls._cache_lock:
+            cls._cache[cache_key] = list(urls)
+        return urls
+
+    @classmethod
+    def discover_fragrances(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 25,
+    ) -> list[UnifiedFragrance]:
+        rows: list[UnifiedFragrance] = []
+        for url in cls.search_fragrantica_urls(query, deadline=deadline, timeout=timeout):
+            name = FragranticaEngine.name_from_url(url)
+            if not name:
+                continue
+            rows.append(UnifiedFragrance(
+                name=name,
+                brand=FragranticaEngine.brand_from_url(url),
+                year="",
+                frag_url=url,
+                resolver_source="decodo_fragrantica_search",
+                resolver_score=cls._RESOLVER_SCORE,
+            ))
+            if max_results and len(rows) >= max_results:
+                break
+        return rows
+
+    @classmethod
+    def search_parfumo_urls(
+        cls,
+        house: str,
+        name: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> list[str]:
+        house = (house or "").strip()
+        name = (name or "").strip()
+        if not (house or name) or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(f"{house} {name}")
+        with cls._cache_lock:
+            cached = cls._parfumo_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        budget = min(float(timeout), cls.MAX_TIMEOUT)
+        if deadline is not None:
+            if deadline.expired():
+                return []
+            budget = min(budget, deadline.timeout(budget))
+        if budget <= 0:
+            return []
+        urls: list[str] = []
+        try:
+            quoted = " ".join(f'"{part}"' for part in (house, name) if part)
+            payload = cls._post_google(f"site:parfumo.com/Perfumes {quoted}".strip(), budget)
+            seen: set[str] = set()
+            for entry in cls._search_entries(payload):
+                canonical = ParfumoEngine.canonical_url(cls._entry_link(entry))
+                if not canonical or not ParfumoEngine.is_perfume_url(canonical):
+                    continue
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                urls.append(canonical)
+        except Exception:
+            return []
+        with cls._cache_lock:
+            cls._parfumo_cache[cache_key] = list(urls)
+        return urls
+
+
+def structured_search_provider():
+    if DecodoScraperClient.enabled():
+        return DecodoScraperClient
+    return None
 
 
 _BASENOTES_CACHE_FILE = Path(
@@ -8624,7 +8999,7 @@ class ParfumoEngine:
     ``/Parfums`` pages and public brand grids -- never ``/api/``,
     ``/app_v5/api/``, ``/s_perfumes.php``, or logged-in endpoints. Degrades
     cleanly: any non-200 / parse failure becomes "no Parfumo result" and never
-    raises into the worker. Discovery is Serper-first (one structured query),
+    raises into the worker. Discovery uses the structured search provider first,
     with a capped, off-by-default single-house brand crawl as last resort.
     """
 
@@ -8656,13 +9031,13 @@ class ParfumoEngine:
         """Last-resort brand crawl gate.
 
         An explicit PARFUMO_BRAND_CRAWL_ENABLED value wins. Otherwise, fall back
-        to the capped crawl when Parfumo fallback is enabled but Serper is not
-        configured, so no-FG jobs still have a discovery path.
+        to the capped crawl when Parfumo fallback is enabled but no structured
+        search provider is configured, so no-FG jobs still have a discovery path.
         """
         explicit = os.environ.get("PARFUMO_BRAND_CRAWL_ENABLED")
         if explicit is not None:
             return _env_truthy("PARFUMO_BRAND_CRAWL_ENABLED")
-        return ParfumoEngine.enabled() and not SerperClient.enabled()
+        return ParfumoEngine.enabled() and structured_search_provider() is None
 
     # ------------------------------------------------------------------
     # URL shape / canonicalization
@@ -8833,7 +9208,7 @@ class ParfumoEngine:
         return ParfumoEngine.parse_fields(soup)
 
     # ------------------------------------------------------------------
-    # Discovery (Serper primary -> capped brand crawl, off by default)
+    # Discovery (structured provider primary -> capped brand crawl, off by default)
     # ------------------------------------------------------------------
     @staticmethod
     def _discover_via_brand_crawl(
@@ -8871,17 +9246,21 @@ class ParfumoEngine:
     @staticmethod
     def discover_urls(scraper, house: str, name: str) -> tuple[list[str], str]:
         """Return (candidate URLs, discovery-source label), capped at
-        MAX_CANDIDATES. Serper first; the single-house brand crawl only if Serper
-        is empty AND the crawl is explicitly enabled. The cap bounds how many
-        live Parfumo pages resolve() will fetch+score per job."""
-        urls = SerperClient.search_parfumo_urls(house, name)
-        if urls:
-            return ParfumoEngine._rank_discovered_urls(urls, house, name)[: ParfumoEngine.MAX_CANDIDATES], "serper"
+        MAX_CANDIDATES. Structured search runs first; the single-house brand
+        crawl only runs if structured search is empty AND the crawl is enabled.
+        The cap bounds how many live Parfumo pages resolve() will fetch+score per
+        job."""
+        provider = structured_search_provider()
+        provider_name = getattr(provider, "PROVIDER_NAME", "structured") if provider else "none"
+        if provider:
+            urls = provider.search_parfumo_urls(house, name)
+            if urls:
+                return ParfumoEngine._rank_discovered_urls(urls, house, name)[: ParfumoEngine.MAX_CANDIDATES], provider_name
         if ParfumoEngine.brand_crawl_enabled():
             crawled = ParfumoEngine._discover_via_brand_crawl(scraper, house)
             if crawled:
                 return ParfumoEngine._rank_discovered_urls(crawled, house, name)[: ParfumoEngine.MAX_CANDIDATES], "brand_crawl"
-        return [], "serper"
+        return [], provider_name
 
     @staticmethod
     def _rank_discovered_urls(urls: list[str], house: str, name: str) -> list[str]:
@@ -9146,7 +9525,7 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     trace = ResolverTrace(enabled=args.debug_timing)
     cache = IdentityCache(args.fg_cache)
     # 1-C: BN and FG run under independent soft-deadlines instead of one shared
-    # ceiling. BN keeps the full first-pass budget; FG/Serper is capped tighter
+    # ceiling. BN keeps the full first-pass budget; FG/provider is capped tighter
     # -- it is the slower, lower-yield leg and its misses are backstopped by the
     # FG cache and the shipped backfill, so a slow FG no longer pins the whole
     # first pass at the ceiling. bounded_parallel still caps the pair at
@@ -9155,15 +9534,17 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     fg_deadline = Deadline(min(getattr(args, "fg_timeout", args.initial_timeout), args.initial_timeout))
     def fg_search_job() -> list[UnifiedFragrance]:
         token = trace.start("raw_search", query=query, deadline=fg_deadline)
-        # When Serper is env-gated on, structured URL discovery replaces the
+        # When a structured provider is env-gated on, URL discovery replaces the
         # dead native Fragrantica SERP scrape for the first pass.
-        if SerperClient.enabled():
-            rows = SerperClient.discover_fragrances(
+        provider = structured_search_provider()
+        if provider:
+            provider_name = getattr(provider, "PROVIDER_NAME", "structured")
+            rows = provider.discover_fragrances(
                 query,
                 deadline=fg_deadline,
                 max_results=args.max_frag_results,
             )
-            skipped_reason = "" if rows else "serper_no_perfume_links"
+            skipped_reason = "" if rows else f"{provider_name}_no_perfume_links"
         else:
             rows = FragranticaEngine.extract_search_data(
                 scraper,
@@ -9505,7 +9886,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-results", type=int, default=15, help="Max merged candidates to display.")
     parser.add_argument("--native-fragrantica-search", action="store_true", help="Opt into Fragrantica's static search page during first-pass search.")
     parser.add_argument("--initial-timeout", type=float, default=6.0, help="First-pass ceiling and Basenotes soft-deadline.")
-    parser.add_argument("--fg-timeout", type=float, default=3.0, help="Fragrantica/Serper first-pass soft-deadline; capped at --initial-timeout.")
+    parser.add_argument("--fg-timeout", type=float, default=3.0, help="Fragrantica/provider first-pass soft-deadline; capped at --initial-timeout.")
     parser.add_argument("--detail-timeout", type=float, default=6.0, help="Shared deadline for selected detail fetch.")
     parser.add_argument("--metrics-budget", type=float, default=0.9, help="Shared budget for rating metrics. Use 0 to skip.")
     parser.add_argument("--metrics-workers", type=int, default=5)

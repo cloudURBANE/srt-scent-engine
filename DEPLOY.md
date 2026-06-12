@@ -73,27 +73,35 @@ Recommended API service variable:
 API_INITIAL_TIMEOUT=5.5
 ```
 
-Optional Fragrantica URL discovery variables for the Serper-backed path:
+Optional structured URL discovery variables for the Decodo-backed path:
 
 ```bash
-SERP_API_PROVIDER=serper
-# Single key, or a comma/space/newline-separated POOL of free-account keys.
-SERPER_API_KEYS=<key1>,<key2>,<key3>
-# Legacy singular var still works and is merged into the pool.
-SERPER_API_KEY=<secret>
+SERP_API_PROVIDER=decodo  # optional; leaving it unset also defaults to Decodo
+DECODO_API_BASIC_TOKEN=<base64 username:password>
 ```
 
-Leaving `SERP_API_PROVIDER` unset (or providing no keys) preserves the current
-non-Serper behavior.
+Alternatively, provide username/password credentials and let the engine build the
+Basic token:
 
-**Key pool / auto-rotation.** When multiple keys are supplied the engine drains
-one key until it returns 401/402/403 (out of credits → retired for the process)
-or 429 (rate-limited → short cooldown, retried later), then rotates to the next
-key automatically — no redeploy. Inspect live health at
-`GET /api/diagnostics/serper-pool` with the worker bearer token (masked keys).
-Refill without a redeploy via `POST /api/admin/serper-pool/keys` with the same
-bearer token and body `{"keys": "k1,k2"}`. State is in-memory only, so a
-restart re-tests every key.
+```bash
+SERP_API_PROVIDER=decodo
+DECODO_API_USERNAME=<decodo-user>
+DECODO_API_PASSWORD=<decodo-password>
+```
+
+`SERP_API_PROVIDER` defaults to Decodo when unset. If no Decodo credentials are
+configured, structured search is disabled and the engine falls back to its
+non-provider search paths.
+
+The former Serper pool diagnostics/admin endpoints now return deprecation
+notices and no longer manage credentials at runtime.
+
+When Decodo is configured, the query spell-repair pass also harvests its
+structured SERP results, so typo'd queries ("creed avantus") are corrected even
+on datacenter hosts where the Google/Bing HTML scrape is dead. Repair only runs
+after a clearly bad first pass; its budget is `API_SPELL_REPAIR_BUDGET`
+(default `4.0` seconds). Below ~1.2s of remaining budget the engine skips the
+structured call rather than spend a request that cannot finish.
 
 ## Basenotes / Chromium requirement
 

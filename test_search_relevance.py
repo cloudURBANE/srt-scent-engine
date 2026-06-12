@@ -99,7 +99,7 @@ def test_margiela_replica_line_aliases_merge_and_filter() -> None:
         brand="Maison Martin Margiela",
         year="2015",
         frag_url="https://www.fragrantica.com/perfume/Maison-Martin-Margiela/By-the-Fireplace-31623.html",
-        resolver_source="serper_fragrantica_search",
+        resolver_source="decodo_fragrantica_search",
     )
     merged = engine.Orchestrator.match_and_merge([bn_fireplace], [fg_fireplace])
     check(
@@ -892,8 +892,8 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
     )
 
 
-class _FakeSerperResponse:
-    """Minimal stand-in for a requests.Response from google.serper.dev."""
+class _FakeDecodoResponse:
+    """Minimal stand-in for a requests.Response from Decodo's scraper API."""
 
     def __init__(self, payload: dict, status_code: int = 200) -> None:
         self._payload = payload
@@ -908,38 +908,63 @@ class _FakeSerperResponse:
         return self._payload
 
 
-_SERPER_SAMPLE_PAYLOAD = {
-    "organic": [
-        {"link": "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"},
-        {"link": "https://example.com/not-fragrance"},
-        {"link": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html?utm=1"},
+_DECODO_SAMPLE_PAYLOAD = {
+    "results": [
+        {
+            "content": {
+                "results": {
+                    "results": {
+                        "organic": [
+                            {"url": "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"},
+                            {"link": "https://example.com/not-fragrance"},
+                            {"link": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html?utm=1"},
+                        ]
+                    }
+                }
+            }
+        }
     ]
 }
 
 
-def _set_serper_env(enabled: bool) -> dict[str, str | None]:
-    saved = {
-        "SERP_API_PROVIDER": os.environ.get("SERP_API_PROVIDER"),
-        "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
-        "SERPER_API_KEYS": os.environ.get("SERPER_API_KEYS"),
-    }
+_DECODO_ENV_KEYS = (
+    "SERP_API_PROVIDER",
+    "DECODO_API_BASIC_TOKEN",
+    "DECODO_SCRAPER_BASIC_TOKEN",
+    "DECODO_BASIC_TOKEN",
+    "DECODO_API_USERNAME",
+    "DECODO_API_PASSWORD",
+    "DECODO_SCRAPER_USERNAME",
+    "DECODO_SCRAPER_PASSWORD",
+    "DECODO_USERNAME",
+    "DECODO_PASSWORD",
+    "DECODO_SCRAPER_LOCALE",
+)
+
+
+def _set_decodo_env(enabled: bool, *, provider: str | None = "decodo") -> dict[str, str | None]:
+    saved = {key: os.environ.get(key) for key in _DECODO_ENV_KEYS}
+    for key in _DECODO_ENV_KEYS:
+        os.environ.pop(key, None)
     if enabled:
-        os.environ["SERP_API_PROVIDER"] = "serper"
-        os.environ["SERPER_API_KEY"] = "test-key-not-real"
-        os.environ.pop("SERPER_API_KEYS", None)
-    else:
-        os.environ.pop("SERP_API_PROVIDER", None)
-        os.environ.pop("SERPER_API_KEY", None)
-        os.environ.pop("SERPER_API_KEYS", None)
+        if provider is not None:
+            os.environ["SERP_API_PROVIDER"] = provider
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+    engine.DecodoScraperClient._cache.clear()
+    engine.DecodoScraperClient._parfumo_cache.clear()
+    engine.DecodoScraperClient._image_cache.clear()
     return saved
 
 
-def _restore_serper_env(saved: dict[str, str | None]) -> None:
+def _restore_decodo_env(saved: dict[str, str | None]) -> None:
     for key, value in saved.items():
         if value is None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+    engine.DecodoScraperClient._cache.clear()
+    engine.DecodoScraperClient._parfumo_cache.clear()
+    engine.DecodoScraperClient._image_cache.clear()
 
 
 def test_pick_launch_year_ignores_house_founding_year() -> None:
@@ -966,168 +991,212 @@ def test_casamorati_tempio_catalog_identity_score() -> None:
     check("catalog row links at accept threshold", score >= engine.Orchestrator.CATALOG_ACCEPT, f"{score:.3f}")
 
 
-def test_serper_enabled_with_key_only() -> None:
-    print("Serper key-only enablement checks:")
-    saved = _set_serper_env(enabled=False)
-    os.environ["SERPER_API_KEY"] = "test-key-not-real"
+def test_decodo_enabled_with_default_provider() -> None:
+    print("Decodo default-provider enablement checks:")
+    saved = _set_decodo_env(enabled=True, provider=None)
     try:
-        check("SerperClient.enabled() with key only", engine.SerperClient.enabled() is True, "")
+        check("DecodoScraperClient.enabled() defaults to Decodo with credentials", engine.DecodoScraperClient.enabled() is True, "")
+        check(
+            "structured_search_provider() selects Decodo by default",
+            engine.structured_search_provider() is engine.DecodoScraperClient,
+            str(engine.structured_search_provider()),
+        )
     finally:
-        _restore_serper_env(saved)
+        _restore_decodo_env(saved)
 
 
-def test_serper_rotates_after_exhausted_key() -> None:
-    print("Serper key-pool rotation checks:")
-    engine.SerperClient._cache.clear()
-    saved = _set_serper_env(enabled=False)
-    old_post = engine.requests.post
-    old_pool = engine._SERPER_POOL
-    calls: list[str | None] = []
-    try:
-        os.environ["SERP_API_PROVIDER"] = "serper"
-        os.environ["SERPER_API_KEYS"] = "test-exhausted-key,test-live-key"
-        engine._SERPER_POOL = engine.SerperKeyPool(rate_limit_cooldown_s=1.0)
-
-        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
-            api_key = (headers or {}).get("X-API-KEY")
-            calls.append(api_key)
-            if api_key == "test-exhausted-key":
-                return _FakeSerperResponse({}, status_code=402)
-            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
-
-        engine.requests.post = fake_post
-        urls = engine.SerperClient.search_fragrantica_urls("pool rotation")
-        snapshot = engine.serper_key_pool().snapshot()
-    finally:
-        engine.requests.post = old_post
-        engine._SERPER_POOL = old_pool
-        _restore_serper_env(saved)
-
-    check(
-        "exhausted key is followed by the next pool key",
-        calls == ["test-exhausted-key", "test-live-key"],
-        str(calls),
-    )
-    check(
-        "rotation still returns Serper results",
-        urls[:1] == ["https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"],
-        str(urls),
-    )
-    key_statuses = [entry["status"] for entry in snapshot.get("keys", [])]
-    check(
-        "exhausted key is retired in diagnostics",
-        any(status == "retired" for status in key_statuses),
-        str(snapshot),
-    )
-
-
-def test_serper_disabled_without_env() -> None:
-    print("Serper env-gating checks:")
-    engine.SerperClient._cache.clear()
-    saved = _set_serper_env(enabled=False)
+def test_decodo_disabled_without_credentials() -> None:
+    print("Decodo env-gating checks:")
+    saved = _set_decodo_env(enabled=False)
     old_post = engine.requests.post
     calls = {"http": 0}
     try:
         def forbidden_post(*args, **kwargs):
             calls["http"] += 1
-            raise AssertionError("requests.post must not be called when Serper is disabled")
+            raise AssertionError("requests.post must not be called when Decodo is disabled")
 
         engine.requests.post = forbidden_post
-        enabled = engine.SerperClient.enabled()
-        urls = engine.SerperClient.search_fragrantica_urls("xerjoff naxos")
-        rows = engine.SerperClient.discover_fragrances("xerjoff naxos")
+        enabled = engine.DecodoScraperClient.enabled()
+        provider = engine.structured_search_provider()
+        urls = engine.DecodoScraperClient.search_fragrantica_urls("xerjoff naxos")
+        rows = engine.DecodoScraperClient.discover_fragrances("xerjoff naxos")
     finally:
         engine.requests.post = old_post
-        _restore_serper_env(saved)
+        _restore_decodo_env(saved)
 
-    check("SerperClient.enabled() is False without env", enabled is False, str(enabled))
-    check("disabled Serper returns no URLs", urls == [], str(urls))
-    check("disabled Serper returns no rows", rows == [], str(rows))
-    check("disabled Serper makes no HTTP call", calls["http"] == 0, str(calls))
+    check("DecodoScraperClient.enabled() is False without credentials", enabled is False, str(enabled))
+    check("structured_search_provider() returns None without credentials", provider is None, str(provider))
+    check("disabled Decodo returns no URLs", urls == [], str(urls))
+    check("disabled Decodo returns no rows", rows == [], str(rows))
+    check("disabled Decodo makes no HTTP call", calls["http"] == 0, str(calls))
 
 
-def test_serper_parses_fragrantica_urls() -> None:
-    print("Serper URL parsing checks:")
-    engine.SerperClient._cache.clear()
-    saved = _set_serper_env(enabled=True)
+def test_decodo_rejects_serper_provider_env() -> None:
+    print("Decodo-only provider selection checks:")
+    saved = _set_decodo_env(enabled=True, provider="serper")
+    try:
+        check("Decodo is disabled when provider env explicitly requests Serper", engine.DecodoScraperClient.enabled() is False, "")
+        check("Serper env no longer selects a structured provider", engine.structured_search_provider() is None, str(engine.structured_search_provider()))
+    finally:
+        _restore_decodo_env(saved)
+
+
+def test_decodo_parses_fragrantica_urls() -> None:
+    print("Decodo URL parsing checks:")
+    saved = _set_decodo_env(enabled=True)
     old_post = engine.requests.post
     seen: dict[str, object] = {}
     try:
         def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
             seen["url"] = url
-            seen["query"] = (json or {}).get("q")
-            seen["api_key"] = (headers or {}).get("X-API-KEY")
-            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+            seen["body"] = dict(json or {})
+            seen["auth"] = (headers or {}).get("Authorization")
+            return _FakeDecodoResponse(_DECODO_SAMPLE_PAYLOAD)
 
         engine.requests.post = fake_post
-        urls = engine.SerperClient.search_fragrantica_urls("xerjoff naxos")
-        rows = engine.SerperClient.discover_fragrances("xerjoff naxos")
+        urls = engine.DecodoScraperClient.search_fragrantica_urls("xerjoff naxos")
+        rows = engine.DecodoScraperClient.discover_fragrances("xerjoff naxos")
     finally:
         engine.requests.post = old_post
-        _restore_serper_env(saved)
+        _restore_decodo_env(saved)
 
+    body = seen.get("body") or {}
     check(
-        "Serper keeps only canonical Fragrantica perfume URLs",
+        "Decodo keeps only canonical Fragrantica perfume URLs",
         urls == [
             "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html",
             "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html",
         ],
         str(urls),
     )
+    check("Decodo request hits the scraper API endpoint", seen.get("url") == engine.DecodoScraperClient.ENDPOINT, str(seen.get("url")))
+    check("Decodo request uses google_search target", body.get("target") == "google_search", str(body))
     check(
-        "Serper request is site-scoped to fragrantica perfume pages",
-        seen.get("query") == "xerjoff naxos site:fragrantica.com/perfume",
-        str(seen.get("query")),
+        "Decodo request is site-scoped to fragrantica perfume pages",
+        body.get("query") == "xerjoff naxos site:fragrantica.com/perfume",
+        str(body.get("query")),
     )
-    check("Serper request sends the API key header", seen.get("api_key") == "test-key-not-real", str(seen.get("api_key")))
-    check("Serper request hits the serper.dev endpoint", seen.get("url") == engine.SerperClient.ENDPOINT, str(seen.get("url")))
+    check("Decodo request asks for parsed JSON", body.get("parse") is True, str(body))
+    check("Decodo request sends Basic auth", seen.get("auth") == "Basic encoded-test-token", str(seen.get("auth")))
 
     naxos = next((row for row in rows if "Naxos" in row.name), None)
     identities = [(row.brand, row.name) for row in rows]
     check(
-        "Serper row recovers Fragrantica identity from the URL",
+        "Decodo row recovers Fragrantica identity from the URL",
         naxos is not None and naxos.name == "1861 Naxos" and naxos.brand == "Xerjoff",
         str(identities),
     )
     check(
-        "Serper row carries the canonical Fragrantica URL",
+        "Decodo row carries the canonical Fragrantica URL",
         naxos is not None and naxos.frag_url == "https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html",
         str(naxos.frag_url if naxos else None),
     )
     check(
-        "Serper row is labelled with the serper resolver source",
-        naxos is not None and naxos.resolver_source == "serper_fragrantica_search",
+        "Decodo row is labelled with the Decodo resolver source",
+        naxos is not None and naxos.resolver_source == "decodo_fragrantica_search",
         str(naxos.resolver_source if naxos else None),
     )
 
 
-def test_serper_caches_responses() -> None:
-    print("Serper response cache checks:")
-    engine.SerperClient._cache.clear()
-    saved = _set_serper_env(enabled=True)
+def test_decodo_caches_responses() -> None:
+    print("Decodo response cache checks:")
+    saved = _set_decodo_env(enabled=True)
     old_post = engine.requests.post
     calls = {"http": 0}
     try:
         def counting_post(url, json=None, headers=None, timeout=None, **kwargs):
             calls["http"] += 1
-            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+            return _FakeDecodoResponse(_DECODO_SAMPLE_PAYLOAD)
 
         engine.requests.post = counting_post
-        first = engine.SerperClient.search_fragrantica_urls("creed aventus")
-        second = engine.SerperClient.search_fragrantica_urls("creed aventus")
+        first = engine.DecodoScraperClient.search_fragrantica_urls("creed aventus")
+        second = engine.DecodoScraperClient.search_fragrantica_urls("creed aventus")
     finally:
         engine.requests.post = old_post
-        _restore_serper_env(saved)
+        _restore_decodo_env(saved)
 
-    check("repeated Serper query is served from the in-process cache", calls["http"] == 1, str(calls))
+    check("repeated Decodo query is served from the in-process cache", calls["http"] == 1, str(calls))
     check(
-        "cached Serper result matches the first live result",
+        "cached Decodo result matches the first live result",
         first == second and first != [],
         str((first, second)),
     )
 
 
-def test_initio_prives_serper_url_survives_merge() -> None:
+def test_decodo_structured_spell_repair_evidence() -> None:
+    """A typo'd query is repaired from structured SERP URLs alone.
+
+    On datacenter hosts the Google/Bing HTML scrapes are dead, so the only SERP
+    evidence QueryRepair.suggest() can harvest comes from the structured
+    provider. Http.get is stubbed to return nothing to simulate exactly that.
+    """
+    print("Decodo structured spell-repair checks:")
+    saved = _set_decodo_env(enabled=True)
+    old_post = engine.requests.post
+    old_get = engine.Http.get
+    posted_queries: list[str] = []
+    aventus_payload = {
+        "results": [
+            {
+                "content": {
+                    "results": {
+                        "organic": [
+                            {"url": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html"},
+                        ]
+                    }
+                }
+            }
+        ]
+    }
+    try:
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            posted_queries.append(str((json or {}).get("query") or ""))
+            return _FakeDecodoResponse(aventus_payload)
+
+        engine.requests.post = fake_post
+        engine.Http.get = staticmethod(lambda *args, **kwargs: None)
+        suggestion = engine.QueryRepair.suggest(None, "creed avantus", seconds=2.0)
+    finally:
+        engine.requests.post = old_post
+        engine.Http.get = old_get
+        _restore_decodo_env(saved)
+
+    check(
+        "structured spell repair queries the provider with the typo'd query",
+        any(q.startswith("creed avantus ") for q in posted_queries),
+        str(posted_queries),
+    )
+    check(
+        "typo'd query is repaired from structured SERP URLs",
+        suggestion.lower() == "creed aventus",
+        repr(suggestion),
+    )
+
+    # Each abandoned provider call still spends a credit, so a budget too small
+    # for Decodo's measured latency must skip the structured leg entirely.
+    saved = _set_decodo_env(enabled=True)
+    starved_posts: list[str] = []
+    try:
+        def counting_post(url, json=None, headers=None, timeout=None, **kwargs):
+            starved_posts.append(str((json or {}).get("query") or ""))
+            return _FakeDecodoResponse(aventus_payload)
+
+        engine.requests.post = counting_post
+        engine.Http.get = staticmethod(lambda *args, **kwargs: None)
+        engine.QueryRepair.suggest(None, "creed avantus", seconds=0.5)
+    finally:
+        engine.requests.post = old_post
+        engine.Http.get = old_get
+        _restore_decodo_env(saved)
+
+    check(
+        "structured spell repair skips the provider when the budget is too small",
+        starved_posts == [],
+        str(starved_posts),
+    )
+
+
+def test_initio_prives_decodo_url_survives_merge() -> None:
     print("Initio Prives merge checks:")
     bn = engine.UnifiedFragrance(
         name="High Frequency",
@@ -1140,14 +1209,14 @@ def test_initio_prives_serper_url_survives_merge() -> None:
         brand="Initio Parfums Prives",
         year="2016",
         frag_url="https://www.fragrantica.com/perfume/Initio-Parfums-Prives/High-Frequency-42259.html",
-        resolver_source="serper_fragrantica_search",
+        resolver_source="decodo_fragrantica_search",
     )
     merged = engine.Orchestrator.match_and_merge([bn], [fg])
 
     check(
-        "generic house suffixes do not block the Serper Fragrantica URL",
+        "generic house suffixes do not block the Decodo Fragrantica URL",
         merged[0].frag_url == fg.frag_url
-        and merged[0].resolver_source == "serper_fragrantica_search",
+        and merged[0].resolver_source == "decodo_fragrantica_search",
         f"{merged[0].brand} | {merged[0].name} | {merged[0].frag_url}",
     )
 
@@ -1174,12 +1243,13 @@ def main() -> int:
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()
-    test_serper_disabled_without_env()
-    test_serper_enabled_with_key_only()
-    test_serper_rotates_after_exhausted_key()
-    test_serper_parses_fragrantica_urls()
-    test_serper_caches_responses()
-    test_initio_prives_serper_url_survives_merge()
+    test_decodo_disabled_without_credentials()
+    test_decodo_enabled_with_default_provider()
+    test_decodo_rejects_serper_provider_env()
+    test_decodo_parses_fragrantica_urls()
+    test_decodo_caches_responses()
+    test_decodo_structured_spell_repair_evidence()
+    test_initio_prives_decodo_url_survives_merge()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
     test_brand_alias_query_keeps_house_catalog()

@@ -54,7 +54,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
-from enrichment_facts import FACT_FIELDS, record_fact_status  # noqa: E402
+from enrichment_facts import FACT_FIELDS, expand_raw_accords, record_fact_status  # noqa: E402
 
 DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
@@ -1541,6 +1541,22 @@ def _payload_fact_summary(
     fragrance which facts this run actually delivered and which the sources
     still lack -- the operator-facing answer to "what did this update?".
     """
+    raw_identity = payload.get("raw_identity") or {}
+    if payload.get("source") == "parfumo":
+        # Mirror api._build_parfumo_cache_row: Parfumo accords ride in
+        # raw_identity and are projected into derived_metrics.main_accords at
+        # completion, so judge the payload the way the API will store it.
+        accords = expand_raw_accords(
+            raw_identity.get("accords") if isinstance(raw_identity, dict) else None
+        )
+        if accords:
+            dm = dict(dm) if isinstance(dm, dict) else {}
+            main = dm.get("main_accords")
+            if not (isinstance(main, dict) and main.get("top_accords")):
+                dm["main_accords"] = {
+                    "top_accords": accords,
+                    "source": "parfumo_accords",
+                }
     record = {
         "name": payload.get("name"),
         "house": payload.get("house"),
@@ -1550,7 +1566,7 @@ def _payload_fact_summary(
             "frag_cards": payload.get("frag_cards") or {},
             "notes": payload.get("notes") or {},
             "reviews": payload.get("reviews") or [],
-            "raw_identity": payload.get("raw_identity") or {},
+            "raw_identity": raw_identity,
             "concentration": payload.get("concentration"),
         },
         "bn_raw": {},
