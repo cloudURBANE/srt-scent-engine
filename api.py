@@ -3134,6 +3134,14 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = session is not None
         if session is not None:
+            with engine._FRAGRANTICA_SESSION_LOCK:
+                old_session = engine._FRAGRANTICA_SESSION
+                engine._FRAGRANTICA_SESSION = session
+            if old_session is not None and old_session is not session and hasattr(old_session, "close"):
+                try:
+                    old_session.close()
+                except Exception:
+                    pass
             try:
                 result["session_validated_after_mint"] = bool(
                     engine._validate_fragrantica_session(session)

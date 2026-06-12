@@ -25,8 +25,11 @@ Exit code is non-zero if any check fails.
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import threading
+from pathlib import Path
 from http.cookies import SimpleCookie
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -303,6 +306,185 @@ def test_fragrantica_challenge_and_static_parse() -> None:
         )
     finally:
         engine.Http.get = original_get
+
+
+def test_fragrantica_clearance_session_lifecycle() -> None:
+    print("Fragrantica clearance session checks:")
+    engine = enrichment_worker.engine
+
+    def response(text: str, status_code: int = 200) -> requests.Response:
+        res = requests.Response()
+        res.status_code = status_code
+        res._content = text.encode("utf-8")
+        res.encoding = "utf-8"
+        return res
+
+    class FakeOptions:
+        def set_browser_path(self, _path: str) -> None:
+            pass
+
+        def set_argument(self, _argument: str) -> None:
+            pass
+
+        def headless(self, _enabled: bool) -> None:
+            pass
+
+        def auto_port(self) -> None:
+            pass
+
+    class FakePage:
+        def __init__(self, _options: object | None = None) -> None:
+            self.title = "Fragrantica"
+            self.url = "about:blank"
+            self.html = "<html><title>Fragrantica</title><body>Perfume rating 4.1 out of 5</body></html>"
+            self.quit_count = 0
+
+        def get(self, url: str, timeout: float | None = None) -> None:
+            self.url = url
+
+        def cookies(self) -> list[dict[str, str]]:
+            return [{"name": "cf_clearance", "value": "ok"}]
+
+        def run_js(self, _script: str) -> str:
+            return (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            )
+
+        def quit(self) -> None:
+            self.quit_count += 1
+
+    class BadReplaySession:
+        def get(self, _url: str, timeout: float = 5) -> requests.Response:
+            return response(
+                "<html><title>Just a moment...</title><body>cf-challenge</body></html>",
+                403,
+            )
+
+    page = FakePage()
+    browser_session = engine._FragranticaBrowserSession(
+        page,
+        "test-ua",
+        {"cf_clearance": "ok"},
+    )
+    try:
+        check(
+            "browser-backed Fragrantica session validates non-challenge pages",
+            engine._validate_fragrantica_session(browser_session),
+        )
+    finally:
+        browser_session.close()
+    check("browser-backed session closes its page", page.quit_count == 1)
+
+    saved = {
+        "ChromiumOptions": engine.ChromiumOptions,
+        "ChromiumPage": engine.ChromiumPage,
+        "new_session": engine._new_fragrantica_http_session,
+        "save_cache": engine._save_fragrantica_cache,
+        "last_error": engine._FRAGRANTICA_LAST_MINT_ERROR,
+        "session": engine._FRAGRANTICA_SESSION,
+        "env_path": os.environ.get("FRAGRANTICA_CHROMIUM_PATH"),
+        "env_wait": os.environ.get("FRAGRANTICA_CLEARANCE_WAIT"),
+    }
+    cache_saves: list[tuple[str, dict[str, str]]] = []
+    minted_session = None
+    try:
+        engine.reset_fragrantica_scraper(clear_cache=False)
+        engine.ChromiumOptions = FakeOptions  # type: ignore[assignment]
+        engine.ChromiumPage = FakePage  # type: ignore[assignment]
+        engine._new_fragrantica_http_session = lambda *_args: BadReplaySession()  # type: ignore[assignment]
+        engine._save_fragrantica_cache = lambda ua, cookies: cache_saves.append((ua, dict(cookies)))  # type: ignore[assignment]
+        os.environ["FRAGRANTICA_CHROMIUM_PATH"] = sys.executable
+        os.environ["FRAGRANTICA_CLEARANCE_WAIT"] = "1"
+
+        minted_session = engine._mint_fragrantica_clearance()
+        check(
+            "mint falls back to browser-backed session when cookie replay fails",
+            isinstance(minted_session, engine._FragranticaBrowserSession),
+            str(type(minted_session)),
+        )
+        check(
+            "curl-invalid Fragrantica clearance is not saved as durable cache",
+            not cache_saves,
+            str(cache_saves),
+        )
+    finally:
+        if hasattr(minted_session, "close"):
+            minted_session.close()
+        engine.ChromiumOptions = saved["ChromiumOptions"]  # type: ignore[assignment]
+        engine.ChromiumPage = saved["ChromiumPage"]  # type: ignore[assignment]
+        engine._new_fragrantica_http_session = saved["new_session"]  # type: ignore[assignment]
+        engine._save_fragrantica_cache = saved["save_cache"]  # type: ignore[assignment]
+        engine._FRAGRANTICA_LAST_MINT_ERROR = saved["last_error"]
+        engine._FRAGRANTICA_SESSION = saved["session"]
+        if saved["env_path"] is None:
+            os.environ.pop("FRAGRANTICA_CHROMIUM_PATH", None)
+        else:
+            os.environ["FRAGRANTICA_CHROMIUM_PATH"] = saved["env_path"]
+        if saved["env_wait"] is None:
+            os.environ.pop("FRAGRANTICA_CLEARANCE_WAIT", None)
+        else:
+            os.environ["FRAGRANTICA_CLEARANCE_WAIT"] = saved["env_wait"]
+
+    env_keys = (
+        "FRAGRANTICA_CLEARANCE_UA",
+        "FRAGRANTICA_CLEARANCE_COOKIE_HEADER",
+        "FRAGRANTICA_CLEARANCE_COOKIES_JSON",
+    )
+    saved_env = {key: os.environ.get(key) for key in env_keys}
+    saved_cache_file = engine._FRAGRANTICA_CACHE_FILE
+    saved_new_session = engine._new_fragrantica_http_session
+    saved_session = engine._FRAGRANTICA_SESSION
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = Path(tmp) / "fg-clearance.json"
+            cache_file.write_text(
+                '{"ua":"ua","cookies":{"cf_clearance":"bad"}}',
+                encoding="utf-8",
+            )
+            engine._FRAGRANTICA_CACHE_FILE = cache_file
+            engine._FRAGRANTICA_SESSION = None
+            engine._new_fragrantica_http_session = lambda *_args: BadReplaySession()  # type: ignore[assignment]
+            fallback = object()
+            result = engine.get_fragrantica_scraper(fallback, mint_clearance=False)
+            check("invalid saved Fragrantica clearance falls back cleanly", result is fallback)
+            check("invalid saved Fragrantica clearance cache is discarded", not cache_file.exists())
+    finally:
+        engine._FRAGRANTICA_CACHE_FILE = saved_cache_file
+        engine._new_fragrantica_http_session = saved_new_session  # type: ignore[assignment]
+        engine._FRAGRANTICA_SESSION = saved_session
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    saved_mint = engine._mint_fragrantica_clearance
+    saved_session = engine._FRAGRANTICA_SESSION
+    saved_headless = os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+    saved_bn_path = os.environ.get("BASENOTES_CHROMIUM_PATH")
+    fake_session = object()
+    try:
+        engine._FRAGRANTICA_SESSION = None
+        engine._mint_fragrantica_clearance = lambda: fake_session  # type: ignore[assignment]
+        enrichment_worker._run_automatic_clearance_mint()
+        check(
+            "dashboard direct mint installs returned Fragrantica session",
+            engine._FRAGRANTICA_SESSION is fake_session,
+        )
+    finally:
+        engine._mint_fragrantica_clearance = saved_mint  # type: ignore[assignment]
+        engine._FRAGRANTICA_SESSION = saved_session
+        if saved_headless is None:
+            os.environ.pop("FRAGRANTICA_CHROMIUM_HEADLESS", None)
+        else:
+            os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = saved_headless
+        if saved_bn_path is None:
+            os.environ.pop("BASENOTES_CHROMIUM_PATH", None)
+        else:
+            os.environ["BASENOTES_CHROMIUM_PATH"] = saved_bn_path
 
 
 def test_mobile_new_device_session_binding() -> None:
@@ -1793,6 +1975,7 @@ def test_db_lifecycle() -> None:
 def main() -> int:
     test_no_db_contract()
     test_fragrantica_challenge_and_static_parse()
+    test_fragrantica_clearance_session_lifecycle()
     test_mobile_new_device_session_binding()
     test_hydration_dedup()
     test_concentration_pipeline()

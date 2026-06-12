@@ -1617,9 +1617,17 @@ def process_pending(
         return 0
 
     scraper = engine.get_scraper()
-    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    fg_scraper = engine.get_fragrantica_scraper(
+        scraper.default_scraper,
+        mint_clearance=not engine._chromium_mint_disabled(),
+    )
     if not engine._validate_fragrantica_session(fg_scraper):
-        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
+        err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None)
+        detail = f" Last mint error: {err}" if err else ""
+        raise SystemExit(
+            "Clearance preflight failed: fragrantica_clearance is missing or invalid."
+            f"{detail}"
+        )
     engine_args = _build_engine_args()
     completed = 0
     total = len(jobs)
@@ -1694,9 +1702,17 @@ def warm_list(client: ApiClient, config: WorkerConfig, path: str, stop: StopCont
         raise SystemExit(f"No queries found in {path!r}.")
 
     scraper = engine.get_scraper()
-    fg_scraper = engine.get_fragrantica_scraper(scraper.default_scraper, mint_clearance=False)
+    fg_scraper = engine.get_fragrantica_scraper(
+        scraper.default_scraper,
+        mint_clearance=not engine._chromium_mint_disabled(),
+    )
     if not engine._validate_fragrantica_session(fg_scraper):
-        raise SystemExit("Clearance preflight failed: fragrantica_clearance is missing or invalid. Trigger mint or provide env vars.")
+        err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None)
+        detail = f" Last mint error: {err}" if err else ""
+        raise SystemExit(
+            "Clearance preflight failed: fragrantica_clearance is missing or invalid."
+            f"{detail}"
+        )
     engine_args = _build_engine_args()
     completed = 0
     print(f"Warm list: {len(queries)} queries from {path}")
@@ -2206,16 +2222,18 @@ def _run_auto_approve(
         auto_state["args"] = _build_engine_args()
         # Same preflight process_pending hard-fails on. Auto mode keeps going
         # (jobs may still resolve via the API or Parfumo), but the operator
-        # must see WHY every FG detail fetch is about to fail.
+        # must see why Fragrantica detail fetches are unavailable.
         try:
             fg_scraper = engine.get_fragrantica_scraper(
-                auto_state["scraper"].default_scraper, mint_clearance=False
+                auto_state["scraper"].default_scraper,
+                mint_clearance=not engine._chromium_mint_disabled(),
             )
             if not engine._validate_fragrantica_session(fg_scraper):
-                _log_event(
-                    "auto: FG clearance missing/invalid — detail fetches will fail until mint",
-                    "err",
-                )
+                err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None)
+                detail = f" ({err})" if err else ""
+                _log_event(f"auto: FG clearance unavailable{detail}", "err")
+            else:
+                _log_event("auto: FG clearance ready", "ok")
         except Exception:
             _log_event("auto: FG clearance preflight errored (continuing)", "warn")
     target = job.get("name") or job.get("house") or job.get("id") or "next job"
@@ -2548,6 +2566,14 @@ def _run_automatic_clearance_mint() -> None:
         os.environ["FRAGRANTICA_CHROMIUM_HEADLESS"] = "0"
         session = engine._mint_fragrantica_clearance()
         if session is not None:
+            with engine._FRAGRANTICA_SESSION_LOCK:
+                old_session = engine._FRAGRANTICA_SESSION
+                engine._FRAGRANTICA_SESSION = session
+            if old_session is not None and old_session is not session and hasattr(old_session, "close"):
+                try:
+                    old_session.close()
+                except Exception:
+                    pass
             print(f"   {c['G']}✓ Fragrantica clearance minted and cached successfully.{c['Z']}")
         else:
             err = getattr(engine, "_FRAGRANTICA_LAST_MINT_ERROR", None) or "Unknown error"
