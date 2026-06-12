@@ -148,7 +148,11 @@ _ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 5.5)
 # initial_timeout; clamped to initial_timeout inside the engine.
 _ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 3.0)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
-_ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 0.8)
+# Spell repair only fires after a clearly bad first pass (the alternative is
+# returning nothing), so it can afford a real budget. Structured-provider SERP
+# evidence (Decodo) needs ~2-4s per call; below ~1.2s remaining the engine
+# skips the structured leg entirely rather than spend a doomed request.
+_ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 4.0)
 
 _LIVE_SEARCH_MAX_CONCURRENT = max(1, _env_int("API_LIVE_SEARCH_MAX_CONCURRENT", 6))
 _LIVE_SEARCH_QUEUE_TIMEOUT = max(

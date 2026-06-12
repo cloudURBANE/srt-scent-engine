@@ -1099,6 +1099,29 @@ def test_decodo_structured_spell_repair_evidence() -> None:
         repr(suggestion),
     )
 
+    # Each abandoned provider call still spends a credit, so a budget too small
+    # for Decodo's measured latency must skip the structured leg entirely.
+    saved = _set_decodo_env(enabled=True)
+    starved_posts: list[str] = []
+    try:
+        def counting_post(url, json=None, headers=None, timeout=None, **kwargs):
+            starved_posts.append(str((json or {}).get("query") or ""))
+            return _FakeDecodoResponse(aventus_payload)
+
+        engine.requests.post = counting_post
+        engine.Http.get = staticmethod(lambda *args, **kwargs: None)
+        engine.QueryRepair.suggest(None, "creed avantus", seconds=0.5)
+    finally:
+        engine.requests.post = old_post
+        engine.Http.get = old_get
+        _restore_decodo_env(saved)
+
+    check(
+        "structured spell repair skips the provider when the budget is too small",
+        starved_posts == [],
+        str(starved_posts),
+    )
+
 
 def test_initio_prives_decodo_url_survives_merge() -> None:
     print("Initio Prives merge checks:")

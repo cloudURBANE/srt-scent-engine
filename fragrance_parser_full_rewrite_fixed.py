@@ -1019,6 +1019,9 @@ class QueryRepair:
     MIN_TITLE_ONLY_CONFIDENCE = 0.96
     MAX_SUGGESTION_WORDS = 8
     MAX_CANONICAL_WORDS = 12
+    # Minimum remaining repair budget (s) before a structured-provider SERP
+    # call is attempted; Decodo URL discovery measures ~2-4s per call.
+    STRUCTURED_MIN_BUDGET = 1.2
 
     BAD_SUGGESTION_PARTS = {
         # search/result UI
@@ -2609,11 +2612,14 @@ class QueryRepair:
         # query inside the site-scoped search itself, so the returned URLs carry
         # the corrected identity. Responses are cached per query inside the
         # provider, bounding spend on repeated repairs of the same input.
+        # Decodo URL discovery measures ~2-4s per call, so each call is gated on
+        # enough remaining budget to plausibly finish: a request that will be
+        # abandoned client-side still spends a provider credit.
         provider = structured_search_provider()
         if provider is not None:
             structured_queries = list(dict.fromkeys([query, *anchor_queries[:1]]))[:2]
             for structured_query in structured_queries:
-                if deadline.expired():
+                if deadline.remaining(QueryRepair.STRUCTURED_MIN_BUDGET) < QueryRepair.STRUCTURED_MIN_BUDGET:
                     break
                 for url in provider.search_fragrantica_urls(structured_query, deadline=deadline):
                     candidate, domain, is_canonical = QueryRepair._canonical_candidate_from_url(url)

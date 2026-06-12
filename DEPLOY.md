@@ -96,6 +96,13 @@ non-provider search paths.
 The former Serper pool diagnostics/admin endpoints now return deprecation
 notices and no longer manage credentials at runtime.
 
+When Decodo is configured, the query spell-repair pass also harvests its
+structured SERP results, so typo'd queries ("creed avantus") are corrected even
+on datacenter hosts where the Google/Bing HTML scrape is dead. Repair only runs
+after a clearly bad first pass; its budget is `API_SPELL_REPAIR_BUDGET`
+(default `4.0` seconds). Below ~1.2s of remaining budget the engine skips the
+structured call rather than spend a request that cannot finish.
+
 ## Basenotes / Chromium requirement
 
 The Basenotes scraper passes Cloudflare clearance by driving a real Chromium
