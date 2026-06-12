@@ -1414,8 +1414,14 @@ def test_worker_fact_summary_and_serp_retry() -> None:
     import concentration_grabber as cg
 
     calls = {"n": 0}
+    sleeps: list[float] = []
     orig = cg.SemanticScentEngine._fetch_serp
+    orig_sleep = cg.time.sleep
     try:
+        # Record backoff sleeps instead of serving them: the contract under
+        # test is *when* the backoff fires, not wall-clock waiting.
+        cg.time.sleep = sleeps.append
+
         def loaded_but_empty(page, q, sf, timeout=None):
             calls["n"] += 1
             return []
@@ -1423,8 +1429,10 @@ def test_worker_fact_summary_and_serp_retry() -> None:
         cg.SemanticScentEngine._fetch_serp = staticmethod(loaded_but_empty)
         rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=3)
         check("empty SERP is returned without retrying", rows == [] and calls["n"] == 1, str(calls))
+        check("empty SERP never triggers backoff sleeps", sleeps == [], str(sleeps))
 
         calls["n"] = 0
+        sleeps.clear()
 
         def fetch_failed(page, q, sf, timeout=None):
             calls["n"] += 1
@@ -1433,8 +1441,10 @@ def test_worker_fact_summary_and_serp_retry() -> None:
         cg.SemanticScentEngine._fetch_serp = staticmethod(fetch_failed)
         rows = cg.SemanticScentEngine._retry_fetch(None, "q", "", attempts=2)
         check("fetch failures retry up to the attempt cap", rows == [] and calls["n"] == 2, str(calls))
+        check("failed fetches back off once between attempts", sleeps == [0.8], str(sleeps))
     finally:
         cg.SemanticScentEngine._fetch_serp = orig
+        cg.time.sleep = orig_sleep
 
     class _FakeWait:
         def __init__(self) -> None:

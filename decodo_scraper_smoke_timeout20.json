@@ -1,0 +1,38 @@
+{
+  "search_cases": [
+    {
+      "name": "fragrantica_naxos",
+      "query": "xerjoff naxos site:fragrantica.com/perfume",
+      "target": "fragrantica",
+      "elapsed_ms": 2393,
+      "accepted_count": 9,
+      "first_accepted_url": "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html",
+      "accepted_sample": [
+        "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html",
+        "https://www.fragrantica.com/perfume/Xerjoff/Avanguardia-135137.html",
+        "https://www.fragrantica.com/perfume/Xerjoff/7-Parfum-118410.html",
+        "https://www.fragrantica.com/perfume/Barberino-s/Naxos-94684.html",
+        "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Renaissance-12126.html"
+      ],
+      "expected_matched": true,
+      "error": null
+    }
+  ],
+  "image_case": {
+    "query": "xerjoff naxos fragrance bottle",
+    "elapsed_ms": 5476,
+    "candidate_count": 12,
+    "first_candidate": {
+      "title": "Xerjoff 1861 Naxos EDP Travel Size Spray Fragrance Lord Sample Decant 0.17 oz (5 ml)",
+      "imageUrl": "https://cdn.shopify.com/s/files/1/0318/9922/2149/files/3_745fddda-a857-4c51-a9ad-0f9842686940.png?v=1773897368",
+      "imageWidth": null,
+      "imageHeight": null,
+      "thumbnailUrl": null,
+      "source": "Venba Fragrance",
+      "link": "https://www.venbafragrance.com/products/xerjoff-1861-naxos-edp?srsltid=AfmBOop0gtiojG_ztCvooaJQEdPZ2_4xIkUJ9liR7C6j9WISUJfdCKIH",
+      "position": 1,
+      "source_provider": "decodo"
+    },
+    "error": null
+  }
+}

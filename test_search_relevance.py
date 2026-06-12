@@ -948,6 +948,54 @@ def test_serper_rotates_after_exhausted_key() -> None:
     )
 
 
+def test_serper_rotates_after_credit_exhausted_400() -> None:
+    print("Serper credit-exhausted 400 checks:")
+    engine.SerperClient._cache.clear()
+    saved = _set_serper_env(enabled=False)
+    old_post = engine.requests.post
+    old_pool = engine._SERPER_POOL
+    calls: list[str | None] = []
+    try:
+        os.environ["SERP_API_PROVIDER"] = "serper"
+        os.environ["SERPER_API_KEYS"] = "test-empty-credit-key,test-live-key"
+        engine._SERPER_POOL = engine.SerperKeyPool(rate_limit_cooldown_s=1.0)
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            api_key = (headers or {}).get("X-API-KEY")
+            calls.append(api_key)
+            if api_key == "test-empty-credit-key":
+                return _FakeSerperResponse(
+                    {"message": "Not enough credits", "statusCode": 400},
+                    status_code=400,
+                )
+            return _FakeSerperResponse(_SERPER_SAMPLE_PAYLOAD)
+
+        engine.requests.post = fake_post
+        urls = engine.SerperClient.search_fragrantica_urls("credit exhausted")
+        snapshot = engine.serper_key_pool().snapshot()
+    finally:
+        engine.requests.post = old_post
+        engine._SERPER_POOL = old_pool
+        _restore_serper_env(saved)
+
+    check(
+        "credit-exhausted 400 is followed by the next pool key",
+        calls == ["test-empty-credit-key", "test-live-key"],
+        str(calls),
+    )
+    check(
+        "rotation after credit-exhausted 400 still returns Serper results",
+        urls[:1] == ["https://www.fragrantica.com/perfume/Xerjoff/1861-Naxos-30529.html"],
+        str(urls),
+    )
+    key_statuses = [entry["status"] for entry in snapshot.get("keys", [])]
+    check(
+        "credit-exhausted 400 retires the empty key in diagnostics",
+        any(status == "retired" for status in key_statuses),
+        str(snapshot),
+    )
+
+
 def test_serper_disabled_without_env() -> None:
     print("Serper env-gating checks:")
     engine.SerperClient._cache.clear()
@@ -1104,6 +1152,7 @@ def main() -> int:
     test_serper_disabled_without_env()
     test_serper_enabled_with_key_only()
     test_serper_rotates_after_exhausted_key()
+    test_serper_rotates_after_credit_exhausted_400()
     test_serper_parses_fragrantica_urls()
     test_serper_caches_responses()
     test_initio_prives_serper_url_survives_merge()

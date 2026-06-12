@@ -1,0 +1,32 @@
+{
+  "search_cases": [
+    {
+      "name": "fragrantica_naxos",
+      "query": "xerjoff naxos site:fragrantica.com/perfume",
+      "target": "fragrantica",
+      "elapsed_ms": 8317,
+      "accepted_count": 0,
+      "first_accepted_url": null,
+      "accepted_sample": [],
+      "expected_matched": false,
+      "error": "ReadTimeout: HTTPSConnectionPool(host='scraper-api.decodo.com', port=443): Read timed out. (read timeout=8.0)"
+    }
+  ],
+  "image_case": {
+    "query": "xerjoff naxos fragrance bottle",
+    "elapsed_ms": 4771,
+    "candidate_count": 12,
+    "first_candidate": {
+      "title": "Xerjoff 1861 Naxos EDP Travel Size Spray Fragrance Lord Sample Decant 0.17 oz (5 ml)",
+      "imageUrl": "https://cdn.shopify.com/s/files/1/0318/9922/2149/files/3_745fddda-a857-4c51-a9ad-0f9842686940.png?v=1773897368",
+      "imageWidth": null,
+      "imageHeight": null,
+      "thumbnailUrl": null,
+      "source": "Venba Fragrance",
+      "link": "https://www.venbafragrance.com/products/xerjoff-1861-naxos-edp?srsltid=AfmBOop7sh9Uv4ifEQTjsgQxXgKBFg71PJfgWfxFxZkJtMxxADqTElCL",
+      "position": 1,
+      "source_provider": "decodo"
+    },
+    "error": null
+  }
+}
