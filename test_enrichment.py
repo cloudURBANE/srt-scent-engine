@@ -354,6 +354,10 @@ def test_fragrantica_clearance_session_lifecycle() -> None:
         def quit(self) -> None:
             self.quit_count += 1
 
+    class NoCookieFakePage(FakePage):
+        def cookies(self) -> list[dict[str, str]]:
+            return []
+
     class BadReplaySession:
         def get(self, _url: str, timeout: float = 5) -> requests.Response:
             return response(
@@ -405,6 +409,23 @@ def test_fragrantica_clearance_session_lifecycle() -> None:
         )
         check(
             "curl-invalid Fragrantica clearance is not saved as durable cache",
+            not cache_saves,
+            str(cache_saves),
+        )
+        if hasattr(minted_session, "close"):
+            minted_session.close()
+        minted_session = None
+
+        engine.ChromiumPage = NoCookieFakePage  # type: ignore[assignment]
+        cache_saves.clear()
+        minted_session = engine._mint_fragrantica_clearance()
+        check(
+            "mint accepts validated browser-backed session without reusable cookies",
+            isinstance(minted_session, engine._FragranticaBrowserSession),
+            str(type(minted_session)),
+        )
+        check(
+            "cookie-less browser-backed Fragrantica session is not saved as durable cache",
             not cache_saves,
             str(cache_saves),
         )
