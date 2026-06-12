@@ -500,7 +500,52 @@ class SemanticScentEngine:
         return []
 
     @staticmethod
-    def analyze(fragrance_name, use_cache=True):
+    def _new_serp_page(deadline=None):
+        co = ChromiumOptions()
+        co.set_argument('--window-position=-2000,-2000')
+        co.set_argument('--mute-audio')
+        co.set_argument('--disable-blink-features=AutomationControlled')
+        co.incognito()
+        page = ChromiumPage(co)
+        try:
+            # Bound every navigation; DrissionPage's defaults can leave a
+            # stalled DDG request blocking the worker far longer than the
+            # whole SERP pass is worth.
+            page.set.timeouts(
+                base=10,
+                page_load=SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
+                script=10,
+            )
+            page.set.load_mode.eager()
+        except Exception:
+            pass
+
+        try:
+            remaining = (
+                SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC
+                if deadline is None
+                else max(1.0, deadline - time.monotonic())
+            )
+            warmup_timeout = min(
+                SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
+                remaining,
+            )
+            page.get(
+                "https://html.duckduckgo.com/html/",
+                retry=0,
+                interval=0,
+                timeout=warmup_timeout,
+            )
+            page.wait.load_start(
+                timeout=min(SemanticScentEngine.SERP_RESULT_WAIT_TIMEOUT_SEC, warmup_timeout)
+            )
+            time.sleep(0.3)
+        except Exception:
+            pass
+        return page
+
+    @staticmethod
+    def analyze(fragrance_name, use_cache=True, page=None):
         fragrance_name = SemanticScentEngine._normalize(fragrance_name)
         print(f"{C}[SYS] Analyzing: '{fragrance_name}'...{Z}")
 
@@ -548,44 +593,10 @@ class SemanticScentEngine:
         sources_consulted = []
         per_source_rows = {}
 
-        page = None
+        owns_page = page is None
         try:
-            co = ChromiumOptions()
-            co.set_argument('--window-position=-2000,-2000')
-            co.set_argument('--mute-audio')
-            co.set_argument('--disable-blink-features=AutomationControlled')
-            co.incognito()
-            page = ChromiumPage(co)
-            try:
-                # Bound every navigation; DrissionPage's defaults can leave a
-                # stalled DDG request blocking the worker far longer than the
-                # whole SERP pass is worth.
-                page.set.timeouts(
-                    base=10,
-                    page_load=SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
-                    script=10,
-                )
-                page.set.load_mode.eager()
-            except Exception:
-                pass
-
-            try:
-                warmup_timeout = min(
-                    SemanticScentEngine.SERP_PAGE_LOAD_TIMEOUT_SEC,
-                    max(1.0, deadline - time.monotonic()),
-                )
-                page.get(
-                    "https://html.duckduckgo.com/html/",
-                    retry=0,
-                    interval=0,
-                    timeout=warmup_timeout,
-                )
-                page.wait.load_start(
-                    timeout=min(SemanticScentEngine.SERP_RESULT_WAIT_TIMEOUT_SEC, warmup_timeout)
-                )
-                time.sleep(0.3)
-            except Exception:
-                pass
+            if page is None:
+                page = SemanticScentEngine._new_serp_page(deadline)
 
             for label, site_filter in source_queries:
                 elapsed = time.monotonic() - t0
@@ -613,9 +624,10 @@ class SemanticScentEngine:
         except Exception as e:
             print(f"  {E}[ERR] Browser failure: {e}{Z}")
         finally:
-            try:
-                if page: page.quit()
-            except Exception: pass
+            if owns_page:
+                try:
+                    if page: page.quit()
+                except Exception: pass
 
         # 5. Patch 5 & 6: Source Tier Score + Decay resolution map matrix
         votes = {k: 0.0 for k in SemanticScentEngine.TAXONOMY.keys()}

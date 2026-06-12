@@ -742,6 +742,63 @@ def test_concentration_pipeline() -> None:
         str(resolved),
     )
 
+    # 2b. Worker-managed SERP state reuses one concentration browser page for
+    # unresolved tier-2 lookups instead of booting Chromium once per job.
+    import concentration_grabber as cg
+
+    class FakeConcentrationPage:
+        def __init__(self) -> None:
+            self.quit_count = 0
+
+        def quit(self) -> None:
+            self.quit_count += 1
+
+    class FakeProfile:
+        primary_concentration = "EDP (Eau de Parfum)"
+        primary_confidence = 60
+
+    fake_pages: list[FakeConcentrationPage] = []
+    analyze_pages: list[object] = []
+    old_new_serp_page = cg.SemanticScentEngine._new_serp_page
+    old_analyze = cg.SemanticScentEngine.analyze
+    try:
+        def fake_new_serp_page(_deadline=None):
+            page = FakeConcentrationPage()
+            fake_pages.append(page)
+            return page
+
+        def fake_analyze(_query, use_cache=True, page=None):
+            analyze_pages.append(page)
+            return FakeProfile()
+
+        cg.SemanticScentEngine._new_serp_page = staticmethod(fake_new_serp_page)
+        cg.SemanticScentEngine.analyze = staticmethod(fake_analyze)
+        serp_state = enrichment_worker.ConcentrationSerpState(enabled=True)
+        first = enrichment_worker._resolve_concentration(
+            "No Prior House", "Made Up One", serp_state=serp_state
+        )
+        second = enrichment_worker._resolve_concentration(
+            "No Prior House", "Made Up Two", serp_state=serp_state
+        )
+        serp_state.close()
+    finally:
+        cg.SemanticScentEngine._new_serp_page = old_new_serp_page
+        cg.SemanticScentEngine.analyze = old_analyze
+    check(
+        "worker reuses concentration SERP browser across unresolved jobs",
+        len(fake_pages) == 1
+        and analyze_pages == [fake_pages[0], fake_pages[0]]
+        and first and second
+        and first["concentration"] == "Eau de Parfum"
+        and second["concentration"] == "Eau de Parfum",
+        detail=f"pages={len(fake_pages)} analyze_pages={analyze_pages}",
+    )
+    check(
+        "worker closes reusable concentration SERP browser",
+        fake_pages and fake_pages[0].quit_count == 1,
+        detail=repr([p.quit_count for p in fake_pages]),
+    )
+
     # 3. _apply_concentration injects into payload + raw_identity.
     worker_payload = {"raw_identity": {"name": "Imaginary Extrait de Parfum"}}
     enrichment_worker._apply_concentration(
