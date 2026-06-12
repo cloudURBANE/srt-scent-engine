@@ -3203,6 +3203,7 @@ class DecodoScraperClient:
         "DECODO_API_BASIC_TOKEN",
         "DECODO_SCRAPER_BASIC_TOKEN",
         "DECODO_BASIC_TOKEN",
+        "DECODO_AUTH_TOKEN",
     )
     _USERNAME_PASSWORD_ENV = (
         ("DECODO_API_USERNAME", "DECODO_API_PASSWORD"),
@@ -3244,16 +3245,30 @@ class DecodoScraperClient:
         return TextSanitizer.normalize_identity(query)
 
     @staticmethod
+    def _credential_env(name: str) -> str:
+        value = os.environ.get(name)
+        if value is None:
+            # Credentials are often saved mixed-case in deployment dashboards
+            # (e.g. Decodo_Username); Linux environments are case-sensitive,
+            # so fall back to a case-insensitive scan.
+            lowered = name.lower()
+            for key, candidate in os.environ.items():
+                if key.lower() == lowered:
+                    value = candidate
+                    break
+        return value or ""
+
+    @staticmethod
     def _auth_header() -> str:
         for name in DecodoScraperClient._BASIC_TOKEN_ENV:
-            token = (os.environ.get(name) or "").strip()
+            token = DecodoScraperClient._credential_env(name).strip()
             if token:
                 if token.lower().startswith("basic "):
                     token = token[6:].strip()
                 return f"Basic {token}"
         for user_key, password_key in DecodoScraperClient._USERNAME_PASSWORD_ENV:
-            username = (os.environ.get(user_key) or "").strip()
-            password = os.environ.get(password_key) or ""
+            username = DecodoScraperClient._credential_env(user_key).strip()
+            password = DecodoScraperClient._credential_env(password_key)
             if username and password:
                 token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
                 return f"Basic {token}"

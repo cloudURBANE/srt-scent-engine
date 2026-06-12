@@ -80,6 +80,10 @@ SERP_API_PROVIDER=decodo  # optional; leaving it unset also defaults to Decodo
 DECODO_API_BASIC_TOKEN=<base64 username:password>
 ```
 
+`DECODO_AUTH_TOKEN`, `DECODO_SCRAPER_BASIC_TOKEN`, and `DECODO_BASIC_TOKEN` are
+accepted aliases for the token variable, and all credential names are matched
+case-insensitively (e.g. `Decodo_auth_token` works).
+
 Alternatively, provide username/password credentials and let the engine build the
 Basic token:
 
