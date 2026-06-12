@@ -4164,14 +4164,12 @@ def _mint_fragrantica_clearance():
 
         cookies = _browser_page_cookies(page)
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
-        if not cookies:
-            _FRAGRANTICA_LAST_MINT_ERROR = "Mint completed without reusable Fragrantica cookies."
-            return None
-        session = _new_fragrantica_http_session(user_agent, cookies)
-        if session is not None and _validate_fragrantica_session(session):
-            _save_fragrantica_cache(user_agent, cookies)
-            _FRAGRANTICA_LAST_MINT_ERROR = None
-            return session
+        if cookies:
+            session = _new_fragrantica_http_session(user_agent, cookies)
+            if session is not None and _validate_fragrantica_session(session):
+                _save_fragrantica_cache(user_agent, cookies)
+                _FRAGRANTICA_LAST_MINT_ERROR = None
+                return session
         browser_session = _FragranticaBrowserSession(
             page,
             user_agent,
@@ -4186,7 +4184,10 @@ def _mint_fragrantica_clearance():
             return browser_session
         browser_session.close()
         page = None
-        _FRAGRANTICA_LAST_MINT_ERROR = "Minted Fragrantica cookies failed HTTP replay and browser-session validation."
+        if cookies:
+            _FRAGRANTICA_LAST_MINT_ERROR = "Minted Fragrantica cookies failed HTTP replay and browser-session validation."
+        else:
+            _FRAGRANTICA_LAST_MINT_ERROR = "Minted Fragrantica browser session failed validation."
         return None
     except Exception as exc:
         _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
