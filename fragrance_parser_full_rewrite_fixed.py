@@ -812,7 +812,14 @@ class IdentityTools:
                 return ""
             if any(IdentityTools.compatible_brand(lead, form) for form in IdentityTools.brand_forms(house)):
                 return ""
-        return cleaned.split()[0]
+        # `tokens` is stopword-filtered, so cleaned.split()[0] can be a dropped
+        # stopword ("Le Beau ..." -> lead "beau" but split()[0] "Le"), which
+        # produced junk pseudo-brand crawls like /designers/Le.html. A name that
+        # starts with a stopword has no leading product-line label at all.
+        first_word = cleaned.split()[0]
+        if TextSanitizer.normalize_identity(first_word) != lead:
+            return ""
+        return first_word
 
     @staticmethod
     def sub_brand_from_bn_slug(bn_url: str) -> str:
@@ -5093,6 +5100,16 @@ class IdentityCache:
 
 class SearchSniper:
     _designer_catalog_cache: dict[str, list[CatalogItem]] = {}
+    # Thread-local diagnostic for the last catalog_candidates_for_brand call:
+    # True when every designer-page fetch failed outright (network error,
+    # 403/429 block, timeout), as opposed to pages that loaded but listed no
+    # perfumes. Callers use this to keep "couldn't reach the catalog" from
+    # being mistaken for "the perfume does not exist on Fragrantica".
+    _catalog_fetch_health = threading.local()
+
+    @staticmethod
+    def last_catalog_fetch_failed() -> bool:
+        return bool(getattr(SearchSniper._catalog_fetch_health, "all_failed", False))
     
     @staticmethod
     def apply_cache(candidates: list[UnifiedFragrance], cache: IdentityCache) -> int:
@@ -5164,14 +5181,23 @@ class SearchSniper:
             cleaned = TextSanitizer.clean(form)
             if not cleaned:
                 continue
-            title_slug = re.sub(r"\s+", "-", cleaned.strip()).title()
-            plain_slug = re.sub(r"\s+", "-", cleaned.strip())
-            no_punct = re.sub(r"[^A-Za-z0-9\s-]", "", cleaned)
-            no_punct_slug = re.sub(r"\s+", "-", no_punct.strip()).title()
-            for slug in (title_slug, plain_slug, no_punct_slug):
-                slug = slug.strip("-")
-                if slug and slug not in slugs:
-                    slugs.append(slug)
+            # Fragrantica designer slugs are ASCII ("Le-Jardin-Retrouve"), so an
+            # accent-transliterated form must be tried; stripping non-ASCII
+            # outright ("Le-Jardin-Retrouv") misses the page.
+            unaccented = "".join(
+                ch for ch in unicodedata.normalize("NFKD", cleaned)
+                if not unicodedata.combining(ch)
+            )
+            variants = [cleaned] if unaccented == cleaned else [unaccented, cleaned]
+            for text in variants:
+                title_slug = re.sub(r"\s+", "-", text.strip()).title()
+                plain_slug = re.sub(r"\s+", "-", text.strip())
+                no_punct = re.sub(r"[^A-Za-z0-9\s-]", "", text)
+                no_punct_slug = re.sub(r"\s+", "-", no_punct.strip()).title()
+                for slug in (title_slug, plain_slug, no_punct_slug):
+                    slug = slug.strip("-")
+                    if slug and slug not in slugs:
+                        slugs.append(slug)
         return slugs[: max(1, limit)]
         
     @staticmethod
@@ -5184,6 +5210,7 @@ class SearchSniper:
         trace: ResolverTrace | None = None,
     ) -> list[CatalogItem]:
         brand_key = TextSanitizer.normalize_identity(brand)
+        SearchSniper._catalog_fetch_health.all_failed = False
         if brand_key in SearchSniper._designer_catalog_cache:
             cached = SearchSniper._designer_catalog_cache[brand_key]
             if trace:
@@ -5197,6 +5224,7 @@ class SearchSniper:
             return []
         catalog: list[CatalogItem] = []
         seen: set[str] = set()
+        pages_loaded = 0
         token = trace.start("designer_catalog", brand=brand, deadline=deadline) if trace else None
         for slug in slug_candidates:
             if deadline.expired():
@@ -5212,6 +5240,7 @@ class SearchSniper:
             )
             if not res:
                 continue
+            pages_loaded += 1
             soup = BeautifulSoup(res.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = FragranticaEngine.canonical_url(a.get("href", ""))
@@ -5236,6 +5265,7 @@ class SearchSniper:
                 )
             if catalog:
                 break
+        SearchSniper._catalog_fetch_health.all_failed = pages_loaded == 0
         if catalog:
             SearchSniper._designer_catalog_cache[brand_key] = catalog
         if trace and token:

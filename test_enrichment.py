@@ -1778,6 +1778,245 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
     )
 
 
+def test_worker_resolver_hardening() -> None:
+    """New resolver hardening: garbled-name repair variants, recombined
+    house/line identities, year-confirmed subset acceptance, blocked-catalog
+    retryability, and the job-pinned Parfumo URL path. No network, no DB."""
+    print("\nWorker resolver hardening:")
+    w = enrichment_worker
+    engine = w.engine
+
+    # --- apostrophe garble repair -------------------------------------------------
+    check(
+        "apostrophe repair fixes d'/l' elisions",
+        w._apostrophe_repaired_name("Parfum Dhabit") == "Parfum d'Habit"
+        and w._apostrophe_repaired_name("Ombre Rose Loriginal") == "Ombre Rose l'Original"
+        and w._apostrophe_repaired_name("Terre Dhermes Eau Intense Vetiver").startswith("Terre d'Hermes"),
+        detail=repr(w._apostrophe_repaired_name("Parfum Dhabit")),
+    )
+    check(
+        "apostrophe repair leaves clean names alone",
+        w._apostrophe_repaired_name("Sauvage Elixir") == ""
+        and w._apostrophe_repaired_name("") == "",
+    )
+    variants = w._query_variants(
+        {"house": "Maitre Parfumeur Et Gantier", "name": "Parfum Dhabit"}
+    )
+    check(
+        "query variants include the apostrophe-repaired form",
+        any("d'Habit" in v for v in variants),
+        detail=repr(variants),
+    )
+
+    # --- recombined house/line identities ------------------------------------------
+    recombined = w._recombined_identities(
+        {"house": "The Fireplace By Martin Margiela", "name": "Replica"}
+    )
+    check(
+        "swapped house/line recombines into brand + line name",
+        recombined == [("Martin Margiela", "Replica The Fireplace")],
+        detail=repr(recombined),
+    )
+    check(
+        "houses that merely start with By do not recombine",
+        w._recombined_identities({"house": "By Kilian", "name": "Black Phantom"}) == [],
+    )
+    margiela_variants = w._query_variants(
+        {"house": "The Fireplace By Martin Margiela", "name": "Replica"}
+    )
+    check(
+        "query variants include the recombined identity",
+        any("Martin Margiela Replica The Fireplace" in v for v in margiela_variants),
+        detail=repr(margiela_variants),
+    )
+
+    # --- The Body Shop house alias --------------------------------------------------
+    check(
+        "Body Shop aliases to The Body Shop",
+        w._canonical_house("Body Shop") == "The Body Shop",
+    )
+
+    # --- sub_brand_label no longer emits dropped stopwords --------------------------
+    check(
+        "sub_brand_label skips stopword-led names",
+        engine.IdentityTools.sub_brand_label("Le Beau Paradise Garden", "Jean Paul Gaultier") == "",
+        detail=repr(engine.IdentityTools.sub_brand_label("Le Beau Paradise Garden", "Jean Paul Gaultier")),
+    )
+    check(
+        "sub_brand_label still finds real sub-lines",
+        engine.IdentityTools.sub_brand_label("Casamorati Mefisto", "Bulgari") == "Casamorati",
+        detail=repr(engine.IdentityTools.sub_brand_label("Casamorati Mefisto", "Bulgari")),
+    )
+
+    # --- unaccented designer slugs ---------------------------------------------------
+    slugs = engine.SearchSniper.designer_slug_candidates("Le Jardin Retrouvé", limit=8)
+    check(
+        "designer slugs include the unaccented form",
+        any(s == "Le-Jardin-Retrouve" for s in slugs),
+        detail=repr(slugs),
+    )
+
+    # --- year-confirmed subset acceptance in the catalog tier ------------------------
+    vetiver_url = "https://www.fragrantica.com/perfume/Clive-Christian/1872-Vetiver-39179.html"
+    subset_catalog = [
+        engine.CatalogItem(name="1872 Vetiver", brand="Clive Christian", year="2016", url=vetiver_url),
+        engine.CatalogItem(name="1872 Mandarin", brand="Clive Christian", year="2016",
+                           url="https://www.fragrantica.com/perfume/Clive-Christian/1872-Mandarin-39178.html"),
+    ]
+
+    def fake_subset_catalog(scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None):
+        return subset_catalog
+
+    old_catalog = engine.SearchSniper.catalog_candidates_for_brand
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(fake_subset_catalog)
+    try:
+        hit = w._designer_catalog_candidate(
+            None, {"house": "Clive Christian", "name": "1872 Twist Vetiver", "year": 2016}
+        )
+        no_year = w._designer_catalog_candidate(
+            None, {"house": "Clive Christian", "name": "1872 Twist Vetiver"}
+        )
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check(
+        "unique subset match with exact year is accepted",
+        hit is not None and hit.frag_url == vetiver_url
+        and hit.resolver_source == "worker_designer_catalog_subset",
+        detail=repr(getattr(hit, "frag_url", None)),
+    )
+    check(
+        "subset match without year confirmation is rejected",
+        no_year is None,
+        detail=repr(no_year),
+    )
+
+    # The flanker shape must never subset-accept: catalog has extra non-stopword
+    # tokens ("Sauvage" probe vs "Sauvage Elixir" row).
+    flanker_catalog = [
+        engine.CatalogItem(name="Sauvage Elixir", brand="Dior", year="2021",
+                           url="https://www.fragrantica.com/perfume/Dior/Sauvage-Elixir-67110.html"),
+    ]
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(
+        lambda scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None: flanker_catalog
+    )
+    try:
+        flanker = w._designer_catalog_candidate(
+            None, {"house": "Dior", "name": "Sauvage", "year": 2021}
+        )
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check("base name never subset-accepts a flanker row", flanker is None, detail=repr(flanker))
+
+    # Stopword-only difference is accepted even without years ("Lys" vs "The Lys").
+    lys_url = "https://www.fragrantica.com/perfume/Le-Jardin-Retrouve/The-Lys-7256.html"
+    lys_catalog = [
+        engine.CatalogItem(name="The Lys", brand="Le Jardin Retrouve", year="", url=lys_url),
+        engine.CatalogItem(name="Citron Boboli", brand="Le Jardin Retrouve", year="1977",
+                           url="https://www.fragrantica.com/perfume/Le-Jardin-Retrouve/Citron-Boboli-7261.html"),
+    ]
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(
+        lambda scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None: lys_catalog
+    )
+    try:
+        lys = w._designer_catalog_candidate(
+            None, {"house": "Le Jardin Retrouve", "name": "Lys", "year": 1989}
+        )
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check(
+        "stopword-only name difference is accepted",
+        lys is not None and lys.frag_url == lys_url,
+        detail=repr(getattr(lys, "frag_url", None)),
+    )
+
+    # --- blocked catalog window => retryable fg_resolver_blocked ---------------------
+    def fake_blocked_catalog(scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None):
+        engine.SearchSniper._catalog_fetch_health.all_failed = True
+        return []
+
+    def fake_empty_search(scraper, query, args, *, debug=False):
+        return []
+
+    old_search = w._search_candidates
+    old_parfumo_enabled = engine.ParfumoEngine.enabled
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(fake_blocked_catalog)
+    w._search_candidates = fake_empty_search
+    engine.ParfumoEngine.enabled = staticmethod(lambda: False)
+    blocked_code = terminal_code = None
+    try:
+        args = w._build_engine_args()
+        try:
+            w.resolve_candidate(None, args, {"house": "Chanel", "name": "No 5 Eau Premiere", "failure_count": 9})
+        except w.WorkerError as exc:
+            blocked_code = (exc.code, exc.retryable)
+        # And when the catalog genuinely loads but has no match, the old
+        # terminal behavior is preserved.
+        engine.SearchSniper.catalog_candidates_for_brand = staticmethod(
+            lambda scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None: (
+                setattr(engine.SearchSniper._catalog_fetch_health, "all_failed", False) or []
+            )
+        )
+        try:
+            w.resolve_candidate(None, args, {"house": "Chanel", "name": "No 5 Eau Premiere", "failure_count": 9})
+        except w.WorkerError as exc:
+            terminal_code = (exc.code, exc.retryable)
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+        w._search_candidates = old_search
+        engine.ParfumoEngine.enabled = old_parfumo_enabled
+    check(
+        "blocked designer catalog raises retryable fg_resolver_blocked",
+        blocked_code == ("fg_resolver_blocked", True),
+        detail=repr(blocked_code),
+    )
+    check(
+        "a loaded-but-no-match catalog still goes terminal after grace",
+        terminal_code == ("fg_url_missing_after_resolution", False),
+        detail=repr(terminal_code),
+    )
+
+    # --- job-pinned Parfumo URL ------------------------------------------------------
+    parfumo_url = "https://www.parfumo.com/Perfumes/Clive_Christian/the-art-of-travel-collection-miami-poolside"
+    rec = engine.ParfumoRecord(
+        url=parfumo_url,
+        name="The Art of Travel Collection - Miami Poolside",
+        house="Clive Christian",
+        year="2019",
+        notes_flat=["Lime", "Mint"],
+    )
+    old_fetch = engine.ParfumoEngine.fetch_record
+    engine.ParfumoEngine.enabled = staticmethod(lambda: True)
+    engine.ParfumoEngine.fetch_record = staticmethod(lambda scraper, url, timeout=15.0: rec)
+    try:
+        pinned = w._parfumo_candidate_from_job_url(
+            None,
+            {"house": "Clive Christian", "name": "Miami Poolside", "year": 2019, "fg_url": parfumo_url},
+        )
+        not_pinned = w._parfumo_candidate_from_job_url(
+            None, {"house": "Clive Christian", "name": "Miami Poolside", "year": 2019}
+        )
+        mismatched = w._parfumo_candidate_from_job_url(
+            None,
+            {"house": "Chanel", "name": "Totally Different Perfume", "fg_url": parfumo_url},
+        )
+    finally:
+        engine.ParfumoEngine.fetch_record = old_fetch
+        engine.ParfumoEngine.enabled = old_parfumo_enabled
+    check(
+        "job-pinned Parfumo URL resolves to a parfumo_fallback candidate",
+        pinned is not None
+        and pinned.resolver_source == "parfumo_fallback"
+        and getattr(pinned, "parfumo_record", None) is rec,
+        detail=repr(getattr(pinned, "resolver_source", None)),
+    )
+    check("no pinned URL means no direct-Parfumo candidate", not_pinned is None)
+    check(
+        "identity mismatch rejects the pinned Parfumo URL",
+        mismatched is None,
+        detail=repr(mismatched),
+    )
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE
@@ -2036,6 +2275,7 @@ def main() -> int:
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
     test_worker_url_gating_catalog_tier_and_retirement()
+    test_worker_resolver_hardening()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()
