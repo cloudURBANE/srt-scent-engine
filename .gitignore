@@ -20,6 +20,7 @@ ipc_out.txt
 out/
 .black_sun_cache.json
 .fragrantica_clearance_cache.json
+.fragrantica_chrome_profile/
 
 # Scratch / throwaway investigation scripts (keep these out of the repo)
 scratch/

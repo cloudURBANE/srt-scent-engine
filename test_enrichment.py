@@ -274,6 +274,22 @@ def test_fragrantica_challenge_and_static_parse() -> None:
     finally:
         engine.Http.get = original_get
 
+    interstitial = FakeResponse(
+        """
+        <!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>
+        <meta http-equiv="refresh" content="360">
+        <script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1?ray=a0a5"></script>
+        </head><body>
+        <noscript><span id="challenge-error-text">Enable JavaScript and cookies to continue</span></noscript>
+        <script>window._cf_chl_opt = {cvId: "3"};</script>
+        </body></html>
+        """
+    )
+    check(
+        "real-shape CF interstitial (orchestrate/chl_page) is detected",
+        bool(engine._response_has_challenge(interstitial)),
+    )
+
     static_page = FakeResponse(
         """
         <html><body>
@@ -288,6 +304,21 @@ def test_fragrantica_challenge_and_static_parse() -> None:
     check(
         "normal Fragrantica detail HTML is not a challenge",
         not engine._response_has_challenge(static_page),
+    )
+
+    cleared_page = FakeResponse(
+        """
+        <html><head><title>Royal Sapphire Thameen perfume</title></head><body>
+          <h1>Royal Sapphire Thameen for women and men</h1>
+          <form action="/login"><div class="cf-turnstile" data-sitekey="x"></div></form>
+          <p>Perfume rating 4.21 out of 5 with 466 votes</p>
+          <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+        </body></html>
+        """
+    )
+    check(
+        "cleared page with CF telemetry + Turnstile login widget is not a challenge",
+        not engine._response_has_challenge(cleared_page),
     )
 
     try:

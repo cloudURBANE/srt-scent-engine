@@ -3221,22 +3221,29 @@ _BASENOTES_CACHE_FILE = Path(
         str(Path(__file__).with_name(".black_sun_cache.json")),
     )
 )
+# Markers must be unique to Cloudflare interstitial/block shells. Cleared pages
+# still embed CF telemetry (/cdn-cgi/challenge-platform/scripts/jsd/main.js) and
+# can render Turnstile widgets in login forms, so generic substrings such as
+# "challenge-platform" or "turnstile" misclassify healthy pages as challenges
+# and make every minted session look invalid.
 _HTTP_CHALLENGE_MARKERS = (
-    "just a moment",
-    "attention required",
     "cf-challenge",
     "cf-browser-verification",
-    "/cdn-cgi/challenge-platform",
-    "challenge-platform",
-    "cf-turnstile",
-    "turnstile",
+    "_cf_chl_opt",
+    "challenge-error-text",
     "checking if the site connection is secure",
     "verify you are human",
     "verifying you are human",
-    "enable javascript and cookies",
-    "enable cookies and javascript",
-    "cloudflare ray id",
+    "needs to review the security of your connection",
+    "enable javascript and cookies to continue",
 )
+# Interstitials load /cdn-cgi/challenge-platform/h/<x>/orchestrate/...; normal
+# pages only load /cdn-cgi/challenge-platform/scripts/jsd/main.js telemetry.
+_CF_CHALLENGE_ORCHESTRATE_RE = re.compile(
+    r"/cdn-cgi/challenge-platform/[^\"']*/orchestrate/", re.I
+)
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.{0,300}?)</title>", re.I | re.S)
+_CHALLENGE_TITLE_MARKERS = ("just a moment", "attention required", "access denied")
 _BASENOTES_SESSION_LOCK = threading.Lock()
 _BASENOTES_SESSION_REQUEST_LOCK = threading.Lock()
 _BASENOTES_SESSION = None
@@ -3377,6 +3384,74 @@ def _terminate_process_tree(proc: Any, *, timeout: float = 3.0) -> None:
             proc.wait(timeout=2)
     except Exception:
         pass
+
+
+def _try_click_cf_turnstile(page: Any) -> bool:
+    """Best-effort click on the Cloudflare Turnstile checkbox.
+
+    Cloudflare's managed challenge is interactive: it never auto-clears, the
+    widget has to be ticked. The checkbox lives behind nested shadow roots and
+    a cross-origin iframe, so locate it from the hidden cf-turnstile-response
+    input and descend through the widget's shadow root.
+
+    The widget renders a second or two after the shell loads, so early calls
+    legitimately find nothing — callers retry every second. Every lookup here
+    must stay non-blocking (timeout=0 / capped element waits): one implicit
+    DrissionPage wait per missing node multiplies into minutes and starves the
+    mint deadline, which is precisely how passive waiting failed before.
+    """
+    # Cap implicit waits for relative lookups; restored before returning.
+    old_timeout = None
+    try:
+        old_timeout = float(page.timeout)
+        page.set.timeouts(base=1)
+    except Exception:
+        old_timeout = None
+    try:
+        try:
+            inputs = page.eles("tag:input", timeout=0)
+        except Exception:
+            return False
+        if len(inputs) > 10:
+            # Interstitial shells carry at most a couple of inputs; a
+            # form-heavy page is real content, not a challenge.
+            return False
+        for ele in inputs:
+            try:
+                attrs = ele.attrs or {}
+                if str(attrs.get("type") or "") != "hidden":
+                    continue
+                if "turnstile" not in str(attrs.get("name") or ""):
+                    continue
+                wrapper = ele.parent()
+                button = wrapper.shadow_root.child()("tag:body").sr("tag:input")
+                if button:
+                    button.click()
+                    return True
+            except Exception:
+                continue
+        # Fallback: a raw mouse click at the checkbox area of the widget.
+        # Turnstile honours CDP Input events (they are trusted); the checkbox
+        # sits ~30px from the widget's left edge at half height.
+        for locator in ("#turnstile-wrapper", ".cf-turnstile", "@data-sitekey"):
+            try:
+                wrapper = page.ele(locator, timeout=0)
+                if not wrapper:
+                    continue
+                width, height = wrapper.rect.size
+                if width <= 0 or height <= 0:
+                    continue
+                wrapper.click.at(offset_x=int(min(30, width / 2)), offset_y=int(height / 2))
+                return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if old_timeout is not None:
+            try:
+                page.set.timeouts(base=old_timeout)
+            except Exception:
+                pass
 
 
 def _mint_clearance_with_raw_cdp(
@@ -3532,12 +3607,24 @@ def _mint_clearance_with_raw_cdp(
         result["step"] = "browser_get_version"
         version = cdp("Browser.getVersion").get("result", {})
         reported_user_agent = str(version.get("userAgent") or "")
-        match = _CHROMIUM_UA_RE.search(reported_user_agent)
-        chrome_version = match.group(2) if match else "122.0.6261.69"
-        user_agent = (
-            f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
-        )
+        # Keep the browser's real platform: a Linux UA from a Windows Chrome
+        # contradicts the Sec-CH-UA client hints and flags the session as a
+        # bot. Only the "Headless" token needs scrubbing.
+        user_agent = reported_user_agent.replace("HeadlessChrome/", "Chrome/").strip()
+        if not user_agent:
+            match = _CHROMIUM_UA_RE.search(reported_user_agent)
+            chrome_version = match.group(2) if match else "122.0.6261.69"
+            user_agent = (
+                f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
+            )
+        ua_lower = user_agent.lower()
+        if "windows" in ua_lower:
+            ua_platform = "Win32"
+        elif "mac os" in ua_lower or "macintosh" in ua_lower:
+            ua_platform = "MacIntel"
+        else:
+            ua_platform = "Linux x86_64"
         result["step"] = "create_target"
         target = cdp("Target.createTarget", {"url": "about:blank"}).get("result", {})
         target_id = target.get("targetId")
@@ -3564,7 +3651,7 @@ def _mint_clearance_with_raw_cdp(
             {
                 "userAgent": user_agent,
                 "acceptLanguage": "en-US,en;q=0.9",
-                "platform": "Linux x86_64",
+                "platform": ua_platform,
             },
             session_id=session_id,
         )
@@ -3660,6 +3747,13 @@ def _response_has_challenge(res: Any) -> bool:
     if status in {403, 429}:
         return True
     head = body[:20000].lower()
+    title_match = _HTML_TITLE_RE.search(head)
+    if title_match and any(
+        marker in title_match.group(1) for marker in _CHALLENGE_TITLE_MARKERS
+    ):
+        return True
+    if _CF_CHALLENGE_ORCHESTRATE_RE.search(head):
+        return True
     return any(marker in head for marker in _HTTP_CHALLENGE_MARKERS)
 
 
@@ -3775,6 +3869,7 @@ class _FragranticaBrowserSession:
 
             response = _browser_page_text_response(self._page, url)
             while _response_has_challenge(response) and time.monotonic() < deadline:
+                _try_click_cf_turnstile(self._page)
                 time.sleep(1)
                 response = _browser_page_text_response(self._page, url)
             page_cookies = _browser_page_cookies(self._page)
@@ -3914,11 +4009,12 @@ def _mint_basenotes_clearance():
         page = ChromiumPage(options)
         page.get("https://basenotes.com/")
 
-        wait_seconds = int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "20") or "20")
+        wait_seconds = int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "30") or "30")
         for _ in range(max(1, wait_seconds)):
             title = str(getattr(page, "title", "") or "")
             if not any(marker in title.lower() for marker in ("just a moment", "attention required")):
                 break
+            _try_click_cf_turnstile(page)
             time.sleep(1)
 
         cookie_data = page.cookies()
@@ -4074,6 +4170,27 @@ def _validate_fragrantica_session(session: Any) -> bool:
         return False
 
 
+def _fragrantica_profile_dir() -> str:
+    """Persistent Chrome profile for clearance mints.
+
+    A throwaway profile starts every mint with zero cookies and zero
+    reputation, so Cloudflare challenges it from scratch each time. Reusing
+    one profile keeps cf_clearance and the solved-challenge reputation across
+    restarts, which is exactly why a regular desktop browser sails through.
+    Returns "" when persistence is disabled or the dir cannot be created.
+    """
+    if _env_truthy("FRAGRANTICA_EPHEMERAL_PROFILE"):
+        return ""
+    path = os.environ.get("FRAGRANTICA_CHROME_PROFILE", "").strip() or str(
+        _FRAGRANTICA_CACHE_FILE.with_name(".fragrantica_chrome_profile")
+    )
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception:
+        return ""
+
+
 def _mint_fragrantica_clearance():
     global _FRAGRANTICA_LAST_MINT_ERROR
     if _chromium_mint_disabled():
@@ -4084,11 +4201,12 @@ def _mint_fragrantica_clearance():
         return None
 
     page = None
-    cleanup_user_data_dir = True
+    persistent_profile = _fragrantica_profile_dir()
+    user_data_dir = persistent_profile or tempfile.mkdtemp(prefix="fg-chromium-")
+    user_data_dir_is_temp = not persistent_profile
+    cleanup_user_data_dir = user_data_dir_is_temp
     chromium_path = ""
-    user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
     try:
-        options = ChromiumOptions()
         chromium_path = (
             os.environ.get("FRAGRANTICA_CHROMIUM_PATH", "").strip()
             or os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
@@ -4124,35 +4242,51 @@ def _mint_fragrantica_clearance():
             _FRAGRANTICA_LAST_MINT_ERROR = "No Chromium binary discovered (env FRAGRANTICA_CHROMIUM_PATH/BASENOTES_CHROMIUM_PATH or common names in PATH)."
             return None
 
-        if chromium_path:
-            try:
-                options.set_browser_path(chromium_path)
-            except Exception as exc:
-                _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-        options.set_argument("--window-position=-2000,-2000")
-        options.set_argument("--mute-audio")
-        options.set_argument("--no-sandbox")
-        options.set_argument("--disable-dev-shm-usage")
-        options.set_argument("--disable-gpu")
-        options.set_argument("--disable-blink-features=AutomationControlled")
-        options.set_argument("--disable-extensions")
-        options.set_argument("--disable-component-extensions-with-background-pages")
-        options.set_argument("--disable-background-networking")
-        options.set_argument("--remote-allow-origins=*")
-        options.set_argument(f"--user-data-dir={user_data_dir}")
         headless_env = (
             os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
             or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
         )
-        if headless_env.lower() in {"1", "true", "yes"}:
-            options.headless(True)
-            options.set_argument("--headless=new")
-        options.auto_port()
 
-        page = ChromiumPage(options)
+        def _build_options(data_dir: str):
+            global _FRAGRANTICA_LAST_MINT_ERROR
+            opts = ChromiumOptions()
+            try:
+                opts.set_browser_path(chromium_path)
+            except Exception as exc:
+                _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+            opts.set_argument("--window-position=-2000,-2000")
+            opts.set_argument("--mute-audio")
+            opts.set_argument("--no-sandbox")
+            opts.set_argument("--disable-dev-shm-usage")
+            opts.set_argument("--disable-gpu")
+            opts.set_argument("--disable-blink-features=AutomationControlled")
+            opts.set_argument("--disable-extensions")
+            opts.set_argument("--disable-component-extensions-with-background-pages")
+            opts.set_argument("--disable-background-networking")
+            opts.set_argument("--remote-allow-origins=*")
+            opts.set_argument(f"--user-data-dir={data_dir}")
+            if headless_env.lower() in {"1", "true", "yes"}:
+                opts.headless(True)
+                opts.set_argument("--headless=new")
+            opts.auto_port()
+            return opts
+
+        try:
+            page = ChromiumPage(_build_options(user_data_dir))
+        except Exception:
+            if user_data_dir_is_temp:
+                raise
+            # The persistent profile is likely locked by a still-running
+            # browser session; mint on a throwaway profile instead.
+            user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
+            user_data_dir_is_temp = True
+            cleanup_user_data_dir = True
+            page = ChromiumPage(_build_options(user_data_dir))
         page.get("https://www.fragrantica.com/")
 
-        wait_seconds = int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")
+        # Cloudflare's managed challenge is interactive — it will not clear
+        # without the Turnstile checkbox being ticked, so click while waiting.
+        wait_seconds = int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "60") or "60")
         wait_until = time.monotonic() + max(1, wait_seconds)
         while True:
             page_res = _browser_page_text_response(page, "https://www.fragrantica.com/")
@@ -4160,6 +4294,7 @@ def _mint_fragrantica_clearance():
                 break
             if time.monotonic() >= wait_until:
                 break
+            _try_click_cf_turnstile(page)
             time.sleep(1)
 
         cookies = _browser_page_cookies(page)
@@ -4175,7 +4310,7 @@ def _mint_fragrantica_clearance():
             user_agent,
             cookies,
             user_data_dir=user_data_dir,
-            remove_user_data_dir=True,
+            remove_user_data_dir=user_data_dir_is_temp,
         )
         if _validate_fragrantica_session(browser_session):
             cleanup_user_data_dir = False
@@ -4191,37 +4326,45 @@ def _mint_fragrantica_clearance():
         return None
     except Exception as exc:
         _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:
+                pass
+            page = None
         _kill_chromiums_for_user_data_dir(user_data_dir)
         raw_minted = None
-        if shutil.which("xvfb-run"):
-            xvfb_user_data_dir = tempfile.mkdtemp(prefix="fg-xvfb-chromium-")
-            try:
+        # The raw-CDP retry gets its own fresh profile: the dir above may
+        # still be locked by the Chromium that just failed.
+        raw_user_data_dir = tempfile.mkdtemp(prefix="fg-cdp-chromium-")
+        try:
+            if shutil.which("xvfb-run"):
                 raw_minted = _mint_clearance_with_raw_cdp(
                     chromium_path=chromium_path,
                     site_url="https://www.fragrantica.com/",
-                    user_data_dir=xvfb_user_data_dir,
-                    wait_seconds=max(50, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
+                    user_data_dir=raw_user_data_dir,
+                    wait_seconds=max(50, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "60") or "60")),
                     headless=False,
                     display_mode="xvfb",
                 )
-            finally:
-                _kill_chromiums_for_user_data_dir(xvfb_user_data_dir)
-                try:
-                    shutil.rmtree(xvfb_user_data_dir, ignore_errors=True)
-                except Exception:
-                    pass
-        if raw_minted is None and not shutil.which("xvfb-run"):
-            raw_minted = _mint_clearance_with_raw_cdp(
-                chromium_path=chromium_path,
-                site_url="https://www.fragrantica.com/",
-                user_data_dir=user_data_dir,
-                wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")),
-                headless=(
-                    os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
-                    or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
-                ).lower() in {"1", "true", "yes"},
-                display_mode="headless",
-            )
+            else:
+                raw_minted = _mint_clearance_with_raw_cdp(
+                    chromium_path=chromium_path,
+                    site_url="https://www.fragrantica.com/",
+                    user_data_dir=raw_user_data_dir,
+                    wait_seconds=max(35, int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "60") or "60")),
+                    headless=(
+                        os.environ.get("FRAGRANTICA_CHROMIUM_HEADLESS")
+                        or os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "")
+                    ).lower() in {"1", "true", "yes"},
+                    display_mode="headless",
+                )
+        finally:
+            _kill_chromiums_for_user_data_dir(raw_user_data_dir)
+            try:
+                shutil.rmtree(raw_user_data_dir, ignore_errors=True)
+            except Exception:
+                pass
         if raw_minted is None:
             raw_result = _CLEARANCE_RAW_CDP_LAST_RESULT or {}
             _FRAGRANTICA_LAST_MINT_ERROR = (
