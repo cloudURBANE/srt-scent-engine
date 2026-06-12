@@ -1555,9 +1555,7 @@ class QueryRepair:
     def _seed_records_from_native_candidates(records: dict, original: str) -> None:
         for item in QueryRepair._LAST_NATIVE_CANDIDATES[:40]:
             url = QueryRepair._native_candidate_url(item)
-            print("[QR DEBUG native url]", url)
             candidate, domain, is_canonical = QueryRepair._canonical_candidate_from_url(url)
-            print("[QR DEBUG parsed]", candidate, domain, is_canonical)
             if is_canonical and candidate:
                 QueryRepair._add_candidate(records, candidate, source=domain or "native_fg", canonical=True)
                 continue

@@ -278,6 +278,57 @@ def test_api_cache_threshold_matches_engine() -> None:
     )
 
 
+def test_api_cache_fallback_uses_long_anchor_variants() -> None:
+    print("API typo anchor cache fallback checks:")
+    old_allow_search = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    old_allow_detail = api._ALLOW_BUNDLED_FG_DETAIL_CACHE
+    old_record_search = api.db.search_fragrance_records
+    old_detail_search = api.db.search_detail_cache
+    old_search_once = api.engine.search_once
+    calls: list[str] = []
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
+
+        def fake_record_search(query, limit=15):
+            calls.append(query)
+            if query.lower() != "montaig":
+                return []
+            return [
+                {
+                    "name": "Gris Dior Gris Montaigne",
+                    "house": "Christian Dior",
+                    "year": 2013,
+                    "bn_url": "https://basenotes.com/fragrances/gris-dior-gris-montaigne-by-christian-dior.26138833",
+                    "canonical_fg_url": "https://www.fragrantica.com/perfume/Dior/Gris-Montaigne-17842.html",
+                    "source_captured_at": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+
+        api.db.search_fragrance_records = fake_record_search
+        api.db.search_detail_cache = lambda query, limit=15: []
+        api.engine.search_once = lambda *args, **kwargs: []
+
+        response = api.search(q="Grizz Dior Grizz Montaig")
+    finally:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow_search
+        api._ALLOW_BUNDLED_FG_DETAIL_CACHE = old_allow_detail
+        api.db.search_fragrance_records = old_record_search
+        api.db.search_detail_cache = old_detail_search
+        api.engine.search_once = old_search_once
+
+    results = response.get("results", [])
+    diagnostics = response.get("diagnostics", {})
+    check("fallback tried the long typo anchor", "montaig" in calls, str(calls))
+    check("typo anchor fallback returns canonical Dior row", len(results) == 1, str(results))
+    check(
+        "fallback result is the expected fragrance",
+        bool(results) and results[0].get("name") == "Gris Dior Gris Montaigne",
+        str(results),
+    )
+    check("fallback source is aggregate DB", diagnostics.get("fallback_source") == "aggregate_db", str(diagnostics))
+
+
 def test_api_strong_cache_precheck_skips_live_identity_hit() -> None:
     print("API strong-cache precheck checks:")
     old_cache = api._ARGS.fg_cache
@@ -1229,6 +1280,7 @@ def main() -> int:
     test_aggregate_cache_search_does_not_expose_unproven_image()
     test_cache_identity_fill_rejects_sibling_image()
     test_api_cache_threshold_matches_engine()
+    test_api_cache_fallback_uses_long_anchor_variants()
     test_api_strong_cache_precheck_skips_live_identity_hit()
     test_api_strong_cache_precheck_does_not_bypass_brand_only()
     test_api_bn_only_cache_hit_does_not_skip_live_search()
