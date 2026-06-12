@@ -6,8 +6,6 @@ import fragrance_parser_full_rewrite_fixed as engine
 
 _SAVED_ENV_KEYS = (
     "SERP_API_PROVIDER",
-    "SERPER_API_KEY",
-    "SERPER_API_KEYS",
     "DECODO_API_BASIC_TOKEN",
     "DECODO_SCRAPER_BASIC_TOKEN",
     "DECODO_BASIC_TOKEN",
@@ -237,12 +235,10 @@ def test_decodo_username_password_auth_fallback() -> None:
 def test_structured_search_provider_selection() -> None:
     print("Structured search provider selection checks:")
     saved = _save_env()
-    old_pool = engine._SERPER_POOL
     try:
         _clear_decodo_env()
         os.environ["SERP_API_PROVIDER"] = "decodo"
         os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
-        os.environ["SERPER_API_KEY"] = "serper-test-key"
         check(
             "Decodo provider is selected when requested",
             engine.structured_search_provider() is engine.DecodoScraperClient,
@@ -250,16 +246,38 @@ def test_structured_search_provider_selection() -> None:
         )
 
         _clear_decodo_env()
-        os.environ["SERP_API_PROVIDER"] = "serper"
-        os.environ["SERPER_API_KEY"] = "serper-test-key"
-        engine._SERPER_POOL = engine.SerperKeyPool(rate_limit_cooldown_s=1.0)
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
         check(
-            "Serper provider remains selected for serper env",
-            engine.structured_search_provider() is engine.SerperClient,
+            "Decodo provider is the default when provider env is unset",
+            engine.structured_search_provider() is engine.DecodoScraperClient,
+            str(engine.structured_search_provider()),
+        )
+
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "   "
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+        check(
+            "Blank provider env defaults to Decodo",
+            engine.structured_search_provider() is engine.DecodoScraperClient,
+            str(engine.structured_search_provider()),
+        )
+
+        _clear_decodo_env()
+        check(
+            "No structured provider is selected without Decodo credentials",
+            engine.structured_search_provider() is None,
+            str(engine.structured_search_provider()),
+        )
+
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "serper"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+        check(
+            "Serper provider env no longer selects a structured provider",
+            engine.structured_search_provider() is None,
             str(engine.structured_search_provider()),
         )
     finally:
-        engine._SERPER_POOL = old_pool
         _restore_env(saved)
 
 

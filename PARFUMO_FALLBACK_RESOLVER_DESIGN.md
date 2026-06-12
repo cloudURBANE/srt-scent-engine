@@ -1,7 +1,7 @@
 # Parfumo Fallback Resolver — Feasibility & Design
 
 **Status:** implemented (gated, dormant by default). §6.A–§6.D are wired:
-`engine.ParfumoEngine` + a Parfumo-scoped Serper method (§6.A), the worker
+`engine.ParfumoEngine` + structured-provider Parfumo discovery (§6.A), the worker
 resolve/fetch fallback (§6.B/C), and the additive API completion path (§6.D).
 The whole path is inert unless `PARFUMO_FALLBACK_ENABLED` is truthy; `db.py` is
 untouched (no schema migration). The read-only POC
@@ -33,7 +33,7 @@ site. Verbatim findings:
 resolves all three positive controls and rejects all three near-misses.
 
 > Note: `WebFetch`/generic bots get `403` from Parfumo; the project's
-> cloudscraper does not. Discovery that relies on a search provider (Serper) is
+> cloudscraper does not. Discovery that relies on a structured search provider is
 > therefore strongly preferred over hammering Parfumo directly.
 
 ---
@@ -63,14 +63,12 @@ resolves all three positive controls and rejects all three near-misses.
 
 Layered, fallback-only, rate-limited:
 
-1. **Primary — Serper (structured SERP), Parfumo-scoped.**
+1. **Primary - Decodo structured SERP, Parfumo-scoped.**
    Query: `site:parfumo.com/Perfumes "<house>" "<name>"`. Reuses the existing
-   `SERPER_API_KEY` the engine already uses for FG, but with a Parfumo site
-   scope (do **not** reuse `SerperClient` as-is — it hardcodes
-   `site:fragrantica.com/perfume`; add a sibling method/param). Collect parfumo
-   perfume URLs, canonicalize, dedupe. Cache per normalized query (mirror
-   `SerperClient._cache`).
-2. **Fallback — capped single-house brand crawl.** Only when Serper is
+   `DecodoScraperClient` provider abstraction used for FG, but with a Parfumo
+   site scope. Collect Parfumo perfume URLs, canonicalize, dedupe, and cache per
+   normalized query.
+2. **Fallback — capped single-house brand crawl.** Only when the provider is
    unavailable/empty *and* explicitly enabled. Walk `/Perfumes/<Brand>` for at
    most N pages (default 6), collect public perfume links, score each. Brand
    grids use image tiles (empty anchor text), so each candidate must still be
@@ -147,9 +145,9 @@ the POC: `canonical_url`, `is_perfume_url`, `brand_slug`, `parse_fields`,
 `fetch_record`, `discover_urls`, `score_record`, and a banded `resolve()`
 returning a `ParfumoVerdict` (`accept` / `manual_review` / `reject` /
 `not_found`). Thresholds `ACCEPT=0.82` / `MANUAL_REVIEW=0.70` /
-`SIBLING_MARGIN=0.06` live on the class. Discovery is Serper-first via the new
-sibling `SerperClient.search_parfumo_urls(house, name)` (a `site=` param was
-added to `SerperClient._post`; the Parfumo cache is separate from the FG cache),
+`SIBLING_MARGIN=0.06` live on the class. Discovery is Decodo-first via
+`structured_search_provider().search_parfumo_urls(house, name)`; the Parfumo
+cache is separate from the FG cache,
 then the off-by-default brand crawl. `enabled()` / `brand_crawl_enabled()` read
 the env gates. Discovery is capped at `ParfumoEngine.MAX_CANDIDATES = 5` so a
 noisy SERP can't stretch one claimed job into tens of page fetches. No signature
@@ -243,11 +241,12 @@ Run: `python scripts/diag_parfumo_resolve.py --cases` → currently **ALL PASS**
 - [x] No review text is ingested (`_build_parfumo_payload` sends no reviews;
   §6.D writes empty `pros_cons`/`reviews`).
 - [x] Rate limiting + caching in place; brand crawl off by default
-  (`ParfumoEngine.resolve` `delay`, Serper response cache, `PARFUMO_BRAND_CRAWL_ENABLED`).
+  (`ParfumoEngine.resolve` `delay`, Decodo response cache,
+  `PARFUMO_BRAND_CRAWL_ENABLED`).
 
 **Remaining before turning the flag on in prod:** re-verify `robots.txt`; smoke
-the live `resolve()` once with `SERPER_API_KEY` set (the POC proves parse+score;
-discovery via the new Serper method needs one live confirmation); decide where
+the live `resolve()` once with Decodo credentials set (the POC proves parse+score;
+provider discovery needs one live confirmation); decide where
 `manual_review` verdicts surface (currently they fall through to a non-retryable
 FG failure for a human to inspect).
 
@@ -258,7 +257,7 @@ FG failure for a human to inspect).
 - **robots.txt:** we use only public `/Perfumes`, `/Parfums`, and brand grids.
   Re-verify `robots.txt` on each deploy; if Parfumo later disallows `/Perfumes`,
   the fallback must hard-disable.
-- **Volume:** fallback-only (FG-miss subset), Serper-first (one structured query,
+- **Volume:** fallback-only (FG-miss subset), Decodo-first (one structured query,
   not page hammering), per-fetch `--delay`, response caching. Brand crawl is
   off by default and page-capped.
 - **Anti-bot fragility:** cloudscraper works **today** with no challenge; Parfumo
@@ -278,10 +277,10 @@ FG failure for a human to inspect).
 `scripts/diag_parfumo_resolve.py` — read-only; no DB/job/engine mutation.
 
 ```
-# regression suite (seeded URLs when Serper is off):
+# regression suite (seeded URLs when provider discovery is off):
 python scripts/diag_parfumo_resolve.py --cases
 
-# one fragrance (Serper if SERPER_API_KEY set, else needs --url/--brand-crawl):
+# one fragrance (Decodo if configured, else needs --url/--brand-crawl):
 python scripts/diag_parfumo_resolve.py --house "Lattafa" --name "Ramz Gold"
 
 # score a specific candidate URL directly:

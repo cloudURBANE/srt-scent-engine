@@ -21,9 +21,8 @@ fragrance, then fetches + caches the detail. Resolution lives in
 `fragrance_parser_full_rewrite_fixed.py::search_once` →
 `_search_core`.
 
-FG's native search SERP is dead, and **Serper is disabled in this environment**
-(`SerperClient.enabled() == False`, no `SERPER_API_KEY`). So the only live
-FG-URL discovery path is the **designer-page crawl**
+FG's native search SERP is dead. When Decodo credentials are not configured, the
+only live FG-URL discovery path is the **designer-page crawl**
 (`SearchSniper.attach_from_designer_catalog`): it fetches
 `fragrantica.com/designers/<Brand>.html`, scrapes the `<a href>` perfume links,
 and accepts a link when `Orchestrator.identity_score(candidate, catalog_item) >=
@@ -221,10 +220,11 @@ Invoke-RestMethod "$base/api/enrichment/jobs/<CK_MAN_ID>" -Method Patch -Headers
       removed.
 
 ## Notes / out of scope
-- The highest-leverage *systemic* fix is enabling Serper for the worker
-  (`SERPER_API_KEY`), which returns canonical FG URLs directly and bypasses this
-  matcher entirely. That is an ops/config change, not part of this task, but
-  worth flagging to the owner.
+- The highest-leverage *systemic* fix is enabling Decodo for the worker
+  (`DECODO_API_BASIC_TOKEN` or `DECODO_API_USERNAME`/`DECODO_API_PASSWORD`),
+  which returns canonical FG URLs directly and bypasses this matcher entirely.
+  That is an ops/config change, not part of this task, but worth flagging to the
+  owner.
 - The dashboard masking the failure reason (`_run_auto_approve` stdout redirect)
   is a separate UX issue; optional follow-up: surface `exc.code` in the live
   stream line.

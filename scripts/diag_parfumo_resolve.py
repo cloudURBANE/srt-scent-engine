@@ -6,7 +6,7 @@ jobs, and does NOT modify the engine. It demonstrates the three pieces a
 production Parfumo fallback would need, so the design can be reviewed before any
 wiring lands:
 
-  1. URL discovery   -- search-provider (Serper) scoped to site:parfumo.com,
+  1. URL discovery   -- structured search provider scoped to site:parfumo.com,
                         with a capped single-house brand-page crawl fallback.
   2. Public parsing  -- factual product fields only (no review text) from the
                         public perfume page.
@@ -19,7 +19,7 @@ network call is rate-limited (--delay) and Parfumo is treated as a fallback, not
 a bulk crawl.
 
 Usage:
-    # Built-in regression cases (uses seeded URLs when Serper is disabled):
+    # Built-in regression cases (uses seeded URLs when the provider is disabled):
     python scripts/diag_parfumo_resolve.py --cases
 
     # One ad-hoc fragrance:
@@ -36,7 +36,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 import time
@@ -259,38 +258,15 @@ def fetch_record(scraper, url: str, *, timeout: float = 15.0) -> ParfumoRecord |
 # ==========================================================================
 # 1b. Discovery
 # ==========================================================================
-def discover_via_serper(house: str, name: str, *, timeout: float = 4.0) -> list[str]:
-    """Primary discovery: structured SERP scoped to site:parfumo.com/Perfumes.
-
-    Reuses the SERPER_API_KEY the engine already uses for Fragrantica, but with a
-    Parfumo site scope. Returns [] when the key is unset (so the POC degrades to
-    seeded URLs / brand crawl)."""
-    key = (os.environ.get("SERPER_API_KEY", "") or "").strip()
-    if not key:
+def discover_via_serp(house: str, name: str, *, timeout: float = 4.0) -> list[str]:
+    """Primary discovery through the engine's configured structured provider."""
+    provider = engine.structured_search_provider()
+    if provider is None:
         return []
-    import requests
-    q = f'site:parfumo.com/Perfumes "{house}" "{name}"'
     try:
-        res = requests.post(
-            "https://google.serper.dev/search",
-            json={"q": q},
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            timeout=timeout,
-        )
-        res.raise_for_status()
-        payload = res.json() or {}
+        return provider.search_parfumo_urls(house, name, timeout=timeout)
     except Exception:
         return []
-    urls: list[str] = []
-    seen: set[str] = set()
-    for entry in payload.get("organic", []) or []:
-        if not isinstance(entry, dict):
-            continue
-        canonical = canonical_parfumo_url(entry.get("link", "") or "")
-        if is_perfume_url(canonical) and canonical not in seen:
-            seen.add(canonical)
-            urls.append(canonical)
-    return urls
 
 
 def discover_via_brand_crawl(
@@ -373,8 +349,9 @@ def resolve(
     delay: float = 2.0,
 ) -> Verdict:
     # ---- discovery (primary -> seeded -> brand crawl) --------------------
-    discovery = "serper"
-    urls = discover_via_serper(house, name)
+    provider = engine.structured_search_provider()
+    discovery = getattr(provider, "PROVIDER_NAME", "structured") if provider else "none"
+    urls = discover_via_serp(house, name) if provider else []
     if not urls and seeded_urls:
         discovery = "seeded"
         urls = [canonical_parfumo_url(u) for u in seeded_urls if is_perfume_url(u)]
@@ -413,8 +390,9 @@ def resolve(
 # CLI
 # ==========================================================================
 # Seeded URLs let the parser+matcher path be demonstrated end-to-end even when
-# SERPER_API_KEY is unset in this environment. In production, discovery is Serper
-# (primary) then the capped brand crawl; these literals would not exist.
+# In local environments the structured provider can be disabled. In production,
+# discovery uses the configured provider first, then the capped brand crawl;
+# these literals would not exist.
 _CASES = [
     # (house, name, year, expect, seeded_urls)
     ("Lattafa", "Ramz Gold", "", "accept",
@@ -471,7 +449,7 @@ def main() -> int:
     ap.add_argument("--house", default="")
     ap.add_argument("--name", default="")
     ap.add_argument("--year", default="")
-    ap.add_argument("--url", action="append", default=[], help="Seed candidate URL(s); skips Serper")
+    ap.add_argument("--url", action="append", default=[], help="Seed candidate URL(s); skips provider discovery")
     ap.add_argument("--brand-crawl", action="store_true", help="Allow capped single-house brand crawl")
     ap.add_argument("--max-pages", type=int, default=6, help="Brand-crawl page cap")
     ap.add_argument("--delay", type=float, default=2.0, help="Seconds between Parfumo fetches")

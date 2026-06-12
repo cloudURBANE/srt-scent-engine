@@ -144,7 +144,7 @@ def _env_float(name: str, default: float) -> float:
 # search suitable for the first screen: live first-pass work is bounded tightly,
 # and candidate metrics are left to /details.
 _ARGS.initial_timeout = _env_float("API_INITIAL_TIMEOUT", 5.5)
-# 1-C: FG/Serper first pass gets a tighter independent cap than the BN-bearing
+# 1-C: FG/provider first pass gets a tighter independent cap than the BN-bearing
 # initial_timeout; clamped to initial_timeout inside the engine.
 _ARGS.fg_timeout = _env_float("API_FG_TIMEOUT", 3.0)
 _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
@@ -846,7 +846,7 @@ def _can_skip_live_search_with_cache(candidates: list[engine.UnifiedFragrance]) 
 
     Aggregate DB rows can be Basenotes-only. Serving those as a precheck hit
     turns a recoverable query into a degraded `live_search_skipped` response,
-    so BN-only cache hits must fall through to the live/Serper resolver.
+    so BN-only cache hits must fall through to the live structured resolver.
     """
     return any(bool(item.frag_url) for item in candidates)
 
@@ -4400,11 +4400,6 @@ class PatchJobRequest(BaseModel):
     house: str | None = None
 
 
-class SerperKeysRequest(BaseModel):
-    # Comma/space/newline-delimited string or a list of key strings.
-    keys: str | list[str] = ""
-
-
 def _json_for_db_blob(obj: Any) -> Any:
     """Return strict JSON-native data for psycopg ``Json()`` payloads.
 
@@ -4630,31 +4625,25 @@ def enrichment_status() -> dict[str, Any]:
     dependencies=[Depends(_require_diagnostics_token)],
 )
 def serper_pool_diagnostics() -> dict[str, Any]:
-    """Live health of the Serper API-key pool (masked keys only).
-
-    Lets you watch free-tier keys drain and spot when the pool is running low
-    without a redeploy. Pairs with POST /api/admin/serper-pool/keys to refill.
-    """
-    return engine.serper_key_pool().snapshot()
+    """Deprecated: Serper has been replaced by Decodo."""
+    return {
+        "deprecated": True,
+        "provider": "decodo",
+        "message": "Serper provider has been replaced by Decodo.",
+    }
 
 
 @app.post(
     "/api/admin/serper-pool/keys",
     dependencies=[Depends(_require_worker_token)],
 )
-def add_serper_pool_keys(payload: SerperKeysRequest) -> dict[str, Any]:
-    """Protected: hot-add Serper keys to the pool at runtime (no redeploy).
-
-    Body: {"keys": "k1,k2"} or {"keys": ["k1", "k2"]}. Re-adding a retired or
-    cooling key revives it.
-    """
-    raw = payload.keys
-    raw_list = raw if isinstance(raw, list) else [raw]
-    keys = engine._parse_key_list(*raw_list)
-    if not keys:
-        raise HTTPException(status_code=400, detail="Provide one or more keys in the `keys` field.")
-    added = engine.serper_key_pool().add_keys(keys)
-    return {"added": added, "snapshot": engine.serper_key_pool().snapshot()}
+def add_serper_pool_keys() -> dict[str, Any]:
+    """Deprecated: Serper key hot-adds are no longer supported."""
+    return {
+        "deprecated": True,
+        "provider": "decodo",
+        "message": "Serper provider has been replaced by Decodo; configure Decodo credentials in the environment.",
+    }
 
 
 class HealSweepRequest(BaseModel):

@@ -164,17 +164,30 @@ def main() -> int:
         ranked[0].endswith("/the-art-of-travel-collection-miami-poolside"),
     )
 
-    saved_env = {
-        "PARFUMO_FALLBACK_ENABLED": os.environ.get("PARFUMO_FALLBACK_ENABLED"),
-        "PARFUMO_BRAND_CRAWL_ENABLED": os.environ.get("PARFUMO_BRAND_CRAWL_ENABLED"),
-        "SERPER_API_KEY": os.environ.get("SERPER_API_KEY"),
-    }
+    provider_env_keys = (
+        "PARFUMO_FALLBACK_ENABLED",
+        "PARFUMO_BRAND_CRAWL_ENABLED",
+        "SERP_API_PROVIDER",
+        "DECODO_API_BASIC_TOKEN",
+        "DECODO_SCRAPER_BASIC_TOKEN",
+        "DECODO_BASIC_TOKEN",
+        "DECODO_API_USERNAME",
+        "DECODO_API_PASSWORD",
+        "DECODO_SCRAPER_USERNAME",
+        "DECODO_SCRAPER_PASSWORD",
+        "DECODO_USERNAME",
+        "DECODO_PASSWORD",
+    )
+    saved_env = {key: os.environ.get(key) for key in provider_env_keys}
     try:
         os.environ["PARFUMO_FALLBACK_ENABLED"] = "1"
         os.environ.pop("PARFUMO_BRAND_CRAWL_ENABLED", None)
-        os.environ.pop("SERPER_API_KEY", None)
+        os.environ.pop("SERP_API_PROVIDER", None)
+        for key in provider_env_keys:
+            if key.startswith("DECODO_"):
+                os.environ.pop(key, None)
         check(
-            "Parfumo brand crawl defaults on when fallback is enabled and Serper is missing",
+            "Parfumo brand crawl defaults on when fallback is enabled and no structured provider is configured",
             engine.ParfumoEngine.brand_crawl_enabled() is True,
         )
         os.environ["PARFUMO_BRAND_CRAWL_ENABLED"] = "0"
