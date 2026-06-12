@@ -19,7 +19,7 @@ from difflib import SequenceMatcher
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 
@@ -37,8 +37,9 @@ def _ensure_utf8_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             encoding = getattr(stream, "encoding", None)
-            if encoding and encoding.lower() != "utf-8" and hasattr(stream, "reconfigure"):
-                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            reconfigure = getattr(stream, "reconfigure", None)
+            if encoding and encoding.lower() != "utf-8" and callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             # Best-effort: never let stdio setup break module import.
             pass
@@ -120,7 +121,7 @@ try:
             import DrissionPage._base.driver as _drission_driver  # pyright: ignore[reportMissingImports]
             import websocket as _ws_lib  # pyright: ignore[reportMissingImports]
 
-            _drission_driver.create_connection = _ws_lib.create_connection
+            setattr(_drission_driver, "create_connection", _ws_lib.create_connection)
         except Exception:
             pass
 except ModuleNotFoundError:
@@ -1939,6 +1940,7 @@ class QueryRepair:
 
         if min(scores, default=0.0) < 0.62:
             return 0.0
+        return sum(scores) / max(1, len(scores))
 
     @staticmethod
     def suggestion_is_valid(original: str, suggestion: str) -> bool:
@@ -2826,8 +2828,10 @@ class Http:
                 last_error = exc
                 if attempt >= attempts - 1:
                     break
-                if deadline and deadline.remaining(0) is not None and deadline.remaining(0) <= sleep_seconds:
-                    break
+                if deadline:
+                    remaining = deadline.remaining(0)
+                    if remaining is not None and remaining <= sleep_seconds:
+                        break
                 time.sleep(sleep_seconds)
         Http._record_error(last_error)
         return None
@@ -3545,8 +3549,8 @@ def _mint_clearance_with_raw_cdp(
             *args,
         ]
 
-    proc: subprocess.Popen[bytes] | None = None
-    ws = None
+    proc: subprocess.Popen[Any] | None = None
+    ws: Any = None
     try:
         popen_kwargs: dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
@@ -3784,6 +3788,10 @@ def _curl_default_chrome_impersonation() -> str:
         return "chrome120"
 
 
+def _curl_impersonation_value(env_name: str, default: str) -> Any:
+    return cast(Any, os.environ.get(env_name, default))
+
+
 def _browser_page_text_response(page: Any, fallback_url: str, *, status_code: int = 200):
     html_text = ""
     title = ""
@@ -3911,7 +3919,7 @@ def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
     if curl_requests is None:
         return None
     session = curl_requests.Session(
-        impersonate=os.environ.get("BASENOTES_CURL_IMPERSONATE", "chrome120")
+        impersonate=_curl_impersonation_value("BASENOTES_CURL_IMPERSONATE", "chrome120")
     )
     session.headers.update({
         "User-Agent": user_agent,
@@ -3963,11 +3971,14 @@ def _mint_basenotes_clearance():
         return None
     if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
         return None
+    chromium_options_cls = ChromiumOptions
+    chromium_page_cls = ChromiumPage
 
     page = None
+    chromium_path = ""
     user_data_dir = tempfile.mkdtemp(prefix="bn-chromium-")
     try:
-        options = ChromiumOptions()
+        options = chromium_options_cls()
         chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
         if not (
             chromium_path
@@ -4013,7 +4024,7 @@ def _mint_basenotes_clearance():
             options.set_argument("--headless=new")
         options.auto_port()
 
-        page = ChromiumPage(options)
+        page = chromium_page_cls(options)
         page.get("https://basenotes.com/")
 
         wait_seconds = int(os.environ.get("BASENOTES_CLEARANCE_WAIT", "30") or "30")
@@ -4129,7 +4140,7 @@ def _new_fragrantica_http_session(user_agent: str, cookies: dict[str, str]):
     if curl_requests is None:
         return None
     session = curl_requests.Session(
-        impersonate=os.environ.get(
+        impersonate=_curl_impersonation_value(
             "FRAGRANTICA_CURL_IMPERSONATE",
             _curl_default_chrome_impersonation(),
         )
@@ -4206,6 +4217,8 @@ def _mint_fragrantica_clearance():
     if ChromiumOptions is None or ChromiumPage is None:
         _FRAGRANTICA_LAST_MINT_ERROR = "DrissionPage Chromium dependencies unavailable."
         return None
+    chromium_options_cls = ChromiumOptions
+    chromium_page_cls = ChromiumPage
 
     page = None
     persistent_profile = _fragrantica_profile_dir()
@@ -4256,7 +4269,7 @@ def _mint_fragrantica_clearance():
 
         def _build_options(data_dir: str):
             global _FRAGRANTICA_LAST_MINT_ERROR
-            opts = ChromiumOptions()
+            opts = chromium_options_cls()
             try:
                 opts.set_browser_path(chromium_path)
             except Exception as exc:
@@ -4279,7 +4292,7 @@ def _mint_fragrantica_clearance():
             return opts
 
         try:
-            page = ChromiumPage(_build_options(user_data_dir))
+            page = chromium_page_cls(_build_options(user_data_dir))
         except Exception:
             if user_data_dir_is_temp:
                 raise
@@ -4288,7 +4301,7 @@ def _mint_fragrantica_clearance():
             user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
             user_data_dir_is_temp = True
             cleanup_user_data_dir = True
-            page = ChromiumPage(_build_options(user_data_dir))
+            page = chromium_page_cls(_build_options(user_data_dir))
         page.get("https://www.fragrantica.com/")
 
         # Cloudflare's managed challenge is interactive — it will not clear
@@ -4438,9 +4451,10 @@ def reset_fragrantica_scraper(clear_cache: bool = False) -> None:
     with _FRAGRANTICA_SESSION_LOCK:
         old_session = _FRAGRANTICA_SESSION
         _FRAGRANTICA_SESSION = None
-        if hasattr(old_session, "close"):
+        close = getattr(old_session, "close", None)
+        if callable(close):
             try:
-                old_session.close()
+                close()
             except Exception:
                 pass
         if clear_cache:
@@ -7795,7 +7809,7 @@ class FragranticaEngine:
             "wear": "When to wear",
         }
 
-        def push(card_name: str, label_text: str, pct: Any, count: Any = "") -> None:
+        def push(card_name: str, label_text: object, pct: Any, count: Any = "") -> None:
             try:
                 pct_f = float(str(pct).strip().rstrip("%"))
             except (TypeError, ValueError):
@@ -9546,6 +9560,8 @@ def main() -> None:
             import importlib.util
             worker_path = Path(__file__).resolve().parent / "scripts" / "enrichment_worker.py"
             spec = importlib.util.spec_from_file_location("enrichment_worker", worker_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Unable to load enrichment worker from {worker_path}")
             worker = importlib.util.module_from_spec(spec)
             sys.modules["enrichment_worker"] = worker  # let @dataclass resolve its module
             spec.loader.exec_module(worker)
