@@ -6,6 +6,7 @@ derive app-facing taxonomy/context from the engine's existing derived metrics.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 UNKNOWN_TEXT = {"", "unknown", "n/a", "none", "null"}
@@ -64,6 +65,25 @@ ACCORD_FAMILY_MAP = {
     "woody": "Woody",
     "yellow floral": "Floral",
 }
+
+
+def expand_raw_accords(accords: Any) -> list[str]:
+    """Flatten raw source accords into the engine's flat accord vocabulary.
+
+    Parfumo reports compound accords like "fruity-sweet" / "synthetic-aquatic";
+    ACCORD_FAMILY_MAP and the rest of the pipeline speak Fragrantica's flat
+    tokens, so compounds are split on hyphens/slashes. Order-preserving,
+    deduplicated, lowercase.
+    """
+    if not isinstance(accords, (list, tuple)):
+        return []
+    out: list[str] = []
+    for accord in accords:
+        for token in re.split(r"[-/]", str(accord or "")):
+            token = token.strip().lower()
+            if token and token not in out:
+                out.append(token)
+    return out
 
 
 def is_fact_complete(value: Any, field: str | None = None) -> bool:
@@ -176,6 +196,32 @@ FACT_FIELDS = (
 )
 
 _COVERAGE_FACTS = ("performance_score", "value_score", "community_interest_score")
+
+# Facts a terminal-partial source can never deliver, keyed by the stored row's
+# fg_raw["source"]. The heal sweep skips requeueing a row when every missing
+# fact is listed here for its source: re-running the worker cannot improve such
+# a row, it only burns resolver budget until the requested_count churn guard
+# trips. Facts NOT listed (e.g. concentration, year, gender, notes, family,
+# main_accords) stay heal-worthy for that source.
+SOURCE_UNSUPPLIABLE_FACTS: dict[str, frozenset[str]] = {
+    # Parfumo pages have no FG status pyramid (wear votes, performance/value/
+    # community-interest distributions) and review text is never ingested.
+    "parfumo": frozenset(
+        {
+            "wear_profile",
+            "performance_score",
+            "value_score",
+            "community_interest_score",
+            "reviews",
+        }
+    ),
+}
+
+
+def record_source(record: dict[str, Any]) -> str:
+    """The stored row's enrichment source ("" when unrecorded / FG-native)."""
+    fg_raw = record.get("fg_raw") if isinstance(record.get("fg_raw"), dict) else {}
+    return str(fg_raw.get("source") or "").strip().lower()
 
 
 def _notes_have_content(notes: Any) -> bool:

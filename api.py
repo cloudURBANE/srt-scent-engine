@@ -54,9 +54,12 @@ from pydantic import BaseModel, Field
 import db
 from enrichment_facts import (
     FACT_FIELDS,
+    SOURCE_UNSUPPLIABLE_FACTS,
     derive_families,
     derive_wear_profile,
+    expand_raw_accords,
     missing_facts,
+    record_source,
 )
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
@@ -4591,6 +4594,27 @@ def _build_parfumo_cache_row(
         derived_metrics = build_derived_metrics(temp_details)
     except Exception:
         derived_metrics = None
+    # Parfumo's accords ride in raw_identity, not FG frag_cards, so the adapter
+    # above cannot see them. Project them into the canonical main_accords slot
+    # (compounds like "fruity-sweet" expand to the flat engine vocabulary) so
+    # family derivation, API detail projection, and the completeness audit all
+    # treat them as the real facts they are -- otherwise every Parfumo partial
+    # counts main_accords/family as permanently missing.
+    top_accords = expand_raw_accords(raw_identity.get("accords"))
+    if top_accords:
+        if not isinstance(derived_metrics, dict):
+            derived_metrics = {}
+        main = derived_metrics.get("main_accords")
+        if not (isinstance(main, dict) and main.get("top_accords")):
+            derived_metrics["main_accords"] = {
+                "scent_vector": [],
+                "top_accords": top_accords,
+                "accord_summary": "",
+                "source": "parfumo_accords",
+            }
+            coverage = derived_metrics.get("source_coverage")
+            if isinstance(coverage, dict):
+                coverage["main_accords"] = True
     return {
         "canonical_fg_url": canonical_parfumo_url,
         "name": name or None,
@@ -4713,6 +4737,7 @@ def _audit_fragrance_records(
                 "year": record.get("year"),
                 "canonical_fg_url": record.get("canonical_fg_url"),
                 "bn_url": record.get("bn_url"),
+                "source": record_source(record) or None,
                 "job_key": job_key or None,
                 "missing": missing,
                 "job": None,
@@ -4812,6 +4837,14 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
         if not missing:
             continue
         incomplete += 1
+        # Terminal-partial sources (e.g. Parfumo) can never deliver certain
+        # facts; when everything missing is unsuppliable, requeueing only burns
+        # resolver budget until the churn guard trips. Healable gaps (e.g. a
+        # missing concentration) still requeue normally.
+        unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(str(item.get("source") or ""))
+        if unsuppliable and all(field in unsuppliable for field in missing):
+            _skip(item, "source_cannot_supply")
+            continue
         if not item["job_key"]:
             _skip(item, "no_healable_identity")
             continue
