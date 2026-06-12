@@ -8495,7 +8495,17 @@ class Orchestrator:
         a_name: set[str],
         b_name: set[str],
     ) -> float:
-        if not a_name or not b_name or len(a_name) != len(b_name):
+        if not a_name or not b_name:
+            return 0.0
+        a_compact_chars = re.sub(r"\s+", "", TextSanitizer.normalize_identity(a_name_raw))
+        b_compact_chars = re.sub(r"\s+", "", TextSanitizer.normalize_identity(b_name_raw))
+        if (
+            a_compact_chars
+            and a_compact_chars == b_compact_chars
+            and len(a_compact_chars) >= 4
+        ):
+            return 0.96
+        if len(a_name) != len(b_name):
             return 0.0
         only_a = a_name - b_name
         only_b = b_name - a_name

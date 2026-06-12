@@ -1641,6 +1641,51 @@ def test_worker_url_gating_catalog_tier_and_retirement() -> None:
     check("catalog tier rejects below-accept identities", miss is None, detail=repr(miss))
     check("catalog tier needs both house and name", no_identity is None)
 
+    jadore_urls = {
+        "Infinissime": "https://www.fragrantica.com/perfume/Dior/J-adore-Infinissime-62177.html",
+        "In Joy": "https://www.fragrantica.com/perfume/Dior/J-adore-In-Joy-43204.html",
+        "L'Absolu": "https://www.fragrantica.com/perfume/Dior/J-adore-L-Absolu-5027.html",
+        "Sauvage Elixir": "https://www.fragrantica.com/perfume/Dior/Sauvage-Elixir-67110.html",
+    }
+    dior_catalog = [
+        engine.CatalogItem(name="J'adore Infinissime", brand="Christian Dior", year="", url=jadore_urls["Infinissime"]),
+        engine.CatalogItem(name="J'adore In Joy", brand="Christian Dior", year="", url=jadore_urls["In Joy"]),
+        engine.CatalogItem(name="J'adore L'Absolu", brand="Christian Dior", year="", url=jadore_urls["L'Absolu"]),
+        engine.CatalogItem(name="Sauvage Elixir", brand="Christian Dior", year="", url=jadore_urls["Sauvage Elixir"]),
+    ]
+
+    def fake_dior_catalog(scraper, brand, deadline, slug_limit=6, page_timeout=3.5, trace=None):
+        return dior_catalog
+
+    engine.SearchSniper.catalog_candidates_for_brand = staticmethod(fake_dior_catalog)
+    try:
+        infinissime = w._designer_catalog_candidate(None, {"house": "Dior", "name": "Jadore Infinissime"})
+        injoy = w._designer_catalog_candidate(None, {"house": "Dior", "name": "Jadore Injoy"})
+        labsolu = w._designer_catalog_candidate(None, {"house": "Dior", "name": "Jadore Labsolu"})
+        sauvage_miss = w._designer_catalog_candidate(None, {"house": "Dior", "name": "Sauvage"})
+    finally:
+        engine.SearchSniper.catalog_candidates_for_brand = old_catalog
+    check(
+        "catalog tier resolves J'adore Infinissime from Jadore import spelling",
+        infinissime is not None and infinissime.frag_url == jadore_urls["Infinissime"],
+        detail=repr(getattr(infinissime, "frag_url", None)),
+    )
+    check(
+        "catalog tier resolves J'adore In Joy from Injoy import spelling",
+        injoy is not None and injoy.frag_url == jadore_urls["In Joy"],
+        detail=repr(getattr(injoy, "frag_url", None)),
+    )
+    check(
+        "catalog tier resolves J'adore L'Absolu from Labsolu import spelling",
+        labsolu is not None and labsolu.frag_url == jadore_urls["L'Absolu"],
+        detail=repr(getattr(labsolu, "frag_url", None)),
+    )
+    check(
+        "catalog tier still rejects Dior sibling without compact identity",
+        sauvage_miss is None,
+        detail=repr(getattr(sauvage_miss, "frag_url", None)),
+    )
+
     # Duplicate rows of the same perfume (same URL listed twice across designer
     # label pages) must collapse before the sibling-margin check — a duplicate
     # of the winner is not a sibling near-tie.

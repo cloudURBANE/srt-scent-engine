@@ -82,6 +82,26 @@ def main() -> int:
     sauvage = score("Sauvage", "Dior", "Sauvage", "Christian Dior")
     check("Dior Sauvage alias still matches Christian Dior", sauvage >= accept, f"score={sauvage:.4f}")
 
+    dior_elisions = [
+        ("Jadore Infinissime", "J'adore Infinissime"),
+        ("Jadore Injoy", "J'adore In Joy"),
+        ("Jadore Labsolu", "J'adore L'Absolu"),
+    ]
+    for imported, fragrantica in dior_elisions:
+        dior_score = score(imported, "Dior", fragrantica, "Christian Dior")
+        check(
+            f"Dior {imported} accepts Fragrantica elision/spacing identity",
+            dior_score >= accept,
+            f"score={dior_score:.4f}",
+        )
+
+    sauvage_sibling = score("Sauvage", "Dior", "Sauvage Elixir", "Christian Dior")
+    check(
+        "Dior compact identity fallback does not accept siblings",
+        sauvage_sibling < accept,
+        f"score={sauvage_sibling:.4f}",
+    )
+
     hermes_urls = {
         "https://www.fragrantica.com/perfume/Hermes/Twilly-d-Hermes-46145.html": "Twilly d'Hermes",
         "https://www.fragrantica.com/perfume/Hermes/Galop-d-Hermes-39584.html": "Galop d'Hermes",
