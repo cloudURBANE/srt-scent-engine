@@ -805,21 +805,101 @@ def _db_detail_cache_search(
 
 def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedFragrance], str | None]:
     """Fallback search for blocked live providers, with DB as source of truth."""
-    candidates = _fragrance_record_search(query, limit)
+    def _variant_queries() -> list[str]:
+        text = engine.QueryRepair.normalized_query(query)
+        tokens = engine.QueryRepair._tokens(text)
+        variants: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            value = engine.QueryRepair.normalized_query(value)
+            key = engine.QueryRepair._identity(value)
+            if key and key not in seen:
+                seen.add(key)
+                variants.append(value)
+
+        add(text)
+        if len(tokens) < 2:
+            return variants
+
+        for i in range(len(tokens) - 1):
+            if len(tokens[i]) >= 3 and len(tokens[i + 1]) >= 3:
+                add(f"{tokens[i]} {tokens[i + 1]}")
+        add(f"{tokens[0]} {tokens[-1]}")
+
+        # Single long anchors rescue truncated suffixes that SQL substring search
+        # can still find, e.g. "Montaig" -> "Montaigne". Shorter single-token
+        # anchors are usually just broad house names and are left to live search.
+        for token in sorted(tokens, key=len, reverse=True):
+            if len(token) >= 5:
+                add(token)
+        return variants[:8]
+
+    def _source_search(
+        search_fn: Any,
+        source_limit: int,
+    ) -> list[engine.UnifiedFragrance]:
+        candidates: list[engine.UnifiedFragrance] = []
+        seen_items: set[str] = set()
+        original_key = engine.QueryRepair._identity(query)
+
+        def variant_candidate_ok(
+            item: engine.UnifiedFragrance, search_query: str
+        ) -> bool:
+            if engine.candidate_relevance_ok(query, item, _CACHE_SEARCH_MIN_SCORE):
+                return True
+            if float(getattr(item, "query_score", 0.0) or 0.0) < 0.80:
+                return False
+            variant_key = engine.QueryRepair._identity(search_query)
+            if variant_key == original_key:
+                return False
+            variant_tokens = engine.QueryRepair._tokens(search_query)
+            if len(variant_tokens) != 1 or len(variant_tokens[0]) < 5:
+                return False
+            target_name_tokens = engine.IdentityTools.name_tokens(item.name, item.brand)
+            if not target_name_tokens:
+                target_name_tokens = engine.IdentityTools.name_tokens_keep_stopwords(
+                    item.name, item.brand
+                )
+            return (
+                engine.IdentityTools.fuzzy_token_coverage(
+                    {variant_tokens[0]}, target_name_tokens
+                )
+                >= 0.90
+            )
+
+        for search_query in _variant_queries():
+            rows = search_fn(search_query, source_limit * 2, min_score=0.0)
+            for item in rows:
+                item.query_score = engine.IdentityTools.relevance_score(query, item)
+                if not variant_candidate_ok(item, search_query):
+                    continue
+                key = item.frag_url or item.bn_url or item.cache_key
+                if key in seen_items:
+                    continue
+                seen_items.add(key)
+                candidates.append(item)
+        candidates.sort(
+            key=lambda item: (item.query_score, item.resolver_score, item.year),
+            reverse=True,
+        )
+        return candidates[:source_limit]
+
+    candidates = _source_search(_fragrance_record_search, limit)
     source: str | None = None
 
     if candidates:
         source = "aggregate_db"
     else:
-        candidates = _db_detail_cache_search(query, limit)
+        candidates = _source_search(_db_detail_cache_search, limit)
         if candidates:
             source = "db"
     if not candidates:
-        candidates = _json_cache_search(query, limit)
+        candidates = _source_search(_json_cache_search, limit)
         if candidates:
             source = "json"
     if not candidates:
-        candidates = _identity_cache_search(query, limit)
+        candidates = _source_search(_identity_cache_search, limit)
         if candidates:
             source = "identity"
 
@@ -2056,9 +2136,13 @@ def search(
         diagnostics["timing"] = timing
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
-        fallback_label = (
-            "identity cache" if fallback_source == "identity" else f"{fallback_source} detail cache"
-        )
+        fallback_labels = {
+            "aggregate_db": "aggregate DB cache",
+            "db": "database detail cache",
+            "json": "bundled detail cache",
+            "identity": "identity cache",
+        }
+        fallback_label = fallback_labels.get(fallback_source, f"{fallback_source} cache")
         if live_search_saturated:
             diagnostics["warning"] = (
                 "Live search capacity is saturated; results came from the "

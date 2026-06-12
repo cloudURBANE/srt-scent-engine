@@ -1588,9 +1588,7 @@ class QueryRepair:
     def _seed_records_from_native_candidates(records: dict, original: str) -> None:
         for item in QueryRepair._LAST_NATIVE_CANDIDATES[:40]:
             url = QueryRepair._native_candidate_url(item)
-            print("[QR DEBUG native url]", url)
             candidate, domain, is_canonical = QueryRepair._canonical_candidate_from_url(url)
-            print("[QR DEBUG parsed]", candidate, domain, is_canonical)
             if is_canonical and candidate:
                 QueryRepair._add_candidate(records, candidate, source=domain or "native_fg", canonical=True)
                 continue
@@ -3236,6 +3234,7 @@ class DecodoScraperClient:
         "DECODO_API_BASIC_TOKEN",
         "DECODO_SCRAPER_BASIC_TOKEN",
         "DECODO_BASIC_TOKEN",
+        "DECODO_AUTH_TOKEN",
     )
     _USERNAME_PASSWORD_ENV = (
         ("DECODO_API_USERNAME", "DECODO_API_PASSWORD"),
@@ -3277,16 +3276,30 @@ class DecodoScraperClient:
         return TextSanitizer.normalize_identity(query)
 
     @staticmethod
+    def _credential_env(name: str) -> str:
+        value = os.environ.get(name)
+        if value is None:
+            # Credentials are often saved mixed-case in deployment dashboards
+            # (e.g. Decodo_Username); Linux environments are case-sensitive,
+            # so fall back to a case-insensitive scan.
+            lowered = name.lower()
+            for key, candidate in os.environ.items():
+                if key.lower() == lowered:
+                    value = candidate
+                    break
+        return value or ""
+
+    @staticmethod
     def _auth_header() -> str:
         for name in DecodoScraperClient._BASIC_TOKEN_ENV:
-            token = (os.environ.get(name) or "").strip()
+            token = DecodoScraperClient._credential_env(name).strip()
             if token:
                 if token.lower().startswith("basic "):
                     token = token[6:].strip()
                 return f"Basic {token}"
         for user_key, password_key in DecodoScraperClient._USERNAME_PASSWORD_ENV:
-            username = (os.environ.get(user_key) or "").strip()
-            password = os.environ.get(password_key) or ""
+            username = DecodoScraperClient._credential_env(user_key).strip()
+            password = DecodoScraperClient._credential_env(password_key)
             if username and password:
                 token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
                 return f"Basic {token}"

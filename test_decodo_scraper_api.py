@@ -9,6 +9,7 @@ _SAVED_ENV_KEYS = (
     "DECODO_API_BASIC_TOKEN",
     "DECODO_SCRAPER_BASIC_TOKEN",
     "DECODO_BASIC_TOKEN",
+    "DECODO_AUTH_TOKEN",
     "DECODO_API_USERNAME",
     "DECODO_API_PASSWORD",
     "DECODO_SCRAPER_USERNAME",
@@ -232,6 +233,54 @@ def test_decodo_username_password_auth_fallback() -> None:
     check("username/password fallback builds Basic token", headers.get("Authorization") == f"Basic {expected}", str(headers))
 
 
+def test_decodo_auth_token_alias_and_casing() -> None:
+    print("Decodo auth-token alias and casing checks:")
+    saved = _save_env()
+    try:
+        _clear_decodo_env()
+        os.environ["DECODO_AUTH_TOKEN"] = "alias-test-token"
+        check(
+            "DECODO_AUTH_TOKEN alias builds the Basic header",
+            engine.DecodoScraperClient._auth_header() == "Basic alias-test-token",
+            engine.DecodoScraperClient._auth_header(),
+        )
+        check(
+            "DECODO_AUTH_TOKEN alias enables the client",
+            engine.DecodoScraperClient.enabled(),
+        )
+
+        # os.environ is case-insensitive on Windows but case-sensitive on the
+        # Linux deploy host; emulate the latter with a plain dict so the
+        # fallback scan is exercised on every platform.
+        _clear_decodo_env()
+        old_environ = engine.os.environ
+        engine.os.environ = {"Decodo_auth_token": "mixed-case-token"}
+        try:
+            header = engine.DecodoScraperClient._auth_header()
+        finally:
+            engine.os.environ = old_environ
+        check(
+            "Mixed-case token name resolves on case-sensitive platforms",
+            header == "Basic mixed-case-token",
+            header,
+        )
+
+        old_environ = engine.os.environ
+        engine.os.environ = {"Decodo_Username": "mixed-user", "Decodo_Password": "mixed-pass"}
+        try:
+            header = engine.DecodoScraperClient._auth_header()
+        finally:
+            engine.os.environ = old_environ
+        expected = base64.b64encode(b"mixed-user:mixed-pass").decode("ascii")
+        check(
+            "Mixed-case username/password resolves on case-sensitive platforms",
+            header == f"Basic {expected}",
+            header,
+        )
+    finally:
+        _restore_env(saved)
+
+
 def test_structured_search_provider_selection() -> None:
     print("Structured search provider selection checks:")
     saved = _save_env()
@@ -285,6 +334,7 @@ def main() -> int:
     test_decodo_scraper_search_payload_and_parsing()
     test_decodo_scraper_image_payload_and_mapping()
     test_decodo_username_password_auth_fallback()
+    test_decodo_auth_token_alias_and_casing()
     test_structured_search_provider_selection()
     print()
     print("All Decodo scraper API checks passed.")
