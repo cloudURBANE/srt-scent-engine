@@ -3663,6 +3663,148 @@ def _response_has_challenge(res: Any) -> bool:
     return any(marker in head for marker in _HTTP_CHALLENGE_MARKERS)
 
 
+def _clearance_env_present(prefix: str) -> bool:
+    return any(
+        str(os.environ.get(name) or "").strip()
+        for name in (
+            f"{prefix}_CLEARANCE_UA",
+            f"{prefix}_CLEARANCE_COOKIE_HEADER",
+            f"{prefix}_CLEARANCE_COOKIES_JSON",
+        )
+    )
+
+
+def _curl_default_chrome_impersonation() -> str:
+    try:
+        from curl_cffi.requests.impersonate import DEFAULT_CHROME  # pyright: ignore[reportMissingImports]
+
+        return str(DEFAULT_CHROME)
+    except Exception:
+        return "chrome120"
+
+
+def _browser_page_text_response(page: Any, fallback_url: str, *, status_code: int = 200):
+    html_text = ""
+    title = ""
+    try:
+        title = str(getattr(page, "title", "") or "")
+    except Exception:
+        title = ""
+    try:
+        html_value = getattr(page, "html", "")
+        html_text = str(html_value() if callable(html_value) else html_value or "")
+    except Exception:
+        html_text = ""
+    if not html_text:
+        try:
+            html_text = str(
+                page.run_js("return document.documentElement.outerHTML;") or ""
+            )
+        except Exception:
+            html_text = ""
+    if title and "<title" not in html_text[:1000].lower():
+        html_text = f"<title>{html.escape(title)}</title>\n{html_text}"
+
+    res = requests.Response()
+    res.status_code = int(status_code)
+    res.url = str(getattr(page, "url", "") or fallback_url)
+    res._content = html_text.encode("utf-8", errors="replace")
+    res.encoding = "utf-8"
+    res.headers["Content-Type"] = "text/html; charset=utf-8"
+    return res
+
+
+def _browser_page_cookies(page: Any) -> dict[str, str]:
+    try:
+        cookie_data = page.cookies()
+    except Exception:
+        return {}
+    if isinstance(cookie_data, list):
+        return {
+            str(c["name"]): str(c["value"])
+            for c in cookie_data
+            if isinstance(c, dict) and "name" in c and "value" in c
+        }
+    try:
+        return {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
+    except Exception:
+        return {}
+
+
+class _FragranticaBrowserSession:
+    """Minimal requests-like client backed by a live ChromiumPage.
+
+    Fragrantica's Cloudflare clearance can be bound tightly enough to the real
+    browser that copied cookies fail when replayed through curl_cffi. Keeping the
+    cleared page alive lets detail fetches go through the same browser that
+    solved the challenge, while still presenting the `.get()` shape expected by
+    Http.get().
+    """
+
+    def __init__(
+        self,
+        page: Any,
+        user_agent: str,
+        cookies: dict[str, str] | None = None,
+        *,
+        user_data_dir: str = "",
+        remove_user_data_dir: bool = False,
+    ) -> None:
+        self._page = page
+        self._lock = threading.Lock()
+        self._closed = False
+        self._user_data_dir = user_data_dir
+        self._remove_user_data_dir = remove_user_data_dir
+        self.headers = {"User-Agent": user_agent}
+        self.cookies = dict(cookies or {})
+
+    def get(self, url: str, timeout: float = 15, headers: dict[str, str] | None = None, **_kwargs: Any):
+        del headers
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Fragrantica browser session is closed")
+            wait_for = max(1.0, float(timeout or 15))
+            deadline = time.monotonic() + wait_for
+            try:
+                try:
+                    self._page.get(url, timeout=wait_for)
+                except TypeError:
+                    self._page.get(url)
+            except Exception:
+                raise
+
+            response = _browser_page_text_response(self._page, url)
+            while _response_has_challenge(response) and time.monotonic() < deadline:
+                time.sleep(1)
+                response = _browser_page_text_response(self._page, url)
+            page_cookies = _browser_page_cookies(self._page)
+            if page_cookies:
+                self.cookies.update(page_cookies)
+            return response
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._page.quit()
+        except Exception:
+            pass
+        if self._user_data_dir:
+            _kill_chromiums_for_user_data_dir(self._user_data_dir)
+            if self._remove_user_data_dir:
+                try:
+                    shutil.rmtree(self._user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _new_basenotes_http_session(user_agent: str, cookies: dict[str, str]):
     if curl_requests is None:
         return None
@@ -3884,7 +4026,10 @@ def _new_fragrantica_http_session(user_agent: str, cookies: dict[str, str]):
     if curl_requests is None:
         return None
     session = curl_requests.Session(
-        impersonate=os.environ.get("FRAGRANTICA_CURL_IMPERSONATE", "chrome120")
+        impersonate=os.environ.get(
+            "FRAGRANTICA_CURL_IMPERSONATE",
+            _curl_default_chrome_impersonation(),
+        )
     )
     session.headers.update({
         "User-Agent": user_agent,
@@ -3934,20 +4079,35 @@ def _mint_fragrantica_clearance():
     if _chromium_mint_disabled():
         _FRAGRANTICA_LAST_MINT_ERROR = "Chromium mint disabled by DISABLE_CHROMIUM_MINT."
         return None
-    if curl_requests is None or ChromiumOptions is None or ChromiumPage is None:
+    if ChromiumOptions is None or ChromiumPage is None:
+        _FRAGRANTICA_LAST_MINT_ERROR = "DrissionPage Chromium dependencies unavailable."
         return None
 
     page = None
+    cleanup_user_data_dir = True
+    chromium_path = ""
     user_data_dir = tempfile.mkdtemp(prefix="fg-chromium-")
     try:
         options = ChromiumOptions()
-        chromium_path = os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        chromium_path = (
+            os.environ.get("FRAGRANTICA_CHROMIUM_PATH", "").strip()
+            or os.environ.get("BASENOTES_CHROMIUM_PATH", "").strip()
+        )
         if not (
             chromium_path
             and os.path.isfile(chromium_path)
             and os.access(chromium_path, os.X_OK)
         ):
             chromium_path = ""
+            if os.name == "nt":
+                for candidate_path in (
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    str(Path.home() / "AppData/Local/Google/Chrome/Application/chrome.exe"),
+                ):
+                    if os.path.isfile(candidate_path) and os.access(candidate_path, os.X_OK):
+                        chromium_path = candidate_path
+                        break
             for candidate in (
                 "chromium",
                 "chromium-browser",
@@ -3961,7 +4121,7 @@ def _mint_fragrantica_clearance():
                     break
 
         if not chromium_path:
-            _FRAGRANTICA_LAST_MINT_ERROR = "No Chromium binary discovered (env BASENOTES_CHROMIUM_PATH or common names in PATH)."
+            _FRAGRANTICA_LAST_MINT_ERROR = "No Chromium binary discovered (env FRAGRANTICA_CHROMIUM_PATH/BASENOTES_CHROMIUM_PATH or common names in PATH)."
             return None
 
         if chromium_path:
@@ -3993,19 +4153,41 @@ def _mint_fragrantica_clearance():
         page.get("https://www.fragrantica.com/")
 
         wait_seconds = int(os.environ.get("FRAGRANTICA_CLEARANCE_WAIT", "20") or "20")
-        for _ in range(max(1, wait_seconds)):
-            title = str(getattr(page, "title", "") or "")
-            if not any(marker in title.lower() for marker in ("just a moment", "attention required")):
+        wait_until = time.monotonic() + max(1, wait_seconds)
+        while True:
+            page_res = _browser_page_text_response(page, "https://www.fragrantica.com/")
+            if not _response_has_challenge(page_res):
+                break
+            if time.monotonic() >= wait_until:
                 break
             time.sleep(1)
 
-        cookie_data = page.cookies()
-        cookies = (
-            {str(c["name"]): str(c["value"]) for c in cookie_data if "name" in c and "value" in c}
-            if isinstance(cookie_data, list)
-            else {str(k): str(v) for k, v in dict(cookie_data or {}).items()}
-        )
+        cookies = _browser_page_cookies(page)
         user_agent = str(page.run_js("return navigator.userAgent;") or Http.DEFAULT_HEADERS["User-Agent"])
+        if not cookies:
+            _FRAGRANTICA_LAST_MINT_ERROR = "Mint completed without reusable Fragrantica cookies."
+            return None
+        session = _new_fragrantica_http_session(user_agent, cookies)
+        if session is not None and _validate_fragrantica_session(session):
+            _save_fragrantica_cache(user_agent, cookies)
+            _FRAGRANTICA_LAST_MINT_ERROR = None
+            return session
+        browser_session = _FragranticaBrowserSession(
+            page,
+            user_agent,
+            cookies,
+            user_data_dir=user_data_dir,
+            remove_user_data_dir=True,
+        )
+        if _validate_fragrantica_session(browser_session):
+            cleanup_user_data_dir = False
+            page = None
+            _FRAGRANTICA_LAST_MINT_ERROR = None
+            return browser_session
+        browser_session.close()
+        page = None
+        _FRAGRANTICA_LAST_MINT_ERROR = "Minted Fragrantica cookies failed HTTP replay and browser-session validation."
+        return None
     except Exception as exc:
         _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
         _kill_chromiums_for_user_data_dir(user_data_dir)
@@ -4054,19 +4236,22 @@ def _mint_fragrantica_clearance():
                 page.quit()
             except Exception:
                 pass
-        _kill_chromiums_for_user_data_dir(user_data_dir)
-        try:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
-        except Exception:
-            pass
+        if cleanup_user_data_dir:
+            _kill_chromiums_for_user_data_dir(user_data_dir)
+            try:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     if not cookies:
+        _FRAGRANTICA_LAST_MINT_ERROR = "Mint completed without reusable Fragrantica cookies."
         return None
-    _save_fragrantica_cache(user_agent, cookies)
     session = _new_fragrantica_http_session(user_agent, cookies)
     if session is not None and _validate_fragrantica_session(session):
+        _save_fragrantica_cache(user_agent, cookies)
         _FRAGRANTICA_LAST_MINT_ERROR = None
         return session
+    _FRAGRANTICA_LAST_MINT_ERROR = "Minted Fragrantica cookies failed HTTP replay validation."
     return None
 
 
@@ -4082,6 +4267,11 @@ def get_fragrantica_scraper(fallback: Any = None, *, mint_clearance: bool = Fals
             if session is not None and _validate_fragrantica_session(session):
                 _FRAGRANTICA_SESSION = session
                 return _FRAGRANTICA_SESSION
+            if not _clearance_env_present("FRAGRANTICA"):
+                try:
+                    _FRAGRANTICA_CACHE_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         if mint_clearance:
             minted = _mint_fragrantica_clearance()
@@ -4095,7 +4285,13 @@ def get_fragrantica_scraper(fallback: Any = None, *, mint_clearance: bool = Fals
 def reset_fragrantica_scraper(clear_cache: bool = False) -> None:
     global _FRAGRANTICA_SESSION
     with _FRAGRANTICA_SESSION_LOCK:
+        old_session = _FRAGRANTICA_SESSION
         _FRAGRANTICA_SESSION = None
+        if hasattr(old_session, "close"):
+            try:
+                old_session.close()
+            except Exception:
+                pass
         if clear_cache:
             try:
                 _FRAGRANTICA_CACHE_FILE.unlink(missing_ok=True)
