@@ -86,6 +86,12 @@ HEAL_SWEEP_MAX_REQUESTED = int(os.environ.get("ENRICHMENT_HEAL_SWEEP_MAX_REQUEST
 # first attempt, so transient SERP/budget hiccups became permanent failures.
 # db.fail_job still hard-caps total retryable failures at MAX_RETRYABLE_FAILURES.
 RESOLVER_RETRY_GRACE = int(os.environ.get("ENRICHMENT_RESOLVER_RETRY_GRACE", "2"))
+# Reuse the concentration SERP browser inside a worker run, but periodically
+# refresh it so a long queue cannot hold a stale DuckDuckGo page forever.
+CONCENTRATION_SERP_SESSION_JOBS = max(
+    1,
+    int(os.environ.get("ENRICHMENT_CONCENTRATION_SERP_SESSION_JOBS", "25") or "25"),
+)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Basenotes-normalized house names that no longer match their Fragrantica
@@ -226,6 +232,46 @@ class StopController:
         if self._interrupts >= 2:
             raise KeyboardInterrupt
         print("\nStop requested. Finishing the current safe step, then exiting.")
+
+
+class ConcentrationSerpState:
+    """Lazy reusable browser page for concentration SERP fallback.
+
+    Fragrantica detail parsing already reuses the engine-level clearance
+    session. This state handles the separate DuckDuckGo concentration tier so a
+    large worker batch does not boot and quit Chromium for every unresolved
+    concentration.
+    """
+
+    def __init__(self, *, enabled: bool, debug: bool = False) -> None:
+        self.enabled = enabled
+        self.debug = debug
+        self._page: Any = None
+        self._uses = 0
+
+    def page(self) -> Any | None:
+        if not self.enabled:
+            return None
+        if self._page is None or self._uses >= CONCENTRATION_SERP_SESSION_JOBS:
+            self.close()
+            from concentration_grabber import SemanticScentEngine
+
+            deadline = time.monotonic() + SemanticScentEngine.SERP_TOTAL_BUDGET_SEC
+            self._page = SemanticScentEngine._new_serp_page(deadline)
+            self._uses = 0
+            if self.debug:
+                print("  [concentration] opened reusable SERP browser")
+        self._uses += 1
+        return self._page
+
+    def close(self) -> None:
+        page = self._page
+        self._page = None
+        self._uses = 0
+        quit_page = getattr(page, "quit", None)
+        if callable(quit_page):
+            with contextlib.suppress(Exception):
+                quit_page()
 
 
 @dataclass
@@ -1330,7 +1376,12 @@ _FG_METRIC_GROUPS = (
 
 
 def _resolve_concentration(
-    house: str, name: str, *, allow_serp: bool = True, debug: bool = False
+    house: str,
+    name: str,
+    *,
+    allow_serp: bool = True,
+    debug: bool = False,
+    serp_state: ConcentrationSerpState | None = None,
 ) -> dict[str, Any] | None:
     """Resolve a ScentCast concentration label for "<house> <name>".
 
@@ -1395,9 +1446,11 @@ def _resolve_concentration(
         if not allow_serp:
             return None
 
-        # Tier 2 -- SERP engine (slow; spins a local headless browser).
+        # Tier 2 -- SERP engine (slow; spins a local headless browser unless
+        # the worker supplies a reusable page for the current batch).
+        serp_page = serp_state.page() if serp_state is not None else None
         profile = _run_engine_call(
-            lambda: SemanticScentEngine.analyze(query), debug=debug
+            lambda: SemanticScentEngine.analyze(query, page=serp_page), debug=debug
         )
         if profile and profile.primary_confidence >= 50:
             label = to_scentcast_concentration(profile.primary_concentration)
@@ -1414,7 +1467,12 @@ def _resolve_concentration(
 
 
 def _apply_concentration(
-    payload: dict[str, Any], house: str, name: str, *, debug: bool = False
+    payload: dict[str, Any],
+    house: str,
+    name: str,
+    *,
+    debug: bool = False,
+    serp_state: ConcentrationSerpState | None = None,
 ) -> None:
     """Attach the resolved concentration to a /complete payload in place.
 
@@ -1428,6 +1486,7 @@ def _apply_concentration(
         name,
         allow_serp=_env_bool("ENRICHMENT_CONCENTRATION_SERP", True),
         debug=debug,
+        serp_state=serp_state,
     )
     if not resolved:
         return
@@ -1510,11 +1569,12 @@ def fetch_payload(
     *,
     detail_timeout: float,
     debug: bool = False,
+    concentration_serp: ConcentrationSerpState | None = None,
 ) -> dict[str, Any]:
     # Parfumo fallback (§6.C): the candidate carries a parsed Parfumo record and
     # no fg_url. Build a partial payload from it instead of fetching FG details.
     if candidate.resolver_source == "parfumo_fallback":
-        return _build_parfumo_payload(candidate, job)
+        return _build_parfumo_payload(candidate, job, concentration_serp=concentration_serp)
     if not candidate.frag_url:
         raise WorkerError("fg_url_missing_after_resolution", retryable=False)
     candidate.frag_url = engine.FragranticaEngine.canonical_url(candidate.frag_url)
@@ -1606,6 +1666,7 @@ def fetch_payload(
         identity["house"] or candidate.brand,
         identity["name"] or candidate.name,
         debug=debug,
+        serp_state=concentration_serp,
     )
     return payload
 
@@ -1613,6 +1674,8 @@ def fetch_payload(
 def _build_parfumo_payload(
     candidate: engine.UnifiedFragrance,
     job: dict[str, Any],
+    *,
+    concentration_serp: ConcentrationSerpState | None = None,
 ) -> dict[str, Any]:
     """Build the partial /complete payload for a Parfumo-sourced candidate (§6.C).
 
@@ -1666,7 +1729,7 @@ def _build_parfumo_payload(
         # Parfumo is never FG-complete; persist as a terminal partial.
         "quality_status": "partial",
     }
-    _apply_concentration(payload, candidate.brand, candidate.name)
+    _apply_concentration(payload, candidate.brand, candidate.name, serp_state=concentration_serp)
     return payload
 
 
@@ -1680,6 +1743,7 @@ def process_job(
     config: WorkerConfig,
     already_claimed: bool = False,
     result_sink: dict[str, Any] | None = None,
+    concentration_serp: ConcentrationSerpState | None = None,
 ) -> bool:
     job_id = str(job.get("id") or "")
     label = _job_label(job)
@@ -1706,6 +1770,7 @@ def process_job(
             job,
             detail_timeout=config.detail_timeout,
             debug=config.debug,
+            concentration_serp=concentration_serp,
         )
         dm = payload.pop("_derived_metrics", None)
         facts_filled, facts_missing = _payload_fact_summary(payload, dm)
@@ -1893,27 +1958,35 @@ def process_pending(
             f"{detail}"
         )
     engine_args = _build_engine_args()
+    concentration_serp = ConcentrationSerpState(
+        enabled=_env_bool("ENRICHMENT_CONCENTRATION_SERP", True),
+        debug=config.debug,
+    )
     completed = 0
     total = len(jobs)
-    for idx, job in enumerate(jobs, 1):
-        if stop and stop.stop_requested:
-            break
-        sink: dict[str, Any] = {}
-        ok = process_job(
-            client,
-            scraper,
-            engine_args,
-            job,
-            index_label=f"[{idx}/{total}]",
-            config=config,
-            result_sink=sink,
-        )
-        completed += 1 if ok else 0
-        if idx < total and not (stop and stop.stop_requested):
-            if sink.get("error") == "fg_resolver_blocked":
-                print("Fragrantica looks rate-limited; backing off 180s before the next job.")
-                sleep_conservatively(180.0, 0.0, stop)
-            sleep_conservatively(config.delay, config.jitter, stop)
+    try:
+        for idx, job in enumerate(jobs, 1):
+            if stop and stop.stop_requested:
+                break
+            sink: dict[str, Any] = {}
+            ok = process_job(
+                client,
+                scraper,
+                engine_args,
+                job,
+                index_label=f"[{idx}/{total}]",
+                config=config,
+                result_sink=sink,
+                concentration_serp=concentration_serp,
+            )
+            completed += 1 if ok else 0
+            if idx < total and not (stop and stop.stop_requested):
+                if sink.get("error") == "fg_resolver_blocked":
+                    print("Fragrantica looks rate-limited; backing off 180s before the next job.")
+                    sleep_conservatively(180.0, 0.0, stop)
+                sleep_conservatively(config.delay, config.jitter, stop)
+    finally:
+        concentration_serp.close()
     print(f"Processed {len(jobs)} job(s); completed {completed}.")
     return completed
 
@@ -1984,37 +2057,45 @@ def warm_list(client: ApiClient, config: WorkerConfig, path: str, stop: StopCont
         )
     engine_args = _build_engine_args()
     completed = 0
+    concentration_serp = ConcentrationSerpState(
+        enabled=_env_bool("ENRICHMENT_CONCENTRATION_SERP", True),
+        debug=config.debug,
+    )
     print(f"Warm list: {len(queries)} queries from {path}")
-    for idx, query in enumerate(queries, 1):
-        if stop and stop.stop_requested:
-            break
-        print(f"[{idx}/{len(queries)}] Resolving {query!r}")
-        synthetic = {"id": f"warm:{idx}", "query": query}
-        try:
-            candidate = resolve_candidate(scraper, engine_args, synthetic, debug=config.debug)
-            pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
-            match = _find_matching_job(pending, query, candidate)
-            if not match:
-                print(
-                    f"[{idx}/{len(queries)}] No matching pending job for {candidate.frag_url}; "
-                    "manual enqueue endpoint is unavailable."
+    try:
+        for idx, query in enumerate(queries, 1):
+            if stop and stop.stop_requested:
+                break
+            print(f"[{idx}/{len(queries)}] Resolving {query!r}")
+            synthetic = {"id": f"warm:{idx}", "query": query}
+            try:
+                candidate = resolve_candidate(scraper, engine_args, synthetic, debug=config.debug)
+                pending = client.list_jobs("pending", limit=MAX_LIST_LIMIT)
+                match = _find_matching_job(pending, query, candidate)
+                if not match:
+                    print(
+                        f"[{idx}/{len(queries)}] No matching pending job for {candidate.frag_url}; "
+                        "manual enqueue endpoint is unavailable."
+                    )
+                    continue
+                ok = process_job(
+                    client,
+                    scraper,
+                    engine_args,
+                    match,
+                    index_label=f"[{idx}/{len(queries)}]",
+                    config=config,
+                    concentration_serp=concentration_serp,
                 )
-                continue
-            ok = process_job(
-                client,
-                scraper,
-                engine_args,
-                match,
-                index_label=f"[{idx}/{len(queries)}]",
-                config=config,
-            )
-            completed += 1 if ok else 0
-        except WorkerError as exc:
-            print(f"[{idx}/{len(queries)}] Failed {query!r}: {exc.code}")
-            if config.debug and str(exc) != exc.code:
-                print(f"[{idx}/{len(queries)}] {exc}")
-        if idx < len(queries) and not (stop and stop.stop_requested):
-            sleep_conservatively(config.delay, config.jitter, stop)
+                completed += 1 if ok else 0
+            except WorkerError as exc:
+                print(f"[{idx}/{len(queries)}] Failed {query!r}: {exc.code}")
+                if config.debug and str(exc) != exc.code:
+                    print(f"[{idx}/{len(queries)}] {exc}")
+            if idx < len(queries) and not (stop and stop.stop_requested):
+                sleep_conservatively(config.delay, config.jitter, stop)
+    finally:
+        concentration_serp.close()
     print(f"Warm-list completed {completed} matching job(s).")
     return completed
 
@@ -2638,6 +2719,10 @@ def _run_auto_approve(
     if auto_state.get("scraper") is None:
         auto_state["scraper"] = engine.get_scraper()
         auto_state["args"] = _build_engine_args()
+        auto_state["concentration_serp"] = ConcentrationSerpState(
+            enabled=_env_bool("ENRICHMENT_CONCENTRATION_SERP", True),
+            debug=config.debug,
+        )
         # Same preflight process_pending hard-fails on. Auto mode keeps going
         # (jobs may still resolve via the API or Parfumo), but the operator
         # must see why Fragrantica detail fetches are unavailable.
@@ -2684,6 +2769,7 @@ def _run_auto_approve(
                 index_label="[auto]",
                 config=config,
                 result_sink=sink,
+                concentration_serp=auto_state.get("concentration_serp"),
             )
     except KeyboardInterrupt:
         stop.stop_requested = True
@@ -2958,6 +3044,10 @@ def run_live_dashboard(
         else:
             # 'r' or any other key — just refresh.
             refresh_now = True
+    concentration_serp = auto_state.get("concentration_serp")
+    close_concentration_serp = getattr(concentration_serp, "close", None)
+    if callable(close_concentration_serp):
+        close_concentration_serp()
     print("\nLeaving SRT Set Engine.")
     return 0
 
