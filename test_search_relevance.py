@@ -327,6 +327,7 @@ def test_api_cache_fallback_uses_long_anchor_variants() -> None:
         str(results),
     )
     check("fallback source is aggregate DB", diagnostics.get("fallback_source") == "aggregate_db", str(diagnostics))
+    check("fallback warning labels aggregate DB cache", "aggregate DB cache" in diagnostics.get("warning", ""), str(diagnostics))
 
 
 def test_api_strong_cache_precheck_skips_live_identity_hit() -> None:

@@ -2105,9 +2105,13 @@ def search(
         diagnostics["timing"] = timing
     if fallback_source:
         diagnostics["fallback_source"] = fallback_source
-        fallback_label = (
-            "identity cache" if fallback_source == "identity" else f"{fallback_source} detail cache"
-        )
+        fallback_labels = {
+            "aggregate_db": "aggregate DB cache",
+            "db": "database detail cache",
+            "json": "bundled detail cache",
+            "identity": "identity cache",
+        }
+        fallback_label = fallback_labels.get(fallback_source, f"{fallback_source} cache")
         if live_search_saturated:
             diagnostics["warning"] = (
                 "Live search capacity is saturated; results came from the "
