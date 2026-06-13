@@ -603,6 +603,7 @@ class IdentityTools:
         "maison martin margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
         "martin margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
         "replica": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
+        "thom browne": {"thom browne", "thombrony"},
     }
     # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
     # Keys are normalized sub-line tokens; values are designer labels to crawl.
@@ -3190,7 +3191,7 @@ class DecodoScraperClient:
 
     PROVIDER_NAME = "decodo"
     ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
-    MAX_TIMEOUT = 8.0
+    MAX_TIMEOUT = 15.0
     # An abandoned call still spends a Decodo credit, and URL discovery
     # measures ~2-4s per call: below this remaining budget the client skips
     # the request instead of starting one that cannot plausibly finish.
@@ -9851,7 +9852,7 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
     # page and one to enumerate perfume URLs under the designer slug.
     budget = max(
         2.4,
-        getattr(args, "spell_repair_budget", 4.0) + getattr(args, "fg_timeout", 4.5),
+        getattr(args, "spell_repair_budget", 4.0) + getattr(args, "fg_timeout", 4.5) + 8.0,
     )
     deadline = Deadline(budget)
     labels: list[str] = []
@@ -9877,6 +9878,12 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
         add_label(canonical_brand)
     for label in IdentityTools.catalog_brand_keys(canonical_brand, query):
         add_label(label)
+    query_tokens = QueryRepair._tokens(query)
+    if (
+        1 <= len(query_tokens) <= 4
+        and not any(token in QueryRepair.BAD_SUGGESTION_PARTS for token in query_tokens)
+    ):
+        add_label(query)
 
     rows: list[UnifiedFragrance] = []
     seen_urls: set[str] = set()

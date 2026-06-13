@@ -1281,6 +1281,12 @@ def test_decodo_designer_fallback_resolves_thombrony() -> None:
     old_designer = engine.DecodoScraperClient.search_fragrantica_designer_urls
     old_brand = engine.DecodoScraperClient.search_fragrantica_brand_urls
     try:
+        check(
+            "collapsed Thom Browne query maps to the canonical brand",
+            engine.IdentityTools.canonical_brand_query("THOMBRONY") == "thom browne",
+            engine.IdentityTools.canonical_brand_query("THOMBRONY"),
+        )
+
         def fake_designer(query, deadline=None, timeout=8.0, max_results=5):
             del deadline, timeout, max_results
             return (

@@ -40,6 +40,8 @@ Changed `fragrance_parser_full_rewrite_fixed.py` to:
 - Parse canonical Fragrantica designer URLs.
 - Add Decodo-backed designer discovery: query the structured provider for a designer page, then query the structured provider for perfume URLs under that designer slug, e.g. `site:fragrantica.com/perfume/Thom-Browne`.
 - Add a focused cold-search fallback that emits Fragrantica perfume rows from the top resolved designer page. This avoids direct Railway-to-Fragrantica designer crawling and preserves existing perfume URL ranking behavior.
+- Increase the slow-path Decodo timeout/budget after production logs showed designer discovery timing out at 8 seconds.
+- Add a specific collapsed-brand alias for the reported `THOMBRONY` input so it can go directly to the Thom Browne perfume URL lookup even when designer-page discovery is slow.
 
 ## Verification
 
@@ -59,3 +61,13 @@ python scripts\verify_production.py --url https://srt-scent-engine-production.up
 Result: `6/6` checks passed.
 
 The targeted `THOMBRONY` production call still depends on this commit being deployed. After deploy, the expected behavior is non-empty Thom Browne fragrance rows with `fg_url` populated from Fragrantica perfume URLs.
+
+## Post-Deploy Observation
+
+The first deployment of the generic designer fallback reached the new code path, but Railway logs showed:
+
+```text
+[SYS] Decodo Fragrantica designer discovery failed (ReadTimeout) ... read timeout=8.0
+```
+
+The final hardening pass raises that timeout and adds the direct `THOMBRONY` brand repair so the reported user query is not solely dependent on the slower designer-page lookup.
