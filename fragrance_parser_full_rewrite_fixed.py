@@ -9866,13 +9866,6 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
         seen_labels.add(norm)
         labels.append(cleaned)
 
-    for url in provider.search_fragrantica_designer_urls(
-        query,
-        deadline=deadline,
-        max_results=1,
-    ):
-        add_label(FragranticaEngine.designer_name_from_url(url))
-
     canonical_brand = IdentityTools.canonical_brand_query(query)
     if canonical_brand:
         add_label(canonical_brand)
@@ -9887,33 +9880,48 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
 
     rows: list[UnifiedFragrance] = []
     seen_urls: set[str] = set()
-    for label in labels:
-        if deadline.expired():
-            break
-        for url in provider.search_fragrantica_brand_urls(
-            label,
+
+    def collect_rows_for_labels() -> None:
+        for label in labels:
+            if deadline.expired():
+                break
+            for url in provider.search_fragrantica_brand_urls(
+                label,
+                deadline=deadline,
+                max_results=getattr(args, "max_results", 25),
+            ):
+                key = FragranticaEngine.dedupe_key(url)
+                if not key or key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                row = UnifiedFragrance(
+                    name=FragranticaEngine.name_from_url(url),
+                    brand=FragranticaEngine.brand_from_url(url) or label,
+                    year="",
+                    frag_url=url,
+                    resolver_source="decodo_fragrantica_designer_catalog",
+                    resolver_score=0.88,
+                )
+                if not row.name:
+                    continue
+                # The designer/brand URL evidence proves the query resolved to
+                # this brand, so brand-only queries should not be rejected
+                # because they do not contain each individual perfume name.
+                row.query_score = max(IdentityTools.relevance_score(query, row), 0.90)
+                rows.append(row)
+
+    # Try direct canonical/brand labels first. Designer-page SERPs are slower
+    # and can time out; they should not starve a clear brand query like
+    # "Thom Browne" or a known collapsed alias like "THOMBRONY".
+    collect_rows_for_labels()
+    if not rows and not deadline.expired():
+        for url in provider.search_fragrantica_designer_urls(
+            query,
             deadline=deadline,
-            max_results=getattr(args, "max_results", 25),
+            max_results=1,
         ):
-            key = FragranticaEngine.dedupe_key(url)
-            if not key or key in seen_urls:
-                continue
-            seen_urls.add(key)
-            row = UnifiedFragrance(
-                name=FragranticaEngine.name_from_url(url),
-                brand=FragranticaEngine.brand_from_url(url) or label,
-                year="",
-                frag_url=url,
-                resolver_source="decodo_fragrantica_designer_catalog",
-                resolver_score=0.88,
-            )
-            if not row.name:
-                continue
-            # The designer URL is canonical evidence that the query resolved to
-            # this brand, so brand-only queries should not be rejected because
-            # they do not contain each individual perfume name.
-            row.query_score = max(IdentityTools.relevance_score(query, row), 0.90)
-            rows.append(row)
+            add_label(FragranticaEngine.designer_name_from_url(url))
+        collect_rows_for_labels()
 
     rows.sort(key=lambda item: (item.query_score, item.resolver_score, item.name), reverse=True)
     return rows[: getattr(args, "max_results", 25)]

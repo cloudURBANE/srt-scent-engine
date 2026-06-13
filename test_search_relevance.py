@@ -1302,7 +1302,7 @@ def test_decodo_designer_fallback_resolves_thombrony() -> None:
                     "https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-And-Rose-57793.html",
                     "https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-Absolute-57791.html",
                 ]
-                if brand == "Thom Browne"
+                if engine.TextSanitizer.normalize_identity(brand) == "thom browne"
                 else []
             )
 
@@ -1314,6 +1314,7 @@ def test_decodo_designer_fallback_resolves_thombrony() -> None:
         )
         args = engine.build_parser().parse_args([])
         rows = engine._designer_provider_fallback_results("THOMBRONY", args)
+        clean_rows = engine._designer_provider_fallback_results("Thom Browne", args)
     finally:
         engine.DecodoScraperClient.search_fragrantica_designer_urls = old_designer
         engine.DecodoScraperClient.search_fragrantica_brand_urls = old_brand
@@ -1321,6 +1322,8 @@ def test_decodo_designer_fallback_resolves_thombrony() -> None:
 
     identities = [(row.brand, row.name, row.frag_url, row.resolver_source) for row in rows]
     check("THOMBRONY resolves to Thom Browne catalog rows", len(rows) == 2, str(identities))
+    clean_identities = [(row.brand, row.name, row.frag_url, row.resolver_source) for row in clean_rows]
+    check("Thom Browne resolves to Thom Browne catalog rows", len(clean_rows) == 2, str(clean_identities))
     check(
         "designer fallback emits Fragrantica perfume URLs",
         all(row.frag_url and row.brand == "Thom Browne" for row in rows),
