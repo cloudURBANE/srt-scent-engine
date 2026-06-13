@@ -18,7 +18,7 @@
         "first_error": null,
         "first_live_search_skipped": true,
         "first_result_count": 3,
-        "first_seconds": 0.25,
+        "first_seconds": 0.203,
         "first_status": 200,
         "first_transport_error": null,
         "query": "Creed Aventus",
@@ -26,7 +26,7 @@
         "second_error": null,
         "second_live_search_skipped": true,
         "second_result_count": 3,
-        "second_seconds": 0.234,
+        "second_seconds": 0.187,
         "second_status": 200,
         "second_transport_error": null
       },

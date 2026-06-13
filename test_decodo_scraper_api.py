@@ -114,6 +114,8 @@ def _clear_decodo_env() -> None:
     for key in _SAVED_ENV_KEYS:
         os.environ.pop(key, None)
     engine.DecodoScraperClient._cache.clear()
+    engine.DecodoScraperClient._designer_cache.clear()
+    engine.DecodoScraperClient._brand_perfume_cache.clear()
     engine.DecodoScraperClient._parfumo_cache.clear()
     engine.DecodoScraperClient._image_cache.clear()
 
@@ -322,12 +324,81 @@ def test_structured_search_provider_selection() -> None:
         os.environ["SERP_API_PROVIDER"] = "serper"
         os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
         check(
-            "Serper provider env no longer selects a structured provider",
-            engine.structured_search_provider() is None,
+            "Legacy Serper provider env does not block Decodo credentials",
+            engine.structured_search_provider() is engine.DecodoScraperClient,
             str(engine.structured_search_provider()),
         )
     finally:
         _restore_env(saved)
+
+
+def test_decodo_designer_and_brand_discovery() -> None:
+    print("Decodo designer/brand discovery checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    seen_queries: list[str] = []
+    try:
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            del url, headers, timeout, kwargs
+            query = str((json or {}).get("query") or "")
+            seen_queries.append(query)
+            if "designers" in query:
+                return _FakeDecodoResponse({
+                    "results": [
+                        {
+                            "content": {
+                                "results": {
+                                    "organic": [
+                                        {"url": "https://www.fragrantica.com/designers/Thom-Browne.html"},
+                                        {"url": "https://www.fragrantica.com/designers/Molton-Brown.html"},
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                })
+            return _FakeDecodoResponse({
+                "results": [
+                    {
+                        "content": {
+                            "results": {
+                                "organic": [
+                                    {"url": "https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-And-Rose-57793.html"},
+                                    {"url": "https://www.fragrantica.com/perfume/Molton-Brown/Jasmine-Sun-Rose-52035.html"},
+                                ]
+                            }
+                        }
+                    }
+                ]
+            })
+
+        engine.requests.post = fake_post
+        designers = engine.DecodoScraperClient.search_fragrantica_designer_urls("THOMBRONY")
+        brand_urls = engine.DecodoScraperClient.search_fragrantica_brand_urls("Thom Browne")
+    finally:
+        engine.requests.post = old_post
+        _restore_env(saved)
+
+    check(
+        "Decodo keeps canonical Fragrantica designer URLs",
+        designers[:1] == ["https://www.fragrantica.com/designers/Thom-Browne.html"]
+        and "https://www.fragrantica.com/designers/Molton-Brown.html" in designers,
+        str(designers),
+    )
+    check(
+        "Decodo brand URL discovery scopes to the designer perfume path",
+        any(query == "site:fragrantica.com/perfume/Thom-Browne" for query in seen_queries),
+        str(seen_queries),
+    )
+    check(
+        "Decodo brand URL discovery keeps only matching-brand perfume URLs",
+        brand_urls == ["https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-And-Rose-57793.html"],
+        str(brand_urls),
+    )
 
 
 def main() -> int:
@@ -336,6 +407,7 @@ def main() -> int:
     test_decodo_username_password_auth_fallback()
     test_decodo_auth_token_alias_and_casing()
     test_structured_search_provider_selection()
+    test_decodo_designer_and_brand_discovery()
     print()
     print("All Decodo scraper API checks passed.")
     return 0
