@@ -3197,6 +3197,7 @@ class DecodoScraperClient:
     MIN_VIABLE_BUDGET = 1.2
     _RESOLVER_SCORE = 0.9
     _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
+    _LEGACY_PROVIDER_ALIASES = {"serper", "scrapedo", "scrape_do", "scrape.do", "scrapedo_proxy"}
     _BASIC_TOKEN_ENV = (
         "DECODO_API_BASIC_TOKEN",
         "DECODO_SCRAPER_BASIC_TOKEN",
@@ -3226,6 +3227,8 @@ class DecodoScraperClient:
         "alt",
     )
     _cache: dict[str, list[str]] = {}
+    _designer_cache: dict[str, list[str]] = {}
+    _brand_perfume_cache: dict[str, list[str]] = {}
     _parfumo_cache: dict[str, list[str]] = {}
     _image_cache: dict[str, list[dict]] = {}
     _cache_lock = threading.Lock()
@@ -3234,9 +3237,15 @@ class DecodoScraperClient:
     def enabled() -> bool:
         raw_provider = (os.environ.get("SERP_API_PROVIDER") or "").strip().lower()
         provider = raw_provider or "decodo"
-        if provider not in DecodoScraperClient._PROVIDER_ALIASES:
-            return False
-        return bool(DecodoScraperClient._auth_header())
+        has_auth = bool(DecodoScraperClient._auth_header())
+        if provider in DecodoScraperClient._PROVIDER_ALIASES:
+            return has_auth
+        # Serper/Scrape.do are deprecated in this engine. If a deployment kept an
+        # old provider flag but added Decodo credentials, do not silently disable
+        # all structured discovery.
+        if provider in DecodoScraperClient._LEGACY_PROVIDER_ALIASES:
+            return has_auth
+        return False
 
     @staticmethod
     def _cache_key(query: str) -> str:
@@ -3503,12 +3512,31 @@ class DecodoScraperClient:
             cached = cls._cache.get(cache_key)
         if cached is not None:
             return list(cached)
+        urls = cls._search_fragrantica_urls_for_google_query(
+            f"{query} site:fragrantica.com/perfume",
+            deadline=deadline,
+            timeout=timeout,
+        )
+        with cls._cache_lock:
+            cls._cache[cache_key] = list(urls)
+        return urls
+
+    @classmethod
+    def _search_fragrantica_urls_for_google_query(
+        cls,
+        search_query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> list[str]:
+        search_query = (search_query or "").strip()
+        if not search_query or not cls.enabled():
+            return []
         budget = cls._viable_budget(timeout, deadline)
         if budget <= 0:
             return []
         urls: list[str] = []
         try:
-            payload = cls._post_google(f"{query} site:fragrantica.com/perfume", budget)
+            payload = cls._post_google(search_query, budget)
             seen: set[str] = set()
             for entry in cls._search_entries(payload):
                 canonical = FragranticaEngine.canonical_url(cls._entry_link(entry))
@@ -3522,8 +3550,109 @@ class DecodoScraperClient:
         except Exception as exc:
             cls._log_request_failure("Fragrantica URL discovery", exc)
             return []
+        return urls
+
+    @classmethod
+    def search_fragrantica_designer_urls(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 5,
+    ) -> list[str]:
+        query = (query or "").strip()
+        if not query or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(query)
         with cls._cache_lock:
-            cls._cache[cache_key] = list(urls)
+            cached = cls._designer_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        budget = cls._viable_budget(timeout, deadline)
+        if budget <= 0:
+            return []
+        urls: list[str] = []
+        try:
+            payload = cls._post_google(f"{query} fragrance site:fragrantica.com/designers", budget)
+            seen: set[str] = set()
+            for entry in cls._search_entries(payload):
+                canonical = FragranticaEngine.canonical_url(cls._entry_link(entry))
+                if not canonical or not FragranticaEngine.is_designer_url(canonical):
+                    continue
+                key = TextSanitizer.normalize_identity(FragranticaEngine.designer_name_from_url(canonical))
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                urls.append(canonical)
+                if max_results and len(urls) >= max_results:
+                    break
+        except Exception as exc:
+            cls._log_request_failure("Fragrantica designer discovery", exc)
+            return []
+        with cls._cache_lock:
+            cls._designer_cache[cache_key] = list(urls)
+        return urls
+
+    @staticmethod
+    def _brand_slug_candidates(brand: str, limit: int = 4) -> list[str]:
+        cleaned = TextSanitizer.clean(brand)
+        if not cleaned:
+            return []
+        unaccented = "".join(
+            ch for ch in unicodedata.normalize("NFKD", cleaned)
+            if not unicodedata.combining(ch)
+        )
+        variants = [cleaned] if unaccented == cleaned else [unaccented, cleaned]
+        slugs: list[str] = []
+        for text in variants:
+            no_punct = re.sub(r"[^A-Za-z0-9\s-]", "", text)
+            for raw in (text, no_punct):
+                slug = re.sub(r"\s+", "-", raw.strip()).strip("-")
+                for candidate in (slug.title(), slug):
+                    if candidate and candidate not in slugs:
+                        slugs.append(candidate)
+        return slugs[: max(1, limit)]
+
+    @classmethod
+    def search_fragrantica_brand_urls(
+        cls,
+        brand: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 25,
+    ) -> list[str]:
+        brand = TextSanitizer.clean(brand)
+        if not brand or not cls.enabled():
+            return []
+        cache_key = cls._cache_key(brand)
+        with cls._cache_lock:
+            cached = cls._brand_perfume_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        urls: list[str] = []
+        seen: set[str] = set()
+        for slug in cls._brand_slug_candidates(brand):
+            if max_results and len(urls) >= max_results:
+                break
+            if deadline is not None and deadline.expired():
+                break
+            for url in cls._search_fragrantica_urls_for_google_query(
+                f"site:fragrantica.com/perfume/{slug}",
+                deadline=deadline,
+                timeout=timeout,
+            ):
+                parsed_brand = FragranticaEngine.brand_from_url(url)
+                if parsed_brand and not IdentityTools.compatible_brand(brand, parsed_brand):
+                    continue
+                key = FragranticaEngine.dedupe_key(url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                urls.append(url)
+                if max_results and len(urls) >= max_results:
+                    break
+        with cls._cache_lock:
+            cls._brand_perfume_cache[cache_key] = list(urls)
         return urls
 
     @classmethod
@@ -6913,6 +7042,11 @@ class FragranticaEngine:
     def is_perfume_url(url: str) -> bool:
         canonical = FragranticaEngine.canonical_url(url)
         return bool(FragranticaEngine.PERFUME_URL_RE.match(canonical or ""))
+
+    @staticmethod
+    def is_designer_url(url: str) -> bool:
+        canonical = FragranticaEngine.canonical_url(url)
+        return bool(re.search(r"^https://www\.fragrantica\.com/designers/[^/?#]+\.html$", canonical or "", re.I))
         
     @staticmethod
     def dedupe_key(url: str) -> str:
@@ -6932,6 +7066,14 @@ class FragranticaEngine:
     @staticmethod
     def brand_from_url(url: str) -> str:
         match = re.search(r"/perfume/([^/]+)/", url or "")
+        if not match:
+            return ""
+        return TextSanitizer.title_from_slug(match.group(1))
+
+    @staticmethod
+    def designer_name_from_url(url: str) -> str:
+        canonical = FragranticaEngine.canonical_url(url)
+        match = re.search(r"/designers/([^/?#]+)\.html$", canonical or "", re.I)
         if not match:
             return ""
         return TextSanitizer.title_from_slug(match.group(1))
@@ -9687,6 +9829,88 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     trace.print_summary(candidates)
     return candidates, bn_results, frag_results
 
+def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragrance]:
+    """Use structured SERP evidence to turn brand/designer queries into rows.
+
+    Cold searches for a designer that is not already in the DB can return zero
+    Basenotes rows and zero Fragrantica perfume URLs even when Fragrantica has a
+    designer page. The deployed runtime also cannot rely on directly crawling
+    that designer page, so this fallback asks the structured provider for the
+    designer URL, then asks Google for perfume URLs under that designer slug.
+    """
+    provider = structured_search_provider()
+    if provider is None:
+        return []
+    if not (
+        hasattr(provider, "search_fragrantica_designer_urls")
+        and hasattr(provider, "search_fragrantica_brand_urls")
+    ):
+        return []
+
+    # This path needs two structured-provider calls: one to resolve the designer
+    # page and one to enumerate perfume URLs under the designer slug.
+    budget = max(
+        2.4,
+        getattr(args, "spell_repair_budget", 4.0) + getattr(args, "fg_timeout", 4.5),
+    )
+    deadline = Deadline(budget)
+    labels: list[str] = []
+    seen_labels: set[str] = set()
+
+    def add_label(label: str) -> None:
+        cleaned = TextSanitizer.clean(label)
+        norm = TextSanitizer.normalize_identity(cleaned)
+        if not norm or norm in seen_labels:
+            return
+        seen_labels.add(norm)
+        labels.append(cleaned)
+
+    for url in provider.search_fragrantica_designer_urls(
+        query,
+        deadline=deadline,
+        max_results=1,
+    ):
+        add_label(FragranticaEngine.designer_name_from_url(url))
+
+    canonical_brand = IdentityTools.canonical_brand_query(query)
+    if canonical_brand:
+        add_label(canonical_brand)
+    for label in IdentityTools.catalog_brand_keys(canonical_brand, query):
+        add_label(label)
+
+    rows: list[UnifiedFragrance] = []
+    seen_urls: set[str] = set()
+    for label in labels:
+        if deadline.expired():
+            break
+        for url in provider.search_fragrantica_brand_urls(
+            label,
+            deadline=deadline,
+            max_results=getattr(args, "max_results", 25),
+        ):
+            key = FragranticaEngine.dedupe_key(url)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            row = UnifiedFragrance(
+                name=FragranticaEngine.name_from_url(url),
+                brand=FragranticaEngine.brand_from_url(url) or label,
+                year="",
+                frag_url=url,
+                resolver_source="decodo_fragrantica_designer_catalog",
+                resolver_score=0.88,
+            )
+            if not row.name:
+                continue
+            # The designer URL is canonical evidence that the query resolved to
+            # this brand, so brand-only queries should not be rejected because
+            # they do not contain each individual perfume name.
+            row.query_score = max(IdentityTools.relevance_score(query, row), 0.90)
+            rows.append(row)
+
+    rows.sort(key=lambda item: (item.query_score, item.resolver_score, item.name), reverse=True)
+    return rows[: getattr(args, "max_results", 25)]
+
 def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None) -> list[UnifiedFragrance]:
     # `timing`, when supplied, is filled in place with per-stage wall-clock
     # marks from the run that produced the returned candidates. A spell-repair
@@ -9738,6 +9962,9 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             if brand_results:
                 brand_results.sort(key=lambda x: x.query_score, reverse=True)
                 return brand_results[:args.max_results]
+        designer_results = _designer_provider_fallback_results(query, args)
+        if designer_results:
+            return designer_results
         best = max((item.query_score for item in candidates), default=0.0)
         if best < QueryRepair.MIN_USEFUL_TOP_SCORE:
             print(f"{Y}[SYS] Ignored weak FG-only fallback rows; best match was only {int(best * 100)}%.{Z}")

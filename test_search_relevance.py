@@ -930,6 +930,8 @@ def _set_decodo_env(enabled: bool, *, provider: str | None = "decodo") -> dict[s
             os.environ["SERP_API_PROVIDER"] = provider
         os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
     engine.DecodoScraperClient._cache.clear()
+    engine.DecodoScraperClient._designer_cache.clear()
+    engine.DecodoScraperClient._brand_perfume_cache.clear()
     engine.DecodoScraperClient._parfumo_cache.clear()
     engine.DecodoScraperClient._image_cache.clear()
     return saved
@@ -942,6 +944,8 @@ def _restore_decodo_env(saved: dict[str, str | None]) -> None:
         else:
             os.environ[key] = value
     engine.DecodoScraperClient._cache.clear()
+    engine.DecodoScraperClient._designer_cache.clear()
+    engine.DecodoScraperClient._brand_perfume_cache.clear()
     engine.DecodoScraperClient._parfumo_cache.clear()
     engine.DecodoScraperClient._image_cache.clear()
 
@@ -1010,12 +1014,16 @@ def test_decodo_disabled_without_credentials() -> None:
     check("disabled Decodo makes no HTTP call", calls["http"] == 0, str(calls))
 
 
-def test_decodo_rejects_serper_provider_env() -> None:
-    print("Decodo-only provider selection checks:")
+def test_decodo_legacy_provider_env_does_not_block_credentials() -> None:
+    print("Decodo legacy-provider selection checks:")
     saved = _set_decodo_env(enabled=True, provider="serper")
     try:
-        check("Decodo is disabled when provider env explicitly requests Serper", engine.DecodoScraperClient.enabled() is False, "")
-        check("Serper env no longer selects a structured provider", engine.structured_search_provider() is None, str(engine.structured_search_provider()))
+        check("Decodo stays enabled when stale Serper env is present", engine.DecodoScraperClient.enabled() is True, "")
+        check(
+            "stale Serper env selects Decodo when Decodo credentials exist",
+            engine.structured_search_provider() is engine.DecodoScraperClient,
+            str(engine.structured_search_provider()),
+        )
     finally:
         _restore_decodo_env(saved)
 
@@ -1267,6 +1275,58 @@ def test_initio_prives_decodo_url_survives_merge() -> None:
     )
 
 
+def test_decodo_designer_fallback_resolves_thombrony() -> None:
+    print("Decodo designer fallback checks:")
+    saved = _set_decodo_env(enabled=True)
+    old_designer = engine.DecodoScraperClient.search_fragrantica_designer_urls
+    old_brand = engine.DecodoScraperClient.search_fragrantica_brand_urls
+    try:
+        def fake_designer(query, deadline=None, timeout=8.0, max_results=5):
+            del deadline, timeout, max_results
+            return (
+                ["https://www.fragrantica.com/designers/Thom-Browne.html"]
+                if query == "THOMBRONY"
+                else []
+            )
+
+        def fake_brand(brand, deadline=None, timeout=8.0, max_results=25):
+            del deadline, timeout, max_results
+            return (
+                [
+                    "https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-And-Rose-57793.html",
+                    "https://www.fragrantica.com/perfume/Thom-Browne/Vetyver-Absolute-57791.html",
+                ]
+                if brand == "Thom Browne"
+                else []
+            )
+
+        engine.DecodoScraperClient.search_fragrantica_designer_urls = classmethod(
+            lambda cls, *args, **kwargs: fake_designer(*args, **kwargs)
+        )
+        engine.DecodoScraperClient.search_fragrantica_brand_urls = classmethod(
+            lambda cls, *args, **kwargs: fake_brand(*args, **kwargs)
+        )
+        args = engine.build_parser().parse_args([])
+        rows = engine._designer_provider_fallback_results("THOMBRONY", args)
+    finally:
+        engine.DecodoScraperClient.search_fragrantica_designer_urls = old_designer
+        engine.DecodoScraperClient.search_fragrantica_brand_urls = old_brand
+        _restore_decodo_env(saved)
+
+    identities = [(row.brand, row.name, row.frag_url, row.resolver_source) for row in rows]
+    check("THOMBRONY resolves to Thom Browne catalog rows", len(rows) == 2, str(identities))
+    check(
+        "designer fallback emits Fragrantica perfume URLs",
+        all(row.frag_url and row.brand == "Thom Browne" for row in rows),
+        str(identities),
+    )
+    check(
+        "designer fallback labels the resolver source",
+        all(row.resolver_source == "decodo_fragrantica_designer_catalog" for row in rows),
+        str(identities),
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
@@ -1292,11 +1352,12 @@ def main() -> int:
     test_casamorati_tempio_catalog_identity_score()
     test_decodo_disabled_without_credentials()
     test_decodo_enabled_with_default_provider()
-    test_decodo_rejects_serper_provider_env()
+    test_decodo_legacy_provider_env_does_not_block_credentials()
     test_decodo_parses_fragrantica_urls()
     test_decodo_caches_responses()
     test_decodo_structured_spell_repair_evidence()
     test_initio_prives_decodo_url_survives_merge()
+    test_decodo_designer_fallback_resolves_thombrony()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
     test_dolce_gabbana_identity_recovery_and_persistence()
