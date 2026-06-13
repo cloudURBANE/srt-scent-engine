@@ -3652,8 +3652,25 @@ class DecodoScraperClient:
                 urls.append(url)
                 if max_results and len(urls) >= max_results:
                     break
-        with cls._cache_lock:
-            cls._brand_perfume_cache[cache_key] = list(urls)
+        if not urls and not (deadline is not None and deadline.expired()):
+            for url in cls._search_fragrantica_urls_for_google_query(
+                f'"{brand}" site:fragrantica.com/perfume',
+                deadline=deadline,
+                timeout=timeout,
+            ):
+                parsed_brand = FragranticaEngine.brand_from_url(url)
+                if parsed_brand and not IdentityTools.compatible_brand(brand, parsed_brand):
+                    continue
+                key = FragranticaEngine.dedupe_key(url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                urls.append(url)
+                if max_results and len(urls) >= max_results:
+                    break
+        if urls:
+            with cls._cache_lock:
+                cls._brand_perfume_cache[cache_key] = list(urls)
         return urls
 
     @classmethod
