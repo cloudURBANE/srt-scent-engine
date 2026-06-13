@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -148,6 +149,156 @@ def resolve_concentration(brand: str, name: str, use_browser: bool = True) -> di
         }
 
     return None
+
+
+# Engine labels whose token is short and common enough to also appear inside a
+# proper fragrance name ("Parfum des Merveilles", "Le Parfum de Therese"). They
+# are only trusted as a *trailing* modifier ("Bleu de Chanel Parfum"), the
+# convention for a concentration flanker. Distinctive multi-word labels
+# (EDP/EDT/EDC/Extrait/Elixir/Intense/...) are trusted anywhere in the
+# house-stripped name -- no perfume is named "Eau de Parfum" as a proper noun.
+_AMBIGUOUS_NAME_LABELS = {"Parfum (Profumo)", "Le Parfum"}
+_TRAILING_PARFUM_RE = re.compile(r"(?i)\b(?:le\s+)?parfum(?:\s+profumo)?\s*$")
+
+
+def _strip_house(name: str, house: str) -> str:
+    """Drop the house tokens from the name so a house literally containing a
+    concentration word ("Initio Parfums Prives") can't poison detection."""
+    out = str(name or "").strip()
+    house = str(house or "").strip()
+    if house:
+        out = re.sub(re.escape(house), " ", out, flags=re.I)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def resolve_concentration_strict(brand: str, name: str) -> dict | None:
+    """High-precision, zero-network concentration. Returns a resolved dict or None.
+
+    Only two trusted signals are consulted, both instant and offline:
+      * the Parfinity catalog (authoritative product_type), and
+      * an explicit concentration token in the *house-stripped* fragrance name.
+    Brand priors, pillar priors, and the SERP engine are intentionally excluded:
+    those are inferences. This path backfills ground-truth facts, never guesses,
+    so a record that currently shows no concentration is only ever filled with a
+    value the source data actually states.
+    """
+    brand = str(brand or "").strip()
+    name = str(name or "").strip()
+
+    # Tier 0 -- Parfinity catalog (instant, no browser, authoritative).
+    try:
+        from parfinity import lookup_concentration as _pf_lookup
+
+        hit = _pf_lookup(brand, name)
+    except Exception:
+        hit = None
+    if hit and hit != "Unknown":
+        return {
+            "concentration": hit,
+            "concentration_meta": {
+                "confidence": 95,
+                "source": "parfinity_catalog",
+                "resolved_at": _now_iso(),
+                "engine_label": hit,
+            },
+        }
+
+    # Tier 1 -- explicit concentration token in the house-stripped name.
+    modifier = _strip_house(name, brand)
+    label = SemanticScentEngine._detect_concentration_in(modifier)
+    if not label:
+        return None
+    if label in _AMBIGUOUS_NAME_LABELS and not _TRAILING_PARFUM_RE.search(modifier):
+        # A bare "Parfum" mid-name is part of the proper noun, not a flanker.
+        return None
+    scentcast = to_scentcast_concentration(label)
+    if scentcast == "Unknown":
+        return None
+    return {
+        "concentration": scentcast,
+        "concentration_meta": {
+            "confidence": 100,
+            "source": "name_explicit",
+            "resolved_at": _now_iso(),
+            "engine_label": label,
+        },
+    }
+
+
+def fetch_engine_gap_rows(cur, limit: int | None) -> list[dict]:
+    """fragrance_records identities whose concentration is null/empty/Unknown."""
+    cur.execute(
+        """
+        SELECT record_key, house, name, fg_raw_json
+        FROM fragrance_records
+        WHERE house IS NOT NULL AND name IS NOT NULL
+          AND house <> '' AND name <> ''
+          AND (fg_raw_json->>'concentration' IS NULL
+               OR LOWER(fg_raw_json->>'concentration') IN ('', 'unknown'))
+          AND (fg_raw_json->'raw_identity'->>'concentration' IS NULL
+               OR LOWER(fg_raw_json->'raw_identity'->>'concentration') IN ('', 'unknown'))
+        ORDER BY record_key
+        """
+        + (f" LIMIT {int(limit)}" if limit else "")
+    )
+    # SQL pre-filters cheaply; confirm with the same predicate the audit uses.
+    rows = []
+    for row in cur.fetchall():
+        if _is_unknown(_engine_concentration_from_fg_raw(dict(row["fg_raw_json"] or {}))):
+            rows.append(row)
+    return rows
+
+
+def run_engine_gap(args: argparse.Namespace) -> None:
+    """Backfill concentration straight off the engine's own completeness gap.
+
+    Sweeps fragrance_records (the table the /api/enrichment/completeness audit
+    reads) for rows missing concentration, resolves each with the strict offline
+    resolver, and merge-writes via update_engine_cache_rows -- which preserves
+    notes/reviews/frag_cards and refuses to overwrite an existing value. Idempotent
+    and safe to re-run; dry-run prints every proposed change without writing.
+    """
+    db.init_db()
+    if not db.ENABLED:
+        raise RuntimeError("DATABASE_URL not configured.")
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    dry_run = args.dry_run
+
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            rows = fetch_engine_gap_rows(cur, args.limit)
+
+    print(f"engine-gap: {len(rows)} fragrance_records missing concentration")
+    resolved = skipped = cache_rows = 0
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        house = str(row["house"] or "").strip()
+        name = str(row["name"] or "").strip()
+        key = (house.lower(), name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        res = resolve_concentration_strict(house, name)
+        if not res:
+            skipped += 1
+            continue
+        resolved += 1
+        conc = res["concentration"]
+        meta = res["concentration_meta"]
+        print(f"  {house} | {name}  ->  {conc}  (src={meta['source']}, label={meta['engine_label']})")
+        if dry_run:
+            continue
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                d, r = update_engine_cache_rows(cur, house, name, conc, meta)
+            conn.commit()
+        cache_rows += d + r
+
+    print(
+        f"\nengine-gap done. resolved={resolved} skipped={skipped} "
+        f"cache_rows_written={cache_rows} dry_run={dry_run}"
+    )
 
 
 def recalc_performance(existing: dict, old_conc: str, new_conc: str) -> dict:
@@ -378,10 +529,20 @@ def main() -> None:
     parser.add_argument("--brand", type=str, default=None, help="Target a specific brand")
     parser.add_argument("--name", type=str, default=None, help="Target a specific fragrance name")
     parser.add_argument("--tier1-only", action="store_true", help="Skip Tier-2 SERP (no browser)")
+    parser.add_argument(
+        "--engine-gap",
+        action="store_true",
+        help="Backfill concentration on the engine's own fragrance_records "
+        "completeness gap (strict offline resolver, merge-safe, idempotent).",
+    )
     args = parser.parse_args()
 
+    if args.engine_gap:
+        run_engine_gap(args)
+        return
+
     if not args.all_unknown and not args.brand and args.limit is None:
-        parser.error("Specify --all-unknown, --limit N, or --brand / --name to select rows.")
+        parser.error("Specify --all-unknown, --limit N, --brand / --name, or --engine-gap to select rows.")
 
     run(args)
 
