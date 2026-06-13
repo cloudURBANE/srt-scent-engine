@@ -159,6 +159,16 @@ _ARGS.metrics_budget = _env_float("API_METRICS_BUDGET", 0.0)
 # evidence (Decodo) needs ~2-4s per call; below ~1.2s remaining the engine
 # skips the structured leg entirely rather than spend a doomed request.
 _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 4.0)
+# Overall wall-clock ceiling for the entire live search path. Without it, a cold
+# bare-designer/brand query ("Thom Browne", "Tom Ford", "Maison Francis
+# Kurkdjian") stacks the independent spell-repair (~4s), designer-catalog (~3.5s)
+# and structured designer-provider (~16.5s) budgets serially and runs ~30s -- long
+# enough to exceed the client/gateway timeout and return an empty body. Capping
+# the chain lets the live engine bail in time and the DB cache fallback
+# (`_cache_search_fallback`, which already resolves brand queries from
+# aggregate_db) serve the request instead. 18s clears the legitimate ~17s cold
+# spell-repair path while cutting the runaway >30s designer stack.
+_ARGS.search_total_budget = _env_float("API_SEARCH_TOTAL_BUDGET", 18.0)
 
 _LIVE_SEARCH_MAX_CONCURRENT = max(1, _env_int("API_LIVE_SEARCH_MAX_CONCURRENT", 6))
 _LIVE_SEARCH_QUEUE_TIMEOUT = max(
