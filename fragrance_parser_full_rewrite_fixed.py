@@ -1460,7 +1460,7 @@ class QueryRepair:
         # Fragrantica result pool before wasting time on Google/Bing.
         QueryRepair._LAST_NATIVE_CANDIDATES = list(candidates[:40])
 
-        if not bn_results and not candidates:
+        if not candidates:
           return True
 
         bn_top = max((QueryRepair._score01(getattr(item, "query_score", 0.0)) for item in bn_results), default=0.0)

@@ -1333,6 +1333,23 @@ def test_decodo_designer_fallback_resolves_thombrony() -> None:
     )
 
 
+def test_zero_candidates_with_raw_bn_rows_still_repairs() -> None:
+    print("Zero-candidate repair gate checks:")
+    raw_bn = [
+        engine.UnifiedFragrance(
+            name="Unrelated Browne",
+            brand="Not Thom Browne",
+            year="",
+            query_score=0.95,
+        )
+    ]
+    check(
+        "raw BN rows do not suppress repair when no usable candidates survived",
+        engine.QueryRepair.needs_repair(raw_bn, []) is True,
+        "needs_repair returned False",
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
@@ -1364,6 +1381,7 @@ def main() -> int:
     test_decodo_structured_spell_repair_evidence()
     test_initio_prives_decodo_url_survives_merge()
     test_decodo_designer_fallback_resolves_thombrony()
+    test_zero_candidates_with_raw_bn_rows_still_repairs()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
     test_dolce_gabbana_identity_recovery_and_persistence()
