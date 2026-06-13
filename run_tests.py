@@ -20,6 +20,7 @@ from pathlib import Path
 
 TESTS = (
     "test_decodo_scraper_api.py",
+    "test_cold_path_decodo_recovery.py",
     "test_decodo_serp_proxy.py",
     "test_parfinity.py",
     "test_search_relevance.py",

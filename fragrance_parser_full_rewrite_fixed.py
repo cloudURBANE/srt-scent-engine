@@ -3235,6 +3235,16 @@ class DecodoScraperClient:
     # measures ~2-4s per call: below this remaining budget the client skips
     # the request instead of starting one that cannot plausibly finish.
     MIN_VIABLE_BUDGET = 1.2
+    # requests' single-float timeout applies to BOTH the connect and read
+    # phases, so a slow TLS connect alone could push a call far past the overall
+    # search deadline (the ~18s budget overshooting to ~20s on cold queries).
+    # Splitting into a (connect, read) tuple caps connection setup while the
+    # read budget tracks the remaining wall-clock time.
+    CONNECT_TIMEOUT = 3.05
+    # Leave a small margin so an in-flight request finishes *before* the overall
+    # deadline rather than running right up to (and slightly past) it. This is
+    # the second half of the cold-query overshoot fix.
+    DEADLINE_SAFETY = 0.4
     _RESOLVER_SCORE = 0.9
     _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
     _LEGACY_PROVIDER_ALIASES = {"serper", "scrapedo", "scrape_do", "scrape.do", "scrapedo_proxy"}
@@ -3330,9 +3340,11 @@ class DecodoScraperClient:
         ).strip() or "en-us"
 
     @classmethod
-    def _payload(cls, query: str, *, image_search: bool = False) -> dict[str, Any]:
+    def _payload(
+        cls, query: str, *, image_search: bool = False, target: str = "google_search"
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "target": "google_search",
+            "target": target,
             "query": query,
             "parse": True,
             "locale": cls._locale(),
@@ -3342,13 +3354,30 @@ class DecodoScraperClient:
         return payload
 
     @classmethod
+    def _request_timeout(cls, budget: float) -> tuple[float, float]:
+        """A (connect, read) timeout tuple bounded by the call budget.
+
+        A single-float requests timeout is applied to the connect phase *and*
+        each read separately, so a slow connect could double the wall-clock
+        cost of a call started near the deadline. Capping connect separately
+        keeps the worst case close to the read budget.
+        """
+        read = min(float(budget), cls.MAX_TIMEOUT)
+        connect = min(cls.CONNECT_TIMEOUT, read)
+        return (connect, read)
+
+    @classmethod
     def _viable_budget(cls, timeout: float, deadline: "Deadline | None") -> float:
         """Request budget in seconds, or 0.0 when too starved to finish."""
         budget = min(float(timeout), cls.MAX_TIMEOUT)
         if deadline is not None:
             if deadline.expired():
                 return 0.0
-            budget = min(budget, deadline.timeout(budget))
+            # Reserve DEADLINE_SAFETY so the request lands before the overall
+            # ceiling instead of straddling it. timeout() floors at 0.35, so the
+            # subtraction can drop below MIN_VIABLE_BUDGET -- that is the point:
+            # a call with too little runway is skipped, not started late.
+            budget = min(budget, deadline.timeout(budget) - cls.DEADLINE_SAFETY)
         return budget if budget >= cls.MIN_VIABLE_BUDGET else 0.0
 
     @staticmethod
@@ -3360,22 +3389,112 @@ class DecodoScraperClient:
         print(f"{Y}[SYS] Decodo {kind} failed ({type(exc).__name__}): {detail[:200]}{Z}")
 
     @classmethod
-    def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
-        if not cls.enabled():
-            raise RuntimeError("Decodo Scraper API is not enabled")
-        headers = {
+    def _headers(cls) -> dict[str, str]:
+        return {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Authorization": cls._auth_header(),
         }
+
+    @classmethod
+    def _post_serp(
+        cls,
+        query: str,
+        timeout: float,
+        *,
+        target: str = "google_search",
+        image_search: bool = False,
+    ) -> dict:
+        if not cls.enabled():
+            raise RuntimeError("Decodo Scraper API is not enabled")
         res = requests.post(
             cls.ENDPOINT,
-            json=cls._payload(query, image_search=image_search),
-            headers=headers,
-            timeout=min(float(timeout), cls.MAX_TIMEOUT),
+            json=cls._payload(query, image_search=image_search, target=target),
+            headers=cls._headers(),
+            timeout=cls._request_timeout(timeout),
         )
         res.raise_for_status()
         return res.json() or {}
+
+    @classmethod
+    def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
+        return cls._post_serp(query, timeout, target="google_search", image_search=image_search)
+
+    @classmethod
+    def _post_bing(cls, query: str, timeout: float) -> dict:
+        return cls._post_serp(query, timeout, target="bing_search")
+
+    @staticmethod
+    def _universal_fallback_enabled() -> bool:
+        """Operator kill-switch for the universal egress recovery.
+
+        Enabled by default: the universal fetch only fires when a direct
+        Fragrantica fetch already failed, so the extra credit is spent solely on
+        pages the runtime cannot reach otherwise. Set
+        ``DECODO_DISABLE_UNIVERSAL_FALLBACK=1`` to turn it off (e.g. to cap cost
+        or while debugging the direct path).
+        """
+        flag = (os.environ.get("DECODO_DISABLE_UNIVERSAL_FALLBACK") or "").strip().lower()
+        return flag not in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _extract_universal_html(cls, payload: Any) -> str:
+        """Pull the rendered page HTML out of a ``universal`` scrape response.
+
+        The v2/scrape envelope is ``{"results": [{"content": "<html>...",
+        "status_code": 200}]}``; some responses inline a single result at the
+        top level. Returns "" when no HTML-looking content is present.
+        """
+        if not isinstance(payload, dict):
+            return ""
+        results = payload.get("results")
+        nodes = results if isinstance(results, list) else [payload]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            content = node.get("content")
+            if isinstance(content, dict):
+                content = content.get("html") or content.get("content") or ""
+            if isinstance(content, str) and "<" in content:
+                return content
+        return ""
+
+    @classmethod
+    def fetch_url_html(
+        cls,
+        url: str,
+        deadline: "Deadline | None" = None,
+        timeout: float = MAX_TIMEOUT,
+    ) -> str | None:
+        """Fetch a page's rendered HTML through Decodo's unblocked egress.
+
+        The deployed runtime's datacenter IP is Cloudflare-blocked from
+        Fragrantica, so a direct fetch returns a challenge/empty body. The
+        ``universal`` target retrieves the same URL through Decodo's premium
+        proxy pool with JS rendering, which is not datacenter-blocked, and hands
+        back the page HTML for the engine's normal parser. Returns ``None`` on
+        any failure so callers degrade exactly as they did before.
+        """
+        url = (url or "").strip()
+        if not url or not cls.enabled() or not cls._universal_fallback_enabled():
+            return None
+        budget = cls._viable_budget(timeout, deadline)
+        if budget <= 0:
+            return None
+        try:
+            res = requests.post(
+                cls.ENDPOINT,
+                json={"target": "universal", "url": url, "headless": "html"},
+                headers=cls._headers(),
+                timeout=cls._request_timeout(budget),
+            )
+            res.raise_for_status()
+            data = res.json() or {}
+        except Exception as exc:
+            cls._log_request_failure("universal URL fetch", exc)
+            return None
+        html = cls._extract_universal_html(data)
+        return html or None
 
     @classmethod
     def _decode_jsonish(cls, value: Any) -> Any:
@@ -3574,22 +3693,41 @@ class DecodoScraperClient:
         budget = cls._viable_budget(timeout, deadline)
         if budget <= 0:
             return []
-        urls: list[str] = []
         try:
             payload = cls._post_google(search_query, budget)
-            seen: set[str] = set()
-            for entry in cls._search_entries(payload):
-                canonical = FragranticaEngine.canonical_url(cls._entry_link(entry))
-                if not canonical or not FragranticaEngine.is_perfume_url(canonical):
-                    continue
-                dedupe = FragranticaEngine.dedupe_key(canonical)
-                if dedupe in seen:
-                    continue
-                seen.add(dedupe)
-                urls.append(canonical)
         except Exception as exc:
             cls._log_request_failure("Fragrantica URL discovery", exc)
-            return []
+            payload = {}
+        urls = cls._collect_fragrantica_urls(payload)
+        if urls:
+            return urls
+        # Google returned nothing usable. Bing is an independent SERP index that
+        # often surfaces the same site:fragrantica.com/perfume page when Google
+        # is rate-limited or omits it -- a redundant discovery path that costs a
+        # second credit only on the (cold) queries that would otherwise be empty.
+        bing_budget = cls._viable_budget(timeout, deadline)
+        if bing_budget <= 0:
+            return urls
+        try:
+            bing_payload = cls._post_bing(search_query, bing_budget)
+        except Exception as exc:
+            cls._log_request_failure("Fragrantica URL discovery (bing)", exc)
+            return urls
+        return cls._collect_fragrantica_urls(bing_payload)
+
+    @classmethod
+    def _collect_fragrantica_urls(cls, payload: dict) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for entry in cls._search_entries(payload):
+            canonical = FragranticaEngine.canonical_url(cls._entry_link(entry))
+            if not canonical or not FragranticaEngine.is_perfume_url(canonical):
+                continue
+            dedupe = FragranticaEngine.dedupe_key(canonical)
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            urls.append(canonical)
         return urls
 
     @classmethod
@@ -4324,6 +4462,21 @@ def _response_has_challenge(res: Any) -> bool:
     if _CF_CHALLENGE_ORCHESTRATE_RE.search(head):
         return True
     return any(marker in head for marker in _HTTP_CHALLENGE_MARKERS)
+
+
+class _DecodoHtmlResponse:
+    """Minimal response shim wrapping HTML fetched via Decodo's universal egress.
+
+    Exposes the ``content`` / ``text`` / ``status_code`` attributes the
+    Fragrantica/Basenotes parsers and ``_response_has_challenge`` read, so a
+    page recovered through Decodo flows through the exact same parsing and
+    challenge-detection path as a directly fetched one.
+    """
+
+    def __init__(self, html: str, status_code: int = 200):
+        self.text = html or ""
+        self.content = self.text.encode("utf-8", "replace")
+        self.status_code = status_code
 
 
 def _clearance_env_present(prefix: str) -> bool:
@@ -7178,21 +7331,43 @@ class FragranticaEngine:
         diag["url"] = url
         timeout = deadline.timeout(15.0) if deadline else 15.0
         res = Http.get(scraper, url, timeout=timeout, referer=FragranticaEngine.BASE_URL, deadline=deadline, attempts=1)
-        if not res:
-            err = Http.last_error()
-            if err:
-                unified_details.fetch_errors["fg"] = err
-                diag["fetch_error"] = err
+        content: bytes | None = None
+        if res is not None and not _response_has_challenge(res):
+            diag["http_status"] = int(getattr(res, "status_code", 0) or 0)
+            diag["html_bytes"] = len(getattr(res, "content", b"") or b"")
+            diag["challenge_detected"] = False
+            content = res.content
+        else:
+            # Direct egress failed or hit a Cloudflare challenge -- the deployed
+            # datacenter IP is blocked from Fragrantica. Record why, then try to
+            # recover the page through Decodo's unblocked universal egress before
+            # giving up. This is the root-cause fix that stops cold results from
+            # collapsing to Basenotes-only / fragrantica_unreachable.
+            if res is None:
+                err = Http.last_error()
+                if err:
+                    unified_details.fetch_errors["fg"] = err
+                    diag["fetch_error"] = err
+            else:
+                diag["http_status"] = int(getattr(res, "status_code", 0) or 0)
+                diag["challenge_detected"] = True
+                unified_details.fetch_errors["fg"] = "challenge_page"
+                diag["fetch_error"] = "challenge_page"
+            fallback_html = DecodoScraperClient.fetch_url_html(url, deadline=deadline)
+            if fallback_html:
+                shim = _DecodoHtmlResponse(fallback_html)
+                if not _response_has_challenge(shim):
+                    content = shim.content
+                    diag["fetched_via"] = "decodo_universal"
+                    diag["html_bytes"] = len(content)
+                    diag["challenge_detected"] = False
+                    # Recovered: clear the direct-fetch error so the bundle is
+                    # not mislabeled unreachable downstream.
+                    unified_details.fetch_errors.pop("fg", None)
+                    diag.pop("fetch_error", None)
+        if content is None:
             return
-        diag["http_status"] = int(getattr(res, "status_code", 0) or 0)
-        diag["html_bytes"] = len(getattr(res, "content", b"") or b"")
-        challenge_detected = _response_has_challenge(res)
-        diag["challenge_detected"] = bool(challenge_detected)
-        if challenge_detected:
-            unified_details.fetch_errors["fg"] = "challenge_page"
-            diag["fetch_error"] = "challenge_page"
-            return
-        soup = BeautifulSoup(res.content, "html.parser", from_encoding="utf-8")
+        soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
 
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
