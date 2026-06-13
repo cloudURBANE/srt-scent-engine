@@ -50,7 +50,7 @@
             "expected_name": "Aventus",
             "match": {
               "house": "Creed",
-              "name": "Absolu Aventus"
+              "name": "Aventus"
             },
             "query": "creed avantus",
             "result_count": 6,
