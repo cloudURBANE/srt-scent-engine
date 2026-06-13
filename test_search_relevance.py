@@ -634,6 +634,39 @@ def test_q_relevance_is_word_based() -> None:
     check("D&G shorthand query matches canonical house", short_alias_score > 0.85, f"{short_alias_score:.3f}")
 
 
+def test_brand_alias_query_keeps_house_catalog() -> None:
+    print("Brand-alias query relevance checks:")
+    rows = [
+        candidate("Maison Francis Kurkdjian", "Baccarat Rouge 540"),
+        candidate("Maison Francis Kurkdjian", "Grand Soir"),
+        candidate("Creed", "Aventus"),
+        candidate("Dior", "Sauvage"),
+    ]
+    filtered = engine.filter_relevant_candidates("MFK", rows)
+    houses = {item.brand for item in filtered}
+    names = {item.name for item in filtered}
+    check("MFK keeps Maison Francis Kurkdjian results", houses == {"Maison Francis Kurkdjian"}, str(houses))
+    check("MFK keeps the whole MFK catalog, not one row", {"Baccarat Rouge 540", "Grand Soir"} <= names, str(names))
+    check("MFK does not leak into other houses", "Creed" not in houses and "Dior" not in houses, str(houses))
+
+    # A brand-only alias query must score the house strongly, while a
+    # brand+fragrance query must still discriminate within the house.
+    mfk_score = engine.IdentityTools.relevance_score(
+        "MFK", candidate("Maison Francis Kurkdjian", "Baccarat Rouge 540")
+    )
+    check("MFK alias scores the house strongly", mfk_score >= 0.99, f"{mfk_score:.3f}")
+    specific = engine.filter_relevant_candidates(
+        "dior sauvage",
+        [candidate("Dior", "J'adore Eau de Toilette 2002"), candidate("Dior", "Sauvage")],
+    )
+    specific_names = [item.name for item in specific]
+    check(
+        "brand-only boost does not relax brand+name filtering",
+        specific_names == ["Sauvage"],
+        str(specific_names),
+    )
+
+
 def test_dolce_gabbana_identity_recovery_and_persistence() -> None:
     print("Dolce Gabbana poisoned-row prevention checks:")
     row = engine.UnifiedFragrance(
@@ -662,6 +695,46 @@ def test_dolce_gabbana_identity_recovery_and_persistence() -> None:
         "persisted search row uses repaired house",
         bool(captured) and captured[0]["house"] == "Dolce Gabbana",
         str(captured),
+    )
+
+
+def test_house_echo_poison_is_suppressed() -> None:
+    print("House-echo poison suppression checks:")
+    check("Creed/Creed Suicide is detected as house echo", api._identity_is_house_echo("Creed", "Creed Suicide"), "")
+    check("self-named house echo is detected", api._identity_is_house_echo("creed", "creed"), "")
+    check("real fragrance is not flagged", not api._identity_is_house_echo("Aventus", "Creed"), "")
+    check("multi-word name is not flagged", not api._identity_is_house_echo("Santal 33", "Le Labo"), "")
+
+    poison = engine.UnifiedFragrance(name="Creed", brand="Creed Suicide", year="")
+    real = engine.UnifiedFragrance(name="Aventus", brand="Creed", year="")
+    check("poison row is denied a display identity", not api._candidate_has_display_identity(poison), "")
+    check("real row keeps its display identity", api._candidate_has_display_identity(real), "")
+    check(
+        "poison row is not persisted to the aggregate cache",
+        not api._search_identity_is_safe_to_store("Creed", "Creed Suicide", poison),
+        "",
+    )
+
+
+def test_brand_only_query_gets_catalog_labels() -> None:
+    print("Brand-only designer-catalog fallback checks:")
+    # The bug: a single-token house we don't alias produced no catalog labels,
+    # so the designer-catalog breadth crawl never ran when Serper/native-FG
+    # discovery came back empty.
+    check(
+        "single-token brand query yields catalog labels",
+        engine.IdentityTools.catalog_brand_keys("creed") == ["creed"],
+        str(engine.IdentityTools.catalog_brand_keys("creed")),
+    )
+    check(
+        "treating the query as a name still yields nothing (the original bug)",
+        engine.IdentityTools.catalog_brand_keys("", "creed") == [],
+        str(engine.IdentityTools.catalog_brand_keys("", "creed")),
+    )
+    check(
+        "multi-token brand+name query is left to the name path",
+        engine.IdentityTools.catalog_brand_keys("", "dior sauvage") == [],
+        str(engine.IdentityTools.catalog_brand_keys("", "dior sauvage")),
     )
 
 
@@ -1387,7 +1460,10 @@ def main() -> int:
     test_zero_candidates_with_raw_bn_rows_still_repairs()
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
+    test_brand_alias_query_keeps_house_catalog()
     test_dolce_gabbana_identity_recovery_and_persistence()
+    test_house_echo_poison_is_suppressed()
+    test_brand_only_query_gets_catalog_labels()
     test_poisoned_db_records_are_filtered()
     test_short_db_search_uses_word_boundaries()
     test_search_serialization_recovers_fragrantica_identity()

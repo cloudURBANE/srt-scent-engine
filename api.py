@@ -417,6 +417,29 @@ def _url_name_should_replace(
     return False
 
 
+def _identity_is_house_echo(name: str, house: str) -> bool:
+    """True when the ``name`` slot is really just the house repeated.
+
+    Live and cached rows occasionally store the house in the name slot
+    (e.g. name="Creed", house="Creed Suicide"), which renders as a fake
+    one-off result like "Creed by Creed Suicide". Worse, the write-through
+    cache persists it and the strong-cache precheck then serves that single
+    row and skips live search -- so one poisoned row permanently shadows the
+    house's real catalogue. A genuine fragrance name is never identical to,
+    nor a strict subset of, its own house name, so treat that shape as
+    poison on both the write and read paths.
+    """
+    name_norm = engine.TextSanitizer.normalize_identity(name)
+    house_norm = engine.TextSanitizer.normalize_identity(house)
+    if not name_norm or not house_norm:
+        return False
+    if name_norm == house_norm:
+        return True
+    name_tokens = set(name_norm.split())
+    house_tokens = set(house_norm.split())
+    return name_tokens.issubset(house_tokens) and len(house_tokens) > len(name_tokens)
+
+
 def _search_identity_is_safe_to_store(
     name: str,
     house: str,
@@ -425,6 +448,8 @@ def _search_identity_is_safe_to_store(
     if not name or not house:
         return False
     if engine.IdentityTools.bad_partial_house_remainder(name, house):
+        return False
+    if _identity_is_house_echo(name, house):
         return False
     if item.frag_url and not parfinity.is_parfinity_url(item.frag_url):
         url_name = engine.FragranticaEngine.name_from_url(item.frag_url)
@@ -488,9 +513,15 @@ def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]
 
 def _candidate_has_display_identity(item: engine.UnifiedFragrance) -> bool:
     identity = _recover_candidate_identity(item)
-    return not _identity_needs_recovery(identity["name"]) and not _identity_needs_recovery(
+    if _identity_needs_recovery(identity["name"]) or _identity_needs_recovery(
         identity["house"]
-    )
+    ):
+        return False
+    # Drop house-echo poison (e.g. "Creed" / "Creed Suicide") that would
+    # otherwise be served alone by the strong-cache precheck and shadow the
+    # house's real catalogue. Identity is recovered from canonical URLs first,
+    # so rows with a real Fragrantica/Basenotes URL are repaired before this.
+    return not _identity_is_house_echo(identity["name"], identity["house"])
 
 
 # ---------------------------------------------------------------------------
