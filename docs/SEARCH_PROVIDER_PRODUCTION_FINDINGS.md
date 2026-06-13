@@ -89,3 +89,12 @@ This verifies the search-engine side of the reported save-rejection path: a deta
 1. Add an explicit "details pending enrichment" state, or block save attempts when details have no usable notes, so a `200 OK` provisional details response is not treated as save-ready.
 2. Rework the cache-promotion verification case. The current unique `Creed Aventus Test <id>` query produced no candidates, so it cannot prove positive-result cache promotion.
 3. Investigate production search latency separately from details latency. Common typo-repair searches timed out under the guide's 15-second client budget but passed with 45 seconds.
+
+## Correction - 2026-06-12 (verifier was the fault, not the engine)
+
+Re-investigation showed two of the three "Verified Issues" above were artifacts of the verifier (`scripts/verify_production.py`), not production defects:
+
+- **Issue 2 (cache promotion) was a broken check.** `test_live_search_and_caching` queried a synthetic `"Creed Aventus Test <random>"` string. That matches no catalog entry, so the first pass returns zero candidates, nothing is cached, and the promotion assertion can never pass. It is also unverifiable for any novel query while Railway is 403'd by Fragrantica: a cold live result caches as a Basenotes-only row with no `frag_url`, and `_can_skip_live_search_with_cache` deliberately refuses to fast-path a row that lost its Fragrantica identity. The cache fast-path itself is healthy: a real FG-linked identity (`Creed Aventus`, `Xerjoff Naxos`) is served `live_search_skipped` / `cache_mode: precheck` in **~0.2-0.6s** on every pass. The check now asserts that production-true behavior and measures the timing.
+- **Issue 1 (search "timeout") was a too-tight client budget.** The cold spell-repair path (first pass -> SERP suggest -> second pass -> designer-catalog crawl) legitimately approaches ~17s; the verifier's 15s default was below that and reported a working path as hung. The default is now 30s, which clears the real latency while still flagging a genuinely stuck request.
+
+After both fixes the verifier reports **6/6** against `https://srt-scent-engine-production.up.railway.app` (see `production_verification_results.json`). Issue 3 (a `200 OK` details response can carry no usable notes) is unchanged and remains a downstream save-gating concern, not an engine defect: the engine already signals it honestly via `source_coverage.complete=false`, empty `raw.notes`, and an `enrichment.status` of `pending`/`processing` with `requires_worker=true`.
