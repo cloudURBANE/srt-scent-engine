@@ -1,0 +1,94 @@
+"""Tests for the strict, zero-network concentration resolver used by the
+engine-gap backfill (scripts/enrich_concentration.py --engine-gap).
+
+These cover the precision contract that makes the backfill safe to point at the
+production fragrance_records table: it fills ground-truth concentrations and
+never guesses. No database is required.
+"""
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+_MOD_PATH = Path(__file__).resolve().parent / "scripts" / "enrich_concentration.py"
+_spec = importlib.util.spec_from_file_location("enrich_concentration_under_test", _MOD_PATH)
+ec = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ec)
+
+
+@pytest.fixture(autouse=True)
+def _no_parfinity(monkeypatch):
+    """Isolate the name-derivation tier from the Parfinity catalog so name
+    cases are deterministic regardless of what the local catalog happens to hold.
+    The single Parfinity test re-patches this explicitly."""
+    import parfinity
+
+    monkeypatch.setattr(parfinity, "lookup_concentration", lambda brand, name: None)
+
+
+def _conc(brand, name):
+    res = ec.resolve_concentration_strict(brand, name)
+    return res["concentration"] if res else None
+
+
+# --- house-stripping keeps a concentration-bearing house from poisoning detection
+def test_strip_house_removes_house_tokens():
+    assert ec._strip_house("Oud For Happiness", "Initio Parfums Prives") == "Oud For Happiness"
+
+
+def test_house_with_parfum_token_does_not_leak():
+    # "Initio Parfums Prives" contains "Parfums"; the name has no concentration.
+    assert _conc("Initio Parfums Prives", "Oud For Happiness") is None
+
+
+# --- explicit, distinctive labels are trusted anywhere in the name
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Black Orchid Eau De Parfum", "Eau de Parfum"),
+        ("No 5 Eau De Toilette", "Eau de Toilette"),
+        ("No 5 Eau De Cologne", "Eau de Cologne"),
+        ("Baccarat Rouge 540 Extrait De Parfum", "Extrait"),
+        ("Sauvage Elixir", "Parfum"),  # Elixir collapses to Parfum in the scentcast union
+        ("Guilty Eau De Parfum Intense Pour Femme", "Eau de Parfum"),
+        ("J Adore Body Mist", "Body Spray"),
+    ],
+)
+def test_distinctive_labels_detected(name, expected):
+    assert _conc("Some House", name) == expected
+
+
+# --- the ambiguous bare "Parfum" is only trusted as a trailing modifier
+def test_trailing_parfum_is_a_concentration():
+    assert _conc("Chanel", "Bleu De Chanel Parfum") == "Parfum"
+    assert _conc("Hermes", "Terre d'Hermes Parfum") == "Parfum"
+
+
+def test_leading_parfum_is_part_of_the_name_not_a_concentration():
+    # "Parfum des Merveilles" / "Parfum d'Habit": the word is the proper noun.
+    assert _conc("Hermes", "Parfum des Merveilles") is None
+    assert _conc("Maitre Parfumeur Et Gantier", "Parfum Dhabit") is None
+
+
+# --- no concentration signal -> no value (never a guess)
+def test_no_signal_returns_none():
+    assert _conc("Dior", "Sauvage") is None
+    assert _conc("Chanel", "Coco") is None
+    assert _conc("Jar", "Bolt Of Lightning") is None
+
+
+# --- the Parfinity catalog tier is authoritative and consulted first
+def test_parfinity_catalog_tier(monkeypatch):
+    import parfinity
+
+    monkeypatch.setattr(parfinity, "lookup_concentration", lambda brand, name: "Extrait")
+    res = ec.resolve_concentration_strict("Nasomatto", "Black Afgano")
+    assert res["concentration"] == "Extrait"
+    assert res["concentration_meta"]["source"] == "parfinity_catalog"
+
+
+def test_name_explicit_provenance():
+    res = ec.resolve_concentration_strict("Chanel", "Bleu De Chanel Parfum")
+    assert res["concentration_meta"]["source"] == "name_explicit"
+    assert res["concentration_meta"]["confidence"] == 100
+    assert res["concentration_meta"]["engine_label"] == "Parfum (Profumo)"
