@@ -117,6 +117,36 @@ started. Provider failures are logged as `[SYS] Decodo ... failed (<error>)`
 so a read timeout, an auth failure, and an empty SERP are distinguishable in
 deploy logs.
 
+### Bing redundancy + universal egress recovery
+
+Two reliability additions reuse the same Decodo credentials (no new secrets):
+
+- **Bing fallback.** When Google SERP discovery returns no usable
+  `fragrantica.com/perfume` URL for a query, the engine retries the same scoped
+  query against Decodo's `bing_search` target. Bing is an independent index that
+  often surfaces the page when Google is rate-limited or omits it. The second
+  call only happens on the (cold) queries that would otherwise be empty, and is
+  gated by the same minimum-viable-budget rule.
+
+- **Universal egress recovery (`/details`).** The deployed datacenter IP is
+  Cloudflare-blocked from Fragrantica, so a direct page fetch returns a
+  challenge/empty body and cold details collapse to Basenotes-only. When the
+  direct fetch fails or hits a challenge, the engine re-fetches the *same URL's*
+  HTML through Decodo's `universal` target (premium-proxy egress with JS
+  rendering) and feeds it to the normal parser. Recovered details set
+  `diagnostics.fg.fetched_via = "decodo_universal"` and clear the
+  `fetch_errors.fg` flag. A recovered body is still run through challenge
+  detection, so a challenge shell is never accepted as a real page.
+
+  Set `DECODO_DISABLE_UNIVERSAL_FALLBACK=1` to turn the recovery off (cost cap /
+  debugging the direct path). It is enabled by default.
+
+The Decodo client also now sends a bounded `(connect, read)` request timeout and
+reserves a small safety margin against the overall search deadline, so an
+in-flight provider call started near the `API_SEARCH_TOTAL_BUDGET` ceiling can no
+longer overshoot it (the cause of cold queries running ~20s against an 18s
+budget).
+
 ## Basenotes / Chromium requirement
 
 The Basenotes scraper passes Cloudflare clearance by driving a real Chromium
