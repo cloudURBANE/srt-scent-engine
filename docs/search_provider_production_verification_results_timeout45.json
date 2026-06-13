@@ -1,6 +1,6 @@
 {
   "base_url": "https://srt-scent-engine-production.up.railway.app",
-  "passed": 4,
+  "passed": 5,
   "results": [
     {
       "details": {
@@ -15,17 +15,17 @@
     {
       "details": {
         "first_cache_mode": null,
-        "first_error": "The read operation timed out",
+        "first_error": null,
         "first_live_search_skipped": null,
-        "first_status": null,
-        "first_transport_error": "TimeoutError",
-        "query": "Creed Aventus Test 9678",
+        "first_status": 200,
+        "first_transport_error": null,
+        "query": "Creed Aventus Test 1036",
         "second_cache_mode": null,
-        "second_error": "The read operation timed out",
+        "second_error": null,
         "second_live_search_skipped": null,
         "second_result_count": 0,
-        "second_status": null,
-        "second_transport_error": "TimeoutError"
+        "second_status": 200,
+        "second_transport_error": null
       },
       "name": "live_search_cache_promotion",
       "passed": false
@@ -35,22 +35,28 @@
         "cases": [
           {
             "expected_name": "Naxos",
-            "match": null,
+            "match": {
+              "house": "Xerjoff",
+              "name": "Xj 1861 Naxos"
+            },
             "query": "xerjoff naxus",
-            "result_count": 0,
-            "status": null
+            "result_count": 1,
+            "status": 200
           },
           {
             "expected_name": "Aventus",
-            "match": null,
+            "match": {
+              "house": "Creed",
+              "name": "Aventus"
+            },
             "query": "creed avantus",
-            "result_count": 0,
-            "status": null
+            "result_count": 6,
+            "status": 200
           }
         ]
       },
       "name": "spelling_repair",
-      "passed": false
+      "passed": true
     },
     {
       "details": {

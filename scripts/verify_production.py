@@ -38,7 +38,7 @@ def request_json(
     method: str = "GET",
     data: bytes | None = None,
     timeout: float = 15.0,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int | None, dict[str, Any]]:
     headers = {"Content-Type": "application/json"}
     request = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
@@ -52,7 +52,7 @@ def request_json(
         except Exception:
             return exc.code, {"error": exc.reason}
     except Exception as exc:
-        return 500, {"error": str(exc)}
+        return None, {"transport_error": type(exc).__name__, "error": str(exc)}
 
 
 def record(name: str, passed: bool, details: dict[str, Any]) -> dict[str, Any]:
@@ -61,8 +61,8 @@ def record(name: str, passed: bool, details: dict[str, Any]) -> dict[str, Any]:
     return {"name": name, "passed": passed, "details": details}
 
 
-def test_health(base_url: str) -> dict[str, Any]:
-    status, response = request_json(f"{base_url}/health")
+def test_health(base_url: str, timeout: float) -> dict[str, Any]:
+    status, response = request_json(f"{base_url}/health", timeout=timeout)
     return record(
         "health",
         status == 200 and response.get("ok") is True,
@@ -70,15 +70,21 @@ def test_health(base_url: str) -> dict[str, Any]:
     )
 
 
-def test_live_search_and_caching(base_url: str) -> dict[str, Any]:
+def test_live_search_and_caching(base_url: str, timeout: float) -> dict[str, Any]:
     suffix = random.randint(1000, 9999)
     query = f"Creed Aventus Test {suffix}"
     encoded_query = urllib.parse.quote(query)
 
-    status1, response1 = request_json(f"{base_url}/api/fragrances/search?q={encoded_query}")
+    status1, response1 = request_json(
+        f"{base_url}/api/fragrances/search?q={encoded_query}",
+        timeout=timeout,
+    )
     diag1 = response1.get("diagnostics", {}) if isinstance(response1, dict) else {}
     time.sleep(1.0)
-    status2, response2 = request_json(f"{base_url}/api/fragrances/search?q={encoded_query}")
+    status2, response2 = request_json(
+        f"{base_url}/api/fragrances/search?q={encoded_query}",
+        timeout=timeout,
+    )
     diag2 = response2.get("diagnostics", {}) if isinstance(response2, dict) else {}
 
     passed = (
@@ -93,9 +99,13 @@ def test_live_search_and_caching(base_url: str) -> dict[str, Any]:
         {
             "query": query,
             "first_status": status1,
+            "first_error": response1.get("error"),
+            "first_transport_error": response1.get("transport_error"),
             "first_live_search_skipped": diag1.get("live_search_skipped"),
             "first_cache_mode": diag1.get("cache_mode"),
             "second_status": status2,
+            "second_error": response2.get("error"),
+            "second_transport_error": response2.get("transport_error"),
             "second_live_search_skipped": diag2.get("live_search_skipped"),
             "second_cache_mode": diag2.get("cache_mode"),
             "second_result_count": len(response2.get("results", []))
@@ -105,13 +115,16 @@ def test_live_search_and_caching(base_url: str) -> dict[str, Any]:
     )
 
 
-def test_spelling_repair(base_url: str) -> dict[str, Any]:
+def test_spelling_repair(base_url: str, timeout: float) -> dict[str, Any]:
     cases = [("xerjoff naxus", "Naxos"), ("creed avantus", "Aventus")]
     observations: list[dict[str, Any]] = []
     all_ok = True
     for query, expected_name in cases:
         encoded_query = urllib.parse.quote(query)
-        status, response = request_json(f"{base_url}/api/fragrances/search?q={encoded_query}")
+        status, response = request_json(
+            f"{base_url}/api/fragrances/search?q={encoded_query}",
+            timeout=timeout,
+        )
         results = response.get("results", []) if isinstance(response, dict) else []
         match = next(
             (
@@ -138,7 +151,7 @@ def test_spelling_repair(base_url: str) -> dict[str, Any]:
     return record("spelling_repair", all_ok, {"cases": observations})
 
 
-def test_details_cached(base_url: str) -> dict[str, Any]:
+def test_details_cached(base_url: str, timeout: float) -> dict[str, Any]:
     naxos_id = encode_id(
         name="XJ 1861 Naxos",
         brand="Xerjoff",
@@ -151,6 +164,7 @@ def test_details_cached(base_url: str) -> dict[str, Any]:
         f"{base_url}/api/fragrances/details",
         method="POST",
         data=payload,
+        timeout=timeout,
     )
     coverage = response.get("source_coverage", {}) if isinstance(response, dict) else {}
     passed = (
@@ -171,7 +185,7 @@ def test_details_cached(base_url: str) -> dict[str, Any]:
     )
 
 
-def test_details_uncached(base_url: str) -> dict[str, Any]:
+def test_details_uncached(base_url: str, timeout: float) -> dict[str, Any]:
     suffix = random.randint(100000, 999999)
     uncached_id = encode_id(
         name=f"Uncached Fragrance {suffix}",
@@ -185,6 +199,7 @@ def test_details_uncached(base_url: str) -> dict[str, Any]:
         f"{base_url}/api/fragrances/details",
         method="POST",
         data=payload,
+        timeout=timeout,
     )
     coverage = response.get("source_coverage", {}) if isinstance(response, dict) else {}
     passed = status == 200 or status in {502, 503}
@@ -199,7 +214,7 @@ def test_details_uncached(base_url: str) -> dict[str, Any]:
     )
 
 
-def test_empty_notes_handling(base_url: str) -> dict[str, Any]:
+def test_empty_notes_handling(base_url: str, timeout: float) -> dict[str, Any]:
     empty_notes_id = encode_id(
         name="Empty Notes Test",
         brand="Empty Notes House",
@@ -212,6 +227,7 @@ def test_empty_notes_handling(base_url: str) -> dict[str, Any]:
         f"{base_url}/api/fragrances/details",
         method="POST",
         data=payload,
+        timeout=timeout,
     )
     if status in {502, 503}:
         return record(
@@ -250,6 +266,7 @@ def test_empty_notes_handling(base_url: str) -> dict[str, Any]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="Base URL of production environment.")
+    parser.add_argument("--timeout", type=float, default=15.0, help="Per-request timeout in seconds.")
     parser.add_argument("--json-output", help="Optional path to write structured results.")
     return parser.parse_args(argv)
 
@@ -260,12 +277,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Starting verification against {base_url}")
 
     results = [
-        test_health(base_url),
-        test_live_search_and_caching(base_url),
-        test_spelling_repair(base_url),
-        test_details_cached(base_url),
-        test_details_uncached(base_url),
-        test_empty_notes_handling(base_url),
+        test_health(base_url, args.timeout),
+        test_live_search_and_caching(base_url, args.timeout),
+        test_spelling_repair(base_url, args.timeout),
+        test_details_cached(base_url, args.timeout),
+        test_details_uncached(base_url, args.timeout),
+        test_empty_notes_handling(base_url, args.timeout),
     ]
 
     passed = sum(1 for result in results if result["passed"])
