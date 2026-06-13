@@ -1,0 +1,92 @@
+{
+  "base_url": "https://srt-scent-engine-production.up.railway.app",
+  "passed": 4,
+  "results": [
+    {
+      "details": {
+        "response": {
+          "ok": true
+        },
+        "status": 200
+      },
+      "name": "health",
+      "passed": true
+    },
+    {
+      "details": {
+        "first_cache_mode": null,
+        "first_error": "The read operation timed out",
+        "first_live_search_skipped": null,
+        "first_status": null,
+        "first_transport_error": "TimeoutError",
+        "query": "Creed Aventus Test 9678",
+        "second_cache_mode": null,
+        "second_error": "The read operation timed out",
+        "second_live_search_skipped": null,
+        "second_result_count": 0,
+        "second_status": null,
+        "second_transport_error": "TimeoutError"
+      },
+      "name": "live_search_cache_promotion",
+      "passed": false
+    },
+    {
+      "details": {
+        "cases": [
+          {
+            "expected_name": "Naxos",
+            "match": null,
+            "query": "xerjoff naxus",
+            "result_count": 0,
+            "status": null
+          },
+          {
+            "expected_name": "Aventus",
+            "match": null,
+            "query": "creed avantus",
+            "result_count": 0,
+            "status": null
+          }
+        ]
+      },
+      "name": "spelling_repair",
+      "passed": false
+    },
+    {
+      "details": {
+        "fragrantica_cache_source": "aggregate_db",
+        "fragrantica_cached": true,
+        "house": "Xerjoff",
+        "name": "XJ 1861 Naxos",
+        "status": 200
+      },
+      "name": "details_cached_naxos",
+      "passed": true
+    },
+    {
+      "details": {
+        "error": null,
+        "fragrantica_cached": false,
+        "status": 200
+      },
+      "name": "details_uncached_safe_response",
+      "passed": true
+    },
+    {
+      "details": {
+        "derived_notes": null,
+        "raw_notes": {
+          "base": [],
+          "flat": [],
+          "has_pyramid": false,
+          "heart": [],
+          "top": []
+        },
+        "status": 200
+      },
+      "name": "empty_notes_handling",
+      "passed": true
+    }
+  ],
+  "total": 6
+}

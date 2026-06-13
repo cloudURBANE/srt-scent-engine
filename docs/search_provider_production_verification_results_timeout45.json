@@ -1,0 +1,98 @@
+{
+  "base_url": "https://srt-scent-engine-production.up.railway.app",
+  "passed": 5,
+  "results": [
+    {
+      "details": {
+        "response": {
+          "ok": true
+        },
+        "status": 200
+      },
+      "name": "health",
+      "passed": true
+    },
+    {
+      "details": {
+        "first_cache_mode": null,
+        "first_error": null,
+        "first_live_search_skipped": null,
+        "first_status": 200,
+        "first_transport_error": null,
+        "query": "Creed Aventus Test 1036",
+        "second_cache_mode": null,
+        "second_error": null,
+        "second_live_search_skipped": null,
+        "second_result_count": 0,
+        "second_status": 200,
+        "second_transport_error": null
+      },
+      "name": "live_search_cache_promotion",
+      "passed": false
+    },
+    {
+      "details": {
+        "cases": [
+          {
+            "expected_name": "Naxos",
+            "match": {
+              "house": "Xerjoff",
+              "name": "Xj 1861 Naxos"
+            },
+            "query": "xerjoff naxus",
+            "result_count": 1,
+            "status": 200
+          },
+          {
+            "expected_name": "Aventus",
+            "match": {
+              "house": "Creed",
+              "name": "Aventus"
+            },
+            "query": "creed avantus",
+            "result_count": 6,
+            "status": 200
+          }
+        ]
+      },
+      "name": "spelling_repair",
+      "passed": true
+    },
+    {
+      "details": {
+        "fragrantica_cache_source": "aggregate_db",
+        "fragrantica_cached": true,
+        "house": "Xerjoff",
+        "name": "XJ 1861 Naxos",
+        "status": 200
+      },
+      "name": "details_cached_naxos",
+      "passed": true
+    },
+    {
+      "details": {
+        "error": null,
+        "fragrantica_cached": false,
+        "status": 200
+      },
+      "name": "details_uncached_safe_response",
+      "passed": true
+    },
+    {
+      "details": {
+        "derived_notes": null,
+        "raw_notes": {
+          "base": [],
+          "flat": [],
+          "has_pyramid": false,
+          "heart": [],
+          "top": []
+        },
+        "status": 200
+      },
+      "name": "empty_notes_handling",
+      "passed": true
+    }
+  ],
+  "total": 6
+}
