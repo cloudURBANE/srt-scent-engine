@@ -2584,6 +2584,12 @@ class QueryRepair:
         if local_cleanup:
             return QueryRepair.normalized_query(local_cleanup)
 
+        # Exact known brand/designer queries are handled by the catalog/provider
+        # fallback. Spell-repair SERPs can add retail tails like "set" and starve
+        # clean brand searches before that fallback gets a useful chance.
+        if IdentityTools.canonical_brand_query(query):
+            return ""
+
         deadline = Deadline(seconds)
         records: dict = {}
 
@@ -9880,7 +9886,9 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     trace.print_summary(candidates)
     return candidates, bn_results, frag_results
 
-def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragrance]:
+def _designer_provider_fallback_results(
+    query: str, args, overall_deadline: "Deadline | None" = None
+) -> list[UnifiedFragrance]:
     """Use structured SERP evidence to turn brand/designer queries into rows.
 
     Cold searches for a designer that is not already in the DB can return zero
@@ -9888,6 +9896,12 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
     designer page. The deployed runtime also cannot rely on directly crawling
     that designer page, so this fallback asks the structured provider for the
     designer URL, then asks Google for perfume URLs under that designer slug.
+
+    ``overall_deadline``, when supplied, is the wall-clock ceiling for the whole
+    live search (see ``search_once``). This stage is the last and slowest link
+    in the cold-query fallback chain, so its own budget is clamped to whatever
+    time is left -- otherwise its ~16.5s internal budget, stacked on the stages
+    before it, pushes the request past the client/gateway timeout.
     """
     provider = structured_search_provider()
     if provider is None:
@@ -9904,6 +9918,12 @@ def _designer_provider_fallback_results(query: str, args) -> list[UnifiedFragran
         2.4,
         getattr(args, "spell_repair_budget", 4.0) + getattr(args, "fg_timeout", 4.5) + 8.0,
     )
+    if overall_deadline is not None:
+        remaining = overall_deadline.remaining()
+        if remaining is not None:
+            if remaining <= 0:
+                return []
+            budget = min(budget, remaining)
     deadline = Deadline(budget)
     labels: list[str] = []
     seen_labels: set[str] = set()
@@ -9981,10 +10001,25 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
     # marks from the run that produced the returned candidates. A spell-repair
     # re-run overwrites the first pass's marks, so the dict reflects the final
     # pipeline; total_search then covers only that final pass.
+    # Overall wall-clock ceiling for the entire live search. The cold-query
+    # fallback chain below -- spell repair -> designer catalog crawl ->
+    # structured designer-provider discovery -- otherwise stacks several
+    # independent multi-second budgets with no shared limit (spell_repair ~4s +
+    # catalog ~3.5s + designer-provider ~16.5s). A bare designer/brand query
+    # ("Thom Browne", "Tom Ford", "Maison Francis Kurkdjian") that misses every
+    # cache and the catalog could therefore run ~30s and blow past the client /
+    # gateway timeout, returning an empty body to the user. Bounding the whole
+    # chain to one deadline lets the caller fall back to its fast DB cache search
+    # (which already resolves brand queries) instead of hanging. ``None`` =>
+    # unbounded (the CLI/default behavior); only the HTTP API sets a concrete
+    # budget via ``API_SEARCH_TOTAL_BUDGET``.
+    overall = Deadline(getattr(args, "search_total_budget", None))
     candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True, timing=timing)
     if QueryRepair.needs_repair(bn_results, candidates):
-        if args.spell_repair_budget > 0:
-            suggestion = QueryRepair.suggest(scraper, query, seconds=args.spell_repair_budget)
+        if args.spell_repair_budget > 0 and not overall.expired():
+            suggestion = QueryRepair.suggest(
+                scraper, query, seconds=overall.timeout(args.spell_repair_budget)
+            )
             if suggestion:
                 print(f"{Y}[SYS] Search corrected: {query!r} -> {suggestion!r}{Z}")
                 repaired, repaired_bn, _ = _search_core(scraper, suggestion, args, allow_repair=False, timing=timing)
@@ -10005,12 +10040,15 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             # Serper) can return the catalogue. Multi-token queries are left
             # alone -- they are usually brand+fragrance, not a bare house.
             catalog_labels = IdentityTools.catalog_brand_keys(query)
-        if catalog_labels:
+        if catalog_labels and not overall.expired():
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
-            deadline = Deadline(args.catalog_budget)
+            # Clamp the catalog crawl to whatever remains of the overall budget so
+            # it cannot, together with the stages before/after it, exceed the
+            # request ceiling.
+            deadline = Deadline(overall.timeout(args.catalog_budget))
             for brand_label in catalog_labels:
-                if deadline.expired():
+                if deadline.expired() or overall.expired():
                     break
                 catalog = SearchSniper.catalog_candidates_for_brand(
                     scraper,
@@ -10038,9 +10076,10 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             if brand_results:
                 brand_results.sort(key=lambda x: x.query_score, reverse=True)
                 return brand_results[:args.max_results]
-        designer_results = _designer_provider_fallback_results(query, args)
-        if designer_results:
-            return designer_results
+        if not overall.expired():
+            designer_results = _designer_provider_fallback_results(query, args, overall_deadline=overall)
+            if designer_results:
+                return designer_results
         best = max((item.query_score for item in candidates), default=0.0)
         if best < QueryRepair.MIN_USEFUL_TOP_SCORE:
             print(f"{Y}[SYS] Ignored weak FG-only fallback rows; best match was only {int(best * 100)}%.{Z}")
@@ -10190,6 +10229,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-budget", type=float, default=5.0)
     parser.add_argument("--external-workers", type=int, default=3)
     parser.add_argument("--spell-repair-budget", type=float, default=1.6, help="Google/Bing spelling repair budget, only used after a clearly bad first pass. Use 0 to disable.")
+    parser.add_argument("--search-total-budget", type=float, default=None, help="Overall wall-clock ceiling (seconds) for the entire live search, including the cold-query spell-repair/catalog/designer fallback chain. None => unbounded. The HTTP API sets a concrete value so a bare designer/brand query cannot stack per-stage budgets past the client timeout.")
     parser.add_argument("--fg-cache", default=str(Path.home() / ".cache" / "fragrance_parser_fg_identity_cache_v2.json"))
     parser.add_argument("--debug", action="store_true", help="Print resolver diagnostics/timing trace. Alias for --debug-timing.")
     parser.add_argument("--debug-timing", action="store_true", help="Print timing checkpoints for each resolver stage.")
