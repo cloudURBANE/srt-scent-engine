@@ -197,6 +197,45 @@ def test_stopword_names_are_not_rejected() -> None:
     check("non-matching same-house sibling still rejected", names == [], str(names))
 
 
+def test_multi_token_brand_only_query_keeps_whole_house() -> None:
+    # Regression: candidate_relevance_ok's distinctive-name-token coverage check
+    # rejected multi-token *brand-only* queries. The query's name tokens collapse
+    # to the full brand once the brand forms cancel, then get compared against the
+    # candidate's name tokens (brand stripped) for ~0 coverage -- so every row of
+    # the house was dropped. Single-token houses ("Xerjoff") slipped through only
+    # via the len<2 early-out, while "Maison Francis Kurkdjian", "Imaginary
+    # Authors", and the flagged "Thom Browne" returned zero rows even when the
+    # house's fragrances were sitting in the DB. relevance_score already treats a
+    # brand-only query as a 1.0 match; candidate_relevance_ok must agree.
+    print("Multi-token brand-only relevance checks:")
+    house_rows = [
+        ("Maison Francis Kurkdjian", "Baccarat Rouge 540"),
+        ("Imaginary Authors", "Memoirs of a Trespasser"),
+        ("Thom Browne", "Eau de Parfum"),
+    ]
+    for brand, name in house_rows:
+        row = candidate(brand, name)
+        names = [item.name for item in engine.filter_relevant_candidates(brand, [row])]
+        check(
+            f"bare-brand query {brand!r} keeps its catalogue row",
+            names == [name],
+            str(names),
+        )
+
+    # A genuine brand+name query (not brand-only) must still demand distinctive
+    # name coverage: the named row survives, a same-house sibling is rejected.
+    named = candidate("Maison Francis Kurkdjian", "Grand Soir")
+    sibling = candidate("Maison Francis Kurkdjian", "Baccarat Rouge 540")
+    kept = [
+        item.name
+        for item in engine.filter_relevant_candidates(
+            "Maison Francis Kurkdjian Grand Soir", [named, sibling]
+        )
+    ]
+    check("brand+name query keeps the named row", "Grand Soir" in kept, str(kept))
+    check("brand+name query still rejects non-matching sibling", "Baccarat Rouge 540" not in kept, str(kept))
+
+
 def test_normalize_notes_flattens_to_independent_layers() -> None:
     print("Note normalization aliasing checks:")
     notes = engine.NotesList(
@@ -1638,6 +1677,8 @@ def main() -> int:
     test_native_search_unusable_detects_junk()
     test_brand_plus_name_filter()
     test_multi_token_name_requires_distinctive_coverage()
+    test_stopword_names_are_not_rejected()
+    test_multi_token_brand_only_query_keeps_whole_house()
     test_normalize_notes_flattens_to_independent_layers()
     test_cache_search_rejects_same_house_sibling()
     test_aggregate_cache_search_does_not_expose_unproven_image()
