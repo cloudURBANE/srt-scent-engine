@@ -167,6 +167,36 @@ def test_multi_token_name_requires_distinctive_coverage() -> None:
     check("true Creed Bayrhum Vétiver remains", names == ["Bayrhum Vétiver"], str(names))
 
 
+def test_stopword_names_are_not_rejected() -> None:
+    # Regression: candidate_relevance_ok compared query tokens that KEEP
+    # stopwords (eau/de/le/la/pour/homme/intense...) against target name tokens
+    # that STRIP them, deflating fuzzy coverage so that even exact, score=1.0
+    # identity matches were rejected. This nuked both the live filter and the DB
+    # fallback for any fragrance whose name carries a stopword, e.g. the user
+    # report of "Bleu de Chanel" returning zero rows.
+    print("Stopword-name relevance checks:")
+    exact_matches = [
+        ("Bleu de Chanel", "Chanel", "Bleu De Chanel Eau De Parfum"),
+        ("Eau Sauvage", "Dior", "Eau Sauvage"),
+        ("L'Eau d'Issey", "Issey Miyake", "L'Eau d'Issey"),
+        ("La Nuit de L'Homme", "Yves Saint Laurent", "La Nuit De L'Homme"),
+    ]
+    for query, brand, name in exact_matches:
+        row = candidate(brand, name)
+        names = [item.name for item in engine.filter_relevant_candidates(query, [row])]
+        check(
+            f"stopword name kept for {query!r}",
+            names == [name],
+            str(names),
+        )
+
+    # The sibling guard must still hold: a same-house row that drops the
+    # distinctive non-stopword token is still rejected even after the alignment.
+    sibling = candidate("Chanel", "Coco Mademoiselle")
+    names = [item.name for item in engine.filter_relevant_candidates("Bleu de Chanel", [sibling])]
+    check("non-matching same-house sibling still rejected", names == [], str(names))
+
+
 def test_normalize_notes_flattens_to_independent_layers() -> None:
     print("Note normalization aliasing checks:")
     notes = engine.NotesList(
