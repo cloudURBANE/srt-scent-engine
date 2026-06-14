@@ -2780,8 +2780,26 @@ def candidate_relevance_ok(
         return False
     query_name_tokens = IdentityTools.query_name_tokens(query, item.brand)
     target_name_tokens = IdentityTools.name_tokens(item.name, item.brand)
+    target_kept_stopwords = False
     if not target_name_tokens:
         target_name_tokens = IdentityTools.name_tokens_keep_stopwords(item.name, item.brand)
+        target_kept_stopwords = True
+    # query_name_tokens() keeps stopwords (eau/de/le/la/pour/homme/intense...) for
+    # display, but name_tokens() strips them from the target. Comparing the two
+    # directly deflates the fuzzy-coverage check below for any fragrance whose
+    # name carries a stopword -- "Bleu de Chanel", "Eau Sauvage", "L'Eau d'Issey",
+    # "La Nuit de L'Homme" -- so even an exact, score=1.0 identity match was
+    # rejected and the query returned zero rows (both the live filter and the DB
+    # fallback run through this gate). Align the query side to the target's
+    # distinctive-token basis before comparing. When the target had to keep its
+    # stopwords (an all-stopword/brand name), keep them on the query side too so
+    # the two sides stay symmetric.
+    if not target_kept_stopwords:
+        stripped_query_tokens = {
+            token for token in query_name_tokens if token not in IdentityTools.STOPWORDS
+        }
+        if stripped_query_tokens:
+            query_name_tokens = stripped_query_tokens
     if len(query_name_tokens) < 2 or not target_name_tokens:
         return True
     if len(target_name_tokens) == 1 and bool(query_name_tokens & target_name_tokens):
