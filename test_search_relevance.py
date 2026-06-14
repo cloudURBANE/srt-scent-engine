@@ -236,6 +236,36 @@ def test_multi_token_brand_only_query_keeps_whole_house() -> None:
     check("brand+name query still rejects non-matching sibling", "Baccarat Rouge 540" not in kept, str(kept))
 
 
+def test_typed_concentration_keeps_exact_match() -> None:
+    # Regression for the search screenshots: a user who types the concentration
+    # ("Lancome Idole Eau de Toilette", "Dior Sauvage Eau de Toilette") kept the
+    # eau/de/toilette tokens on the query side, while name_tokens() strips them
+    # from the candidate -- so an otherwise exact, score=1.0 hit fell under the
+    # coverage floor and was discarded. The stopword-symmetric fix in
+    # candidate_relevance_ok aligns both sides; this guards the specific typed-
+    # concentration case (distinct from the canonical stopword-name case in
+    # test_stopword_names_are_not_rejected) without weakening the same-house guard.
+    print("Typed-concentration relevance gate checks:")
+    idole = engine.filter_relevant_candidates(
+        "Lancome Idole Eau de Toilette",
+        [candidate("Lancome", "Idole Eau de Toilette"),
+         candidate("Lancome", "La Vie Est Belle")],
+    )
+    idole_names = [item.name for item in idole]
+    check("typed concentration keeps the exact match",
+          "Idole Eau de Toilette" in idole_names, str(idole_names))
+    check("typed concentration still drops unrelated same-house row",
+          "La Vie Est Belle" not in idole_names, str(idole_names))
+
+    sauvage = engine.filter_relevant_candidates(
+        "Dior Sauvage Eau de Toilette",
+        [candidate("Dior", "Sauvage Eau de Toilette")],
+    )
+    check("Dior Sauvage Eau de Toilette keeps the exact match",
+          [item.name for item in sauvage] == ["Sauvage Eau de Toilette"],
+          str([item.name for item in sauvage]))
+
+
 def test_normalize_notes_flattens_to_independent_layers() -> None:
     print("Note normalization aliasing checks:")
     notes = engine.NotesList(
@@ -1784,6 +1814,7 @@ def main() -> int:
     test_multi_token_name_requires_distinctive_coverage()
     test_stopword_names_are_not_rejected()
     test_multi_token_brand_only_query_keeps_whole_house()
+    test_typed_concentration_keeps_exact_match()
     test_normalize_notes_flattens_to_independent_layers()
     test_cache_search_rejects_same_house_sibling()
     test_aggregate_cache_search_does_not_expose_unproven_image()
