@@ -1,5 +1,17 @@
 # Project instructions
 
+## First-time setup (run once per clone)
+
+Activate the committed git hooks so the merge-ladder guardrail is enforced
+locally:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`core.hooksPath` is local config and cannot be committed, so each fresh clone
+must run this once. The hook itself lives in `.githooks/` and is tracked.
+
 ## Git workflow — READ BEFORE ANY git merge/push (hard rules)
 
 History on this repo previously tangled into a "merge ladder": one long-lived
@@ -48,6 +60,7 @@ Do not "just merge to make it work" — that is exactly how the ladder formed.
 2. Has this branch already been merged to `main`? If yes, cut a fresh branch.
 3. Is the history I'm about to create linear (rebase) rather than a back-merge?
 
-A local `pre-merge-commit` hook enforces rule #2/back-merge as a backstop, but
-the hook is per-clone and does not catch every case — these written rules are
+A committed `prepare-commit-msg` hook (in `.githooks/`, activated via the
+first-time-setup step above) enforces the no-back-merge rule as a hard backstop,
+but a clone that skipped setup won't have it active — so these written rules are
 the real guardrail.
