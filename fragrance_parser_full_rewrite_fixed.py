@@ -1184,6 +1184,12 @@ class QueryRepair:
     r"(?i)\b("
     # question/search intent
     r"which|what|who|where|when|why|how|best|better|top|list|"
+    # listicle/ranking tails: Google autocomplete answers a bare house query
+    # ("frederic malle") with "frederic malle ranked"/"... ranking". Without
+    # this the junk tail survives clean_suggestion, is added as a direct
+    # candidate, and wins as a "repair" -- corrupting the query and wasting the
+    # spell-repair budget on a bare-brand miss. Same family as best|top|rated.
+    r"rank|ranks|ranked|ranking|rankings|"
     r"compare|comparison|vs|versus|similar|smells like|"
     # review/info tails
     r"review|reviews|rating|ratings|rated|description|descriptions|"
@@ -1204,6 +1210,20 @@ class QueryRepair:
     # clone/dupe tails
     r"dupe|dupes|clone|clones|alternative|alternatives"
     r")\b.*$"
+    )
+
+    # Trailing bottle-size / volume spec: Google autocomplete answers a real
+    # brand+fragrance query ("frederic malle carnal flower") with a retail tail
+    # carrying the size ("frederic malle carnal flower 50 ml"). A bare volume
+    # unit is not in CUT_AFTER_RE, so the "50 ml" tail survived clean_suggestion,
+    # was added as a direct candidate and won as a "repair" -- corrupting the
+    # query and, worse, burning the spell-repair budget so the downstream Decodo
+    # designer-discovery leg read-timed-out and the query returned zero rows.
+    # A volume is never part of a fragrance identity, so cut a trailing
+    # <number><unit> spec (and anything after it). Requires a leading digit so
+    # real name tokens ("Oz") are never truncated.
+    VOLUME_TAIL_RE = re.compile(
+        r"(?i)\b\d[\d.,]*\s*(?:ml|mls|oz|fl\.?\s*oz|ounces?)\b.*$"
     )
 
     TITLE_TAIL_RE = re.compile(
@@ -2002,6 +2022,7 @@ class QueryRepair:
         text = re.sub(r"(?i)<[^>]+>", " ", text)
         text = re.sub(r"(?i)^(showing results for|search instead for|did you mean:?|including results for)\s*", "", text)
         text = re.sub(r"(?i)\b(search instead for|showing results for|including results for|search only for)\b.*$", "", text)
+        text = QueryRepair.VOLUME_TAIL_RE.sub("", text)
         text = QueryRepair.CUT_AFTER_RE.sub("", text)
         text = re.sub(r"(?i)\b(fragrance|fragrances|perfume|perfumes|cologne|colognes|scent|scents)\b", " ", text)
         text = re.sub(r"[?!.:;|•·]+", " ", text)

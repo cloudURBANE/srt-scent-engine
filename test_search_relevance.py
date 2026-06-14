@@ -1404,6 +1404,61 @@ def test_known_brand_query_skips_spell_repair() -> None:
     check("spell-repair network paths were skipped", calls == {"http": 0, "decodo": 0}, str(calls))
 
 
+def test_ranking_tail_is_stripped_from_spell_repair() -> None:
+    print("Listicle/ranking-tail spell-repair checks:")
+    # Google autocomplete answers a bare house query ("frederic malle") with
+    # listicle tails like "frederic malle ranked". The tail survived
+    # clean_suggestion (CUT_AFTER_RE had best|top|list|rated but not the rank
+    # family), so it was added as a direct candidate and won as a "repair" --
+    # corrupting "Frederic Malle" -> "frederic malle ranked" and wasting the
+    # spell-repair budget on a bare-brand miss. The tail must now be cut so the
+    # candidate collapses back to the original query (a no-op, not a repair).
+    QR = engine.QueryRepair
+    for tail in ("ranked", "ranking", "rankings", "rank", "ranks"):
+        cleaned = QR.clean_suggestion(f"frederic malle {tail}")
+        check(
+            f"'{tail}' listicle tail is stripped",
+            QR._identity(cleaned) == QR._identity("frederic malle"),
+            repr(cleaned),
+        )
+    # Word-boundary safety: names that merely contain the substring "rank"
+    # ("frank", "franck") must be preserved.
+    check(
+        "ranking cut does not truncate 'frank'/'franck' names",
+        QR.clean_suggestion("frank olivier black") == "frank olivier black"
+        and QR.clean_suggestion("franck boclet cocaine") == "franck boclet cocaine",
+        repr((QR.clean_suggestion("frank olivier black"), QR.clean_suggestion("franck boclet cocaine"))),
+    )
+
+
+def test_volume_tail_is_stripped_from_spell_repair() -> None:
+    print("Bottle-size/volume-tail spell-repair checks:")
+    # Google autocomplete answers a real brand+fragrance query ("frederic malle
+    # carnal flower") with a retail tail carrying the bottle size ("... 50 ml").
+    # A bare volume unit was not in CUT_AFTER_RE, so the "50 ml" tail survived
+    # clean_suggestion, was added as a direct candidate and won as a "repair" --
+    # corrupting the query and burning the spell-repair budget so the downstream
+    # Decodo designer-discovery leg read-timed-out and the query returned zero
+    # rows. The tail must now be cut so the candidate collapses back to the
+    # original query (a no-op, not a repair). Same family as the rank-tail fix.
+    QR = engine.QueryRepair
+    for tail in ("50 ml", "100ml", "70 ml", "3.4 oz", "100 ml for men"):
+        cleaned = QR.clean_suggestion(f"frederic malle carnal flower {tail}")
+        check(
+            f"'{tail}' volume tail is stripped",
+            QR._identity(cleaned) == QR._identity("frederic malle carnal flower"),
+            repr(cleaned),
+        )
+    # Safety: a leading digit is required, and real name tokens that merely
+    # contain numbers or look unit-ish must be preserved in full.
+    for name in ("baccarat rouge 540", "chanel no 5", "by kilian 461", "amber oud 24k gold"):
+        check(
+            f"volume cut preserves the name {name!r}",
+            QR.clean_suggestion(name) == name,
+            repr(QR.clean_suggestion(name)),
+        )
+
+
 def test_decodo_post_request_splits_connect_and_read_timeout() -> None:
     print("Decodo connect/read timeout-split checks:")
     # `requests` applies a single float timeout to the connect and read phases
@@ -1750,6 +1805,8 @@ def main() -> int:
     test_decodo_caches_responses()
     test_decodo_structured_spell_repair_evidence()
     test_known_brand_query_skips_spell_repair()
+    test_ranking_tail_is_stripped_from_spell_repair()
+    test_volume_tail_is_stripped_from_spell_repair()
     test_decodo_post_request_splits_connect_and_read_timeout()
     test_decodo_bing_fallback_recovers_when_google_empty()
     test_decodo_ai_overview_extracts_cited_urls()
