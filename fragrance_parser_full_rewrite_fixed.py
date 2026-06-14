@@ -2778,6 +2778,18 @@ def candidate_relevance_ok(
     """
     if float(getattr(item, "query_score", 0.0) or 0.0) < minimum:
         return False
+    # Brand-only queries ("Maison Francis Kurkdjian", "Imaginary Authors") name a
+    # whole house, not one fragrance, so there are no distinctive *name* tokens to
+    # cover. The distinctive-token check below compares the query's tokens (which
+    # fall back to the full brand when everything cancels) against the candidate's
+    # name tokens (brand stripped), scoring ~0 and rejecting every row -- which
+    # silently zeroed out multi-token bare-brand searches from the DB/cache
+    # fallback (single-token brands only escaped via the len<2 early-out). The
+    # relevance scorer already treats this case as a 1.0 match; mirror it here so
+    # the catalogue survives the gate. (Same query/target token-basis mismatch the
+    # stopword fix addressed, but for the whole-house case.)
+    if IdentityTools.query_is_brand_only(query, item.brand):
+        return True
     query_name_tokens = IdentityTools.query_name_tokens(query, item.brand)
     target_name_tokens = IdentityTools.name_tokens(item.name, item.brand)
     target_kept_stopwords = False
