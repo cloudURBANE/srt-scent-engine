@@ -1,0 +1,4 @@
+# Git hooks are POSIX shell scripts; they MUST keep LF endings or the
+# `#!/bin/sh` shebang breaks on Linux/macOS clones (CRLF -> "/bin/sh\r" error).
+.githooks/** text eol=lf
+*.sh text eol=lf

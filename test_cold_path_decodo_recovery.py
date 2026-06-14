@@ -45,6 +45,10 @@ _ENV_KEYS = (
     "DECODO_API_USERNAME",
     "DECODO_API_PASSWORD",
     "DECODO_SCRAPER_LOCALE",
+    # Bing SERP fallback is opt-in: discovery only consults Bing when this flag
+    # is set (see DecodoScraperClient.bing_fallback_enabled). Tracked here so the
+    # Bing tests can enable it explicitly and it is wiped/restored around them.
+    "DECODO_ENABLE_BING_FALLBACK",
 )
 
 
@@ -132,6 +136,7 @@ def test_bing_fallback_recovers_fragrantica_url() -> None:
     fg_url = "https://www.fragrantica.com/perfume/Imaginary-Authors/Cape-Heartache-30001.html"
     try:
         _enable_cold_decodo()
+        os.environ["DECODO_ENABLE_BING_FALLBACK"] = "1"  # opt-in: enable the gated Bing leg
 
         def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
             target = (json or {}).get("target")
@@ -164,6 +169,9 @@ def test_bing_not_called_when_google_succeeds() -> None:
     fg_url = "https://www.fragrantica.com/perfume/Nishane/Hacivat-40002.html"
     try:
         _enable_cold_decodo()
+        # Enable Bing so the assertion proves Google success *short-circuits* the
+        # gated Bing leg -- not merely that the flag is off.
+        os.environ["DECODO_ENABLE_BING_FALLBACK"] = "1"
 
         def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
             targets.append((json or {}).get("target"))

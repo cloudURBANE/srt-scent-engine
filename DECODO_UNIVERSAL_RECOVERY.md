@@ -60,8 +60,11 @@ All in `fragrance_parser_full_rewrite_fixed.py`, reusing existing Decodo creds
 
 2. **Bing redundancy in `_search_fragrantica_urls_for_google_query`.** If Google
    discovery yields no usable `fragrantica.com/perfume` URL, retry the scoped
-   query against `bing_search`. Fires only on otherwise-empty cold queries; the
-   shared URL-collection logic is factored into `_collect_fragrantica_urls`.
+   query against `bing_search`. Fires only on otherwise-empty cold queries, and
+   is **opt-in** — gated behind `DECODO_ENABLE_BING_FALLBACK=1` (off by default;
+   enable per-deploy after a live smoke, since the retry spends a second credit).
+   The shared URL-collection logic is factored into `_fragrantica_urls_from_payload`,
+   which the Google, Bing, and AI-Overview paths all funnel through.
 
 3. **Overshoot clamp (code-only tightening).** `_viable_budget` reserves a
    `DEADLINE_SAFETY` (0.4s) margin so an in-flight call finishes before the
