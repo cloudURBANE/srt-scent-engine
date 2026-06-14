@@ -928,7 +928,50 @@ class IdentityTools:
         if remaining:
             return False
         return IdentityTools.compatible_brand(query, brand)
-        
+
+    @staticmethod
+    def bare_brand_label(query: str, results: list) -> str:
+        """Return the house label to crawl when ``query`` is a bare multi-token house.
+
+        A multi-token query is usually brand+fragrance ("Tom Ford Oud Wood"), so
+        search_once deliberately does not seed a designer-catalog crawl for it --
+        only single-token un-aliased houses are seeded. But a *bare* multi-token
+        house with no alias entry ("Frederic Malle", "Parfums de Marly") reaches
+        that same path with canonical_brand_query()=="" and gets zero catalog
+        breadth, leaving it dependent solely on the structured (Decodo) provider
+        leg; when that leg is slow or times out the query returns zero rows even
+        though the house's Fragrantica designer page is crawlable.
+
+        Disambiguate using the first-pass BN/FG rows: when their dominant house
+        matches the whole query with no leftover name tokens (query_is_brand_only),
+        the user named a house, so return that brand label for the catalog
+        resolver. A brand+fragrance query ("Tom Ford Oud Wood") fails the
+        query_is_brand_only check against its dominant house ("Tom Ford") and
+        yields "" -- it is left to the name path. Returns "" when the query is not
+        a confirmed bare house.
+        """
+        counts: dict[str, int] = {}
+        display: dict[str, str] = {}
+        total = 0
+        for item in results or []:
+            brand = TextSanitizer.clean(getattr(item, "brand", "") or "")
+            norm = TextSanitizer.normalize_identity(brand)
+            if not norm:
+                continue
+            total += 1
+            counts[norm] = counts.get(norm, 0) + 1
+            display.setdefault(norm, brand)
+        if not counts:
+            return ""
+        dom_norm = max(counts, key=lambda key: counts[key])
+        # Require the house to actually dominate the result set, so a single stray
+        # row that happens to satisfy query_is_brand_only cannot trigger a crawl
+        # for a query that is really brand+fragrance.
+        if counts[dom_norm] < max(2, (total + 1) // 2):
+            return ""
+        dom_brand = display[dom_norm]
+        return dom_brand if IdentityTools.query_is_brand_only(query, dom_brand) else ""
+
     @staticmethod
     def token_overlap(a: set[str], b: set[str]) -> tuple[float, float]:
         if not a or not b:
@@ -10428,9 +10471,23 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             # breadth whenever Serper/native-FG discovery comes back empty.
             # Treat the single-token query as the house so the designer-catalog
             # resolver (server-rendered FG brand pages, reachable without
-            # Serper) can return the catalogue. Multi-token queries are left
-            # alone -- they are usually brand+fragrance, not a bare house.
+            # Serper) can return the catalogue.
             catalog_labels = IdentityTools.catalog_brand_keys(query)
+        elif not catalog_labels:
+            # Multi-token bare house with no alias entry (e.g. "Frederic Malle",
+            # "Parfums de Marly"): canonical_brand_query() returns "" and the
+            # single-token guard above skips it, so catalog_labels stays empty
+            # and the house gets zero catalog breadth -- it then depends solely
+            # on the structured (Decodo) provider leg, which returns zero rows
+            # whenever that provider is slow or times out (the live failure mode
+            # for "Frederic Malle"). Multi-token queries are usually
+            # brand+fragrance, not a bare house, so only seed the house when the
+            # first-pass BN/FG rows confirm the query names a single dominant
+            # house with nothing left to identify one fragrance. Brand+fragrance
+            # queries ("Tom Ford Oud Wood") fail that check and are left alone.
+            bare_house = IdentityTools.bare_brand_label(query, [*candidates, *bn_results])
+            if bare_house:
+                catalog_labels = IdentityTools.catalog_brand_keys(bare_house)
         # "Resolve faster, not looser." The structured Decodo brand-URL discovery
         # is the leg that actually resolves cold niche brand-only houses on the
         # Fragrantica-blocked runtime, and it is fast (~2-4s). Run it FIRST -- while
