@@ -991,6 +991,8 @@ _DECODO_ENV_KEYS = (
     "DECODO_USERNAME",
     "DECODO_PASSWORD",
     "DECODO_SCRAPER_LOCALE",
+    "DECODO_ENABLE_BING_FALLBACK",
+    "DECODO_ENABLE_AI_OVERVIEW",
 )
 
 
@@ -1256,6 +1258,177 @@ def test_decodo_structured_spell_repair_evidence() -> None:
     )
 
 
+def test_known_brand_query_skips_spell_repair() -> None:
+    print("Known-brand spell-repair bypass checks:")
+    saved = _set_decodo_env(enabled=True)
+    old_get = engine.Http.get
+    old_search_urls = engine.DecodoScraperClient.search_fragrantica_urls
+    calls = {"http": 0, "decodo": 0}
+    try:
+        def fail_http(*args, **kwargs):
+            calls["http"] += 1
+            raise AssertionError("known brand query should not hit HTTP spell repair")
+
+        def fail_decodo(cls, *args, **kwargs):
+            calls["decodo"] += 1
+            raise AssertionError("known brand query should not hit structured spell repair")
+
+        engine.Http.get = staticmethod(fail_http)
+        engine.DecodoScraperClient.search_fragrantica_urls = classmethod(fail_decodo)
+        suggestion = engine.QueryRepair.suggest(None, "Thom Browne", seconds=2.0)
+    finally:
+        engine.Http.get = old_get
+        engine.DecodoScraperClient.search_fragrantica_urls = old_search_urls
+        _restore_decodo_env(saved)
+
+    check("exact known brand query is not rewritten", suggestion == "", repr(suggestion))
+    check("spell-repair network paths were skipped", calls == {"http": 0, "decodo": 0}, str(calls))
+
+
+def test_decodo_post_request_splits_connect_and_read_timeout() -> None:
+    print("Decodo connect/read timeout-split checks:")
+    # `requests` applies a single float timeout to the connect and read phases
+    # *separately*, so a lone in-flight call started near the overall deadline
+    # could run up to ~2x its budget and overshoot the wall-clock ceiling. The
+    # client must pass a (connect, read) tuple: read bound to the clamped budget
+    # and connect capped to the small CONNECT_TIMEOUT.
+    saved = _set_decodo_env(enabled=True)
+    old_post = engine.requests.post
+    seen: dict[str, object] = {}
+    try:
+        def capturing_post(url, json=None, headers=None, timeout=None, **kwargs):
+            seen["timeout"] = timeout
+            return _FakeDecodoResponse(_DECODO_SAMPLE_PAYLOAD)
+
+        engine.requests.post = capturing_post
+        engine.DecodoScraperClient._post_google("xerjoff naxos", 10.0)
+    finally:
+        engine.requests.post = old_post
+        _restore_decodo_env(saved)
+
+    timeout = seen.get("timeout")
+    cap = engine.DecodoScraperClient.CONNECT_TIMEOUT
+    expected_read = min(10.0, engine.DecodoScraperClient.MAX_TIMEOUT)
+    check(
+        "Decodo POST timeout is a (connect, read) tuple",
+        isinstance(timeout, tuple) and len(timeout) == 2,
+        str(timeout),
+    )
+    check(
+        "read phase is bound to the clamped budget",
+        isinstance(timeout, tuple) and abs(timeout[1] - expected_read) < 1e-6,
+        str(timeout),
+    )
+    check(
+        "connect phase is capped to CONNECT_TIMEOUT",
+        isinstance(timeout, tuple) and timeout[0] == min(cap, expected_read),
+        str(timeout),
+    )
+
+
+def test_decodo_bing_fallback_recovers_when_google_empty() -> None:
+    print("Decodo Bing-fallback recovery checks:")
+    # Cold niche brand-only house: Google organic parsing returns zero
+    # Fragrantica URLs. With DECODO_ENABLE_BING_FALLBACK set, the same
+    # site-scoped query is retried on Bing, which recovers the perfume URLs.
+    # The fallback is gated -- without the flag, no Bing call is made.
+    google_empty = {
+        "results": [{"content": {"results": {"organic": [
+            {"url": "https://example.com/blog-about-bortnikoff"},
+        ]}}}]
+    }
+    bing_hit = {
+        "results": [{"content": {"results": {"organic": [
+            {"url": "https://www.fragrantica.com/perfume/Bortnikoff/Sayat-Nova-12345.html"},
+            {"url": "https://www.fragrantica.com/perfume/Bortnikoff/Oud-Maximus-67890.html"},
+            {"url": "https://www.fragrantica.com/perfume/Bortnikoff/Sayat-Nova-12345.html?utm=dup"},
+        ]}}}]
+    }
+
+    def run(flag: bool) -> tuple[list[str], list[str]]:
+        saved = _set_decodo_env(enabled=True)
+        if flag:
+            os.environ["DECODO_ENABLE_BING_FALLBACK"] = "1"
+        old_post = engine.requests.post
+        targets: list[str] = []
+        try:
+            def routed_post(url, json=None, headers=None, timeout=None, **kwargs):
+                body = json or {}
+                target = str(body.get("target") or "")
+                targets.append(target)
+                if target == "bing_search":
+                    return _FakeDecodoResponse(bing_hit)
+                return _FakeDecodoResponse(google_empty)
+
+            engine.requests.post = routed_post
+            urls = engine.DecodoScraperClient.search_fragrantica_urls("Bortnikoff")
+        finally:
+            engine.requests.post = old_post
+            _restore_decodo_env(saved)
+        return urls, targets
+
+    on_urls, on_targets = run(True)
+    off_urls, off_targets = run(False)
+
+    check(
+        "Bing fallback recovers Fragrantica URLs Google missed",
+        on_urls == [
+            "https://www.fragrantica.com/perfume/Bortnikoff/Sayat-Nova-12345.html",
+            "https://www.fragrantica.com/perfume/Bortnikoff/Oud-Maximus-67890.html",
+        ],
+        str(on_urls),
+    )
+    check("Bing fallback dedupes the recovered URLs", len(on_urls) == 2, str(on_urls))
+    check("Bing search target is actually queried when enabled", "bing_search" in on_targets, str(on_targets))
+    check("Bing fallback is gated off by default (no URLs)", off_urls == [], str(off_urls))
+    check("Bing search is never called when the flag is unset", "bing_search" not in off_targets, str(off_targets))
+
+
+def test_decodo_ai_overview_extracts_cited_urls() -> None:
+    print("Decodo AI-Overview discovery checks:")
+    # Last-ditch, opt-in path: mine Google's AI Overview source panel for cited
+    # Fragrantica URLs. Gated behind DECODO_ENABLE_AI_OVERVIEW; only canonical
+    # Fragrantica perfume links survive, and non-fragrance citations are dropped.
+    ai_payload = {
+        "results": [{"content": {"ai_overviews": [
+            {"source_panel": {"items": [
+                {"url": "https://www.fragrantica.com/perfume/Bortnikoff/Musk-Cologne-111.html"},
+                {"url": "https://example.org/not-a-fragrance"},
+            ]}},
+        ]}}]
+    }
+
+    def run(flag: bool) -> tuple[list[str], int]:
+        saved = _set_decodo_env(enabled=True)
+        if flag:
+            os.environ["DECODO_ENABLE_AI_OVERVIEW"] = "1"
+        old_post = engine.requests.post
+        calls = {"n": 0}
+        try:
+            def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+                calls["n"] += 1
+                return _FakeDecodoResponse(ai_payload)
+
+            engine.requests.post = fake_post
+            urls = engine.DecodoScraperClient.search_fragrantica_urls_via_ai_overview("Bortnikoff")
+        finally:
+            engine.requests.post = old_post
+            _restore_decodo_env(saved)
+        return urls, calls["n"]
+
+    on_urls, on_calls = run(True)
+    off_urls, off_calls = run(False)
+
+    check(
+        "AI Overview extracts the cited Fragrantica perfume URL",
+        on_urls == ["https://www.fragrantica.com/perfume/Bortnikoff/Musk-Cologne-111.html"],
+        str(on_urls),
+    )
+    check("AI Overview drops non-Fragrantica citations", all("fragrantica.com" in u for u in on_urls), str(on_urls))
+    check("AI Overview is gated off by default (no URLs)", off_urls == [], str(off_urls))
+    check("AI Overview makes no request when the flag is unset", off_calls == 0, str(off_calls))
+
+
 def test_decodo_url_discovery_budget_gate() -> None:
     print("Decodo URL-discovery budget gate checks:")
     # Mirrors the spell-repair gate: an abandoned provider call still spends a
@@ -1455,6 +1628,10 @@ def main() -> int:
     test_decodo_parses_fragrantica_urls()
     test_decodo_caches_responses()
     test_decodo_structured_spell_repair_evidence()
+    test_known_brand_query_skips_spell_repair()
+    test_decodo_post_request_splits_connect_and_read_timeout()
+    test_decodo_bing_fallback_recovers_when_google_empty()
+    test_decodo_ai_overview_extracts_cited_urls()
     test_initio_prives_decodo_url_survives_merge()
     test_decodo_designer_fallback_resolves_thombrony()
     test_zero_candidates_with_raw_bn_rows_still_repairs()
