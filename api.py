@@ -169,6 +169,14 @@ _ARGS.spell_repair_budget = _env_float("API_SPELL_REPAIR_BUDGET", 4.0)
 # aggregate_db) serve the request instead. 18s clears the legitimate ~17s cold
 # spell-repair path while cutting the runaway >30s designer stack.
 _ARGS.search_total_budget = _env_float("API_SEARCH_TOTAL_BUDGET", 18.0)
+# Slice of the overall budget held in reserve for the reliable structured
+# designer/brand discovery (the leg that resolves cold niche brand-only houses
+# on the Fragrantica-blocked runtime). With it, that fast ~2-4s leg runs first
+# for cold brand queries and a slow direct-FG catalog crawl is capped so it can
+# never starve the resolver -- recovering rows for "Imaginary Authors", "Cola
+# Addict", "Bortnikoff" within the SAME ceiling instead of raising it. 0 =>
+# disabled (original catalog-first order). Must stay < API_SEARCH_TOTAL_BUDGET.
+_ARGS.designer_provider_reserve = _env_float("API_DESIGNER_PROVIDER_RESERVE", 7.0)
 
 _LIVE_SEARCH_MAX_CONCURRENT = max(1, _env_int("API_LIVE_SEARCH_MAX_CONCURRENT", 6))
 _LIVE_SEARCH_QUEUE_TIMEOUT = max(
@@ -2214,6 +2222,8 @@ _SEARCH_TIMING_ARG_KEYS = (
     "external_budget",
     "external_workers",
     "spell_repair_budget",
+    "search_total_budget",
+    "designer_provider_reserve",
     "max_frag_results",
     "max_results",
 )

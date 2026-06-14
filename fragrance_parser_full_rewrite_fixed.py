@@ -2808,6 +2808,13 @@ class Http:
         "Connection": "keep-alive",
     }
 
+    # `requests` applies a single `timeout` float to the connect phase AND the
+    # read phase *separately*, so a lone in-flight fetch started near the overall
+    # deadline can run up to ~2x its intended budget and overshoot the wall-clock
+    # ceiling. We bound the read (dominant) phase to the remaining budget and cap
+    # the connect phase to this small value so the total can't blow the deadline.
+    CONNECT_TIMEOUT = 3.05
+
     # Thread-local diagnostic: the reason the last get() call returned None,
     # so callers can surface "HTTP 403" / "Timeout" without re-fetching.
     _LAST_ERROR = threading.local()
@@ -2848,7 +2855,19 @@ class Http:
                 last_error = last_error or TimeoutError("deadline expired before attempt")
                 break
             try:
-                request_timeout = deadline.timeout(timeout) if deadline else timeout
+                if deadline is not None:
+                    # Bound the in-flight read to whatever is left of the deadline
+                    # and cap connect small, so a fetch begun close to expiry
+                    # cannot push total wall-clock past the overall ceiling (a
+                    # single float would let connect+read each consume the full
+                    # budget -> ~2x overshoot).
+                    read_timeout = deadline.timeout(timeout)
+                    request_timeout: float | tuple[float, float] = (
+                        min(Http.CONNECT_TIMEOUT, read_timeout),
+                        read_timeout,
+                    )
+                else:
+                    request_timeout = timeout
                 res = scraper.get(url, timeout=request_timeout, headers=headers)
                 res.raise_for_status()
                 Http._record_error(None)
@@ -3231,20 +3250,28 @@ class DecodoScraperClient:
     PROVIDER_NAME = "decodo"
     ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
     MAX_TIMEOUT = 15.0
+    # `requests` applies `timeout` to connect and read separately, so a single
+    # float lets one in-flight Decodo call run ~2x its budget and overshoot the
+    # overall search deadline. Cap connect to this small value and bind the read
+    # (dominant) phase to the clamped budget instead. See `_post_request`.
+    CONNECT_TIMEOUT = 3.05
     # An abandoned call still spends a Decodo credit, and URL discovery
     # measures ~2-4s per call: below this remaining budget the client skips
     # the request instead of starting one that cannot plausibly finish.
     MIN_VIABLE_BUDGET = 1.2
-    # requests' single-float timeout applies to BOTH the connect and read
-    # phases, so a slow TLS connect alone could push a call far past the overall
-    # search deadline (the ~18s budget overshooting to ~20s on cold queries).
-    # Splitting into a (connect, read) tuple caps connection setup while the
-    # read budget tracks the remaining wall-clock time.
-    CONNECT_TIMEOUT = 3.05
     # Leave a small margin so an in-flight request finishes *before* the overall
-    # deadline rather than running right up to (and slightly past) it. This is
-    # the second half of the cold-query overshoot fix.
+    # deadline rather than running right up to (and slightly past) it. Paired with
+    # the connect/read split above, this is the second half of the cold-query
+    # overshoot fix (see `_viable_budget` / `_request_timeout`).
     DEADLINE_SAFETY = 0.4
+    # Secondary SERP + AI-Overview discovery are OFF by default and gated behind
+    # these env flags. They exist to recover rows for cold, never-seen niche
+    # brand-only houses where Google organic parsing returns zero Fragrantica
+    # URLs. Bing organic is cheap (no JS); AI Overview needs JS rendering
+    # (Premium+JS rate) and is a deliberate last-ditch. Enable per-deploy after a
+    # live smoke. Values: 1/true/yes/on.
+    _BING_FALLBACK_ENV = "DECODO_ENABLE_BING_FALLBACK"
+    _AI_OVERVIEW_ENV = "DECODO_ENABLE_AI_OVERVIEW"
     _RESOLVER_SCORE = 0.9
     _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
     _LEGACY_PROVIDER_ALIASES = {"serper", "scrapedo", "scrape_do", "scrape.do", "scrapedo_proxy"}
@@ -3388,6 +3415,10 @@ class DecodoScraperClient:
         detail = str(exc) or type(exc).__name__
         print(f"{Y}[SYS] Decodo {kind} failed ({type(exc).__name__}): {detail[:200]}{Z}")
 
+    @staticmethod
+    def _env_flag(name: str) -> bool:
+        return (os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "on"}
+
     @classmethod
     def _headers(cls) -> dict[str, str]:
         return {
@@ -3397,19 +3428,47 @@ class DecodoScraperClient:
         }
 
     @classmethod
-    def _post_serp(
-        cls,
-        query: str,
-        timeout: float,
-        *,
-        target: str = "google_search",
-        image_search: bool = False,
-    ) -> dict:
+    def bing_fallback_enabled(cls) -> bool:
+        return cls.enabled() and cls._env_flag(cls._BING_FALLBACK_ENV)
+
+    @classmethod
+    def ai_overview_enabled(cls) -> bool:
+        return cls.enabled() and cls._env_flag(cls._AI_OVERVIEW_ENV)
+
+    @classmethod
+    def _bing_payload(cls, query: str) -> dict[str, Any]:
+        return {
+            "target": "bing_search",
+            "query": query,
+            "parse": True,
+            "page_from": "1",
+            "page_count": 1,
+            "locale": cls._locale(),
+        }
+
+    @classmethod
+    def _ai_overview_payload(cls, query: str) -> dict[str, Any]:
+        # AI Overview is only reliably populated with JS rendering + an explicit
+        # device type (per Decodo's AI-Overview rate-optimization guidance).
+        return {
+            "target": "google_search",
+            "query": query,
+            "parse": True,
+            "headless": "html",
+            "device_type": "desktop",
+            "locale": cls._locale(),
+        }
+
+    @classmethod
+    def _post_request(cls, payload: dict, timeout: float) -> dict:
+        """Single Decodo POST with a connect/read split so a call started near
+        the overall deadline cannot overshoot it (a lone `timeout` float is
+        applied to connect and read separately => up to ~2x the budget)."""
         if not cls.enabled():
             raise RuntimeError("Decodo Scraper API is not enabled")
         res = requests.post(
             cls.ENDPOINT,
-            json=cls._payload(query, image_search=image_search, target=target),
+            json=payload,
             headers=cls._headers(),
             timeout=cls._request_timeout(timeout),
         )
@@ -3418,11 +3477,15 @@ class DecodoScraperClient:
 
     @classmethod
     def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
-        return cls._post_serp(query, timeout, target="google_search", image_search=image_search)
+        return cls._post_request(cls._payload(query, image_search=image_search), timeout)
 
     @classmethod
     def _post_bing(cls, query: str, timeout: float) -> dict:
-        return cls._post_serp(query, timeout, target="bing_search")
+        return cls._post_request(cls._bing_payload(query), timeout)
+
+    @classmethod
+    def _post_ai_overview(cls, query: str, timeout: float) -> dict:
+        return cls._post_request(cls._ai_overview_payload(query), timeout)
 
     @staticmethod
     def _universal_fallback_enabled() -> bool:
@@ -3695,28 +3758,35 @@ class DecodoScraperClient:
             return []
         try:
             payload = cls._post_google(search_query, budget)
+            urls = cls._fragrantica_urls_from_payload(payload)
         except Exception as exc:
             cls._log_request_failure("Fragrantica URL discovery", exc)
-            payload = {}
-        urls = cls._collect_fragrantica_urls(payload)
-        if urls:
-            return urls
-        # Google returned nothing usable. Bing is an independent SERP index that
-        # often surfaces the same site:fragrantica.com/perfume page when Google
-        # is rate-limited or omits it -- a redundant discovery path that costs a
-        # second credit only on the (cold) queries that would otherwise be empty.
-        bing_budget = cls._viable_budget(timeout, deadline)
-        if bing_budget <= 0:
-            return urls
-        try:
-            bing_payload = cls._post_bing(search_query, bing_budget)
-        except Exception as exc:
-            cls._log_request_failure("Fragrantica URL discovery (bing)", exc)
-            return urls
-        return cls._collect_fragrantica_urls(bing_payload)
+            urls = []
+        # Secondary SERP redundancy. When Google organic yields no Fragrantica
+        # perfume URL and the Bing fallback is enabled, retry the same
+        # site-scoped query on Bing. This recovers cold, never-seen niche
+        # brand-only houses for which Google parsing comes back empty, without
+        # touching default behavior (gated) or the latency budget (re-clamped to
+        # the same deadline; skipped when no time remains).
+        if not urls and cls.bing_fallback_enabled():
+            bing_budget = cls._viable_budget(timeout, deadline)
+            if bing_budget > 0:
+                try:
+                    payload = cls._post_bing(search_query, bing_budget)
+                    urls = cls._fragrantica_urls_from_payload(payload)
+                except Exception as exc:
+                    cls._log_request_failure("Fragrantica URL discovery (bing)", exc)
+        return urls
 
     @classmethod
-    def _collect_fragrantica_urls(cls, payload: dict) -> list[str]:
+    def _fragrantica_urls_from_payload(cls, payload: dict) -> list[str]:
+        """Canonical Fragrantica perfume URLs from any parsed SERP payload.
+
+        Shared by the Google and Bing discovery paths: the generic
+        ``_search_entries`` walker already descends ``organic`` arrays nested
+        under ``content``/``results``, so a Bing ``bing_search`` response and a
+        ``google_search`` response funnel through the same filter + dedupe.
+        """
         urls: list[str] = []
         seen: set[str] = set()
         for entry in cls._search_entries(payload):
@@ -3729,6 +3799,61 @@ class DecodoScraperClient:
             seen.add(dedupe)
             urls.append(canonical)
         return urls
+
+    @classmethod
+    def _ai_overview_fragrantica_urls(cls, payload: dict) -> list[str]:
+        """Fragrantica perfume URLs cited in a parsed AI Overview source panel.
+
+        AI Overview blocks live under ``ai_overviews[].source_panel.items[].url``
+        (and occasionally other nested ``url``-bearing nodes), which the generic
+        organic walker does not target. Walk the structure defensively and keep
+        only canonical Fragrantica perfume links.
+        """
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def visit(node: Any, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            node = cls._decode_jsonish(node)
+            if isinstance(node, dict):
+                link = node.get("url") or node.get("link")
+                if isinstance(link, str) and link.strip():
+                    canonical = FragranticaEngine.canonical_url(link.strip())
+                    if canonical and FragranticaEngine.is_perfume_url(canonical):
+                        key = FragranticaEngine.dedupe_key(canonical)
+                        if key and key not in seen:
+                            seen.add(key)
+                            urls.append(canonical)
+                for value in node.values():
+                    visit(value, depth + 1)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item, depth + 1)
+
+        for block in cls._search_ai_overview_blocks(payload):
+            visit(block)
+        return urls
+
+    @classmethod
+    def _search_ai_overview_blocks(cls, payload: Any, depth: int = 0) -> list[Any]:
+        """Find every ``ai_overviews`` array anywhere in a parsed payload."""
+        if depth > 8:
+            return []
+        payload = cls._decode_jsonish(payload)
+        blocks: list[Any] = []
+        if isinstance(payload, dict):
+            value = payload.get("ai_overviews") or payload.get("ai_overview")
+            if isinstance(value, list):
+                blocks.extend(value)
+            elif isinstance(value, dict):
+                blocks.append(value)
+            for child in payload.values():
+                blocks.extend(cls._search_ai_overview_blocks(child, depth + 1))
+        elif isinstance(payload, list):
+            for item in payload:
+                blocks.extend(cls._search_ai_overview_blocks(item, depth + 1))
+        return blocks
 
     @classmethod
     def search_fragrantica_designer_urls(
@@ -3849,6 +3974,36 @@ class DecodoScraperClient:
             with cls._cache_lock:
                 cls._brand_perfume_cache[cache_key] = list(urls)
         return urls
+
+    @classmethod
+    def search_fragrantica_urls_via_ai_overview(
+        cls,
+        query: str,
+        deadline: Deadline | None = None,
+        timeout: float = MAX_TIMEOUT,
+        max_results: int = 25,
+    ) -> list[str]:
+        """Last-ditch Fragrantica URL discovery from Google's AI Overview.
+
+        OFF unless ``DECODO_ENABLE_AI_OVERVIEW`` is set. AI Overview needs JS
+        rendering (Premium+JS rate, slower), returns non-deterministic prose, and
+        is *not* in the latency-critical path -- it is only consulted when the
+        cheap Google + Bing organic passes both came back empty for a cold niche
+        brand. URLs come from the answer's cited ``source_panel``.
+        """
+        query = (query or "").strip()
+        if not query or not cls.ai_overview_enabled():
+            return []
+        budget = cls._viable_budget(timeout, deadline)
+        if budget <= 0:
+            return []
+        try:
+            payload = cls._post_ai_overview(f"{query} perfume site:fragrantica.com", budget)
+        except Exception as exc:
+            cls._log_request_failure("AI Overview discovery", exc)
+            return []
+        urls = cls._ai_overview_fragrantica_urls(payload)
+        return urls[:max_results] if max_results else urls
 
     @classmethod
     def discover_fragrances(
@@ -10168,6 +10323,37 @@ def _designer_provider_fallback_results(
             add_label(FragranticaEngine.designer_name_from_url(url))
         collect_rows_for_labels()
 
+    # Last-ditch, opt-in (DECODO_ENABLE_AI_OVERVIEW): if the cheap organic passes
+    # (Google + optional Bing) produced nothing for this cold niche brand, mine
+    # Google's AI Overview source panel for cited Fragrantica URLs. No-ops unless
+    # the flag is set and the provider exposes the method.
+    if (
+        not rows
+        and not deadline.expired()
+        and hasattr(provider, "search_fragrantica_urls_via_ai_overview")
+    ):
+        for url in provider.search_fragrantica_urls_via_ai_overview(
+            query,
+            deadline=deadline,
+            max_results=getattr(args, "max_results", 25),
+        ):
+            key = FragranticaEngine.dedupe_key(url)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            row = UnifiedFragrance(
+                name=FragranticaEngine.name_from_url(url),
+                brand=FragranticaEngine.brand_from_url(url) or canonical_brand or query,
+                year="",
+                frag_url=url,
+                resolver_source="decodo_ai_overview_source_panel",
+                resolver_score=0.80,
+            )
+            if not row.name:
+                continue
+            row.query_score = max(IdentityTools.relevance_score(query, row), 0.85)
+            rows.append(row)
+
     rows.sort(key=lambda item: (item.query_score, item.resolver_score, item.name), reverse=True)
     return rows[: getattr(args, "max_results", 25)]
 
@@ -10215,13 +10401,35 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             # Serper) can return the catalogue. Multi-token queries are left
             # alone -- they are usually brand+fragrance, not a bare house.
             catalog_labels = IdentityTools.catalog_brand_keys(query)
+        # "Resolve faster, not looser." The structured Decodo brand-URL discovery
+        # is the leg that actually resolves cold niche brand-only houses on the
+        # Fragrantica-blocked runtime, and it is fast (~2-4s). Run it FIRST -- while
+        # the full remaining budget is still available -- so a slow direct-FG
+        # catalog crawl (usually blocked in production anyway) can no longer
+        # consume the budget and leave the reliable resolver starved, which is
+        # what made cold "Imaginary Authors" / "Cola Addict" / "Bortnikoff"
+        # queries return zero rows. Gated on a configured reserve so CLI/unbounded
+        # callers keep the original catalog-first ordering byte-for-byte.
+        reserve = getattr(args, "designer_provider_reserve", None) or 0.0
+        if reserve > 0 and not overall.expired():
+            early_designer = _designer_provider_fallback_results(
+                query, args, overall_deadline=overall
+            )
+            if early_designer:
+                return early_designer
         if catalog_labels and not overall.expired():
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
             # Clamp the catalog crawl to whatever remains of the overall budget so
             # it cannot, together with the stages before/after it, exceed the
-            # request ceiling.
-            deadline = Deadline(overall.timeout(args.catalog_budget))
+            # request ceiling. When a reserve is configured, also hold back that
+            # slice so the final designer pass is never skipped for lack of time.
+            catalog_cap = args.catalog_budget
+            if reserve > 0:
+                _rem = overall.remaining()
+                if _rem is not None:
+                    catalog_cap = min(catalog_cap, max(0.0, _rem - reserve))
+            deadline = Deadline(overall.timeout(catalog_cap))
             for brand_label in catalog_labels:
                 if deadline.expired() or overall.expired():
                     break
@@ -10405,6 +10613,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-workers", type=int, default=3)
     parser.add_argument("--spell-repair-budget", type=float, default=1.6, help="Google/Bing spelling repair budget, only used after a clearly bad first pass. Use 0 to disable.")
     parser.add_argument("--search-total-budget", type=float, default=None, help="Overall wall-clock ceiling (seconds) for the entire live search, including the cold-query spell-repair/catalog/designer fallback chain. None => unbounded. The HTTP API sets a concrete value so a bare designer/brand query cannot stack per-stage budgets past the client timeout.")
+    parser.add_argument("--designer-provider-reserve", type=float, default=None, help="Seconds of the overall budget reserved for the reliable structured designer/brand discovery so a slow catalog crawl cannot starve it. When set (>0), that leg runs FIRST for cold brand queries and the catalog crawl is capped to leave this slice. None/0 => original catalog-first ordering (CLI/script default, unchanged).")
     parser.add_argument("--fg-cache", default=str(Path.home() / ".cache" / "fragrance_parser_fg_identity_cache_v2.json"))
     parser.add_argument("--debug", action="store_true", help="Print resolver diagnostics/timing trace. Alias for --debug-timing.")
     parser.add_argument("--debug-timing", action="store_true", help="Print timing checkpoints for each resolver stage.")
