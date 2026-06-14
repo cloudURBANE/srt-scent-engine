@@ -807,6 +807,56 @@ def test_brand_only_query_gets_catalog_labels() -> None:
     )
 
 
+def test_multi_token_bare_brand_seeds_catalog_labels() -> None:
+    print("Multi-token bare-brand catalog-seed checks:")
+    # The bug: a *multi-token* house we don't alias ("Frederic Malle") fell
+    # through search_once's single-token-only catalog seed with empty labels, so
+    # it got zero designer-catalog breadth and returned zero rows whenever the
+    # structured (Decodo) provider leg was slow/timed out -- even though its
+    # Fragrantica designer page is crawlable. bare_brand_label() recovers it from
+    # the dominant first-pass house, while leaving brand+fragrance queries alone.
+    def rows(brand: str, count: int) -> list:
+        return [engine.UnifiedFragrance(name=f"Frag {i}", brand=brand, year="") for i in range(count)]
+
+    malle = rows("Frederic Malle", 8)
+    check(
+        "bare multi-token house resolves to its catalog label",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", malle) == "Frederic Malle",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", malle),
+    )
+    check(
+        "recovered label feeds a non-empty catalog crawl",
+        engine.IdentityTools.catalog_brand_keys(
+            engine.IdentityTools.bare_brand_label("Frederic Malle", malle)
+        ) == ["Frederic Malle"],
+        str(engine.IdentityTools.catalog_brand_keys(
+            engine.IdentityTools.bare_brand_label("Frederic Malle", malle)
+        )),
+    )
+    # Brand+fragrance multi-token query: dominant house is "Tom Ford" but the
+    # query carries leftover name tokens ("oud wood"), so it must NOT be treated
+    # as a bare house (that would crawl a non-existent "Tom Ford Oud Wood" page).
+    tf = rows("Tom Ford", 6)
+    check(
+        "brand+fragrance multi-token query is not treated as a bare house",
+        engine.IdentityTools.bare_brand_label("Tom Ford Oud Wood", tf) == "",
+        engine.IdentityTools.bare_brand_label("Tom Ford Oud Wood", tf),
+    )
+    # A single stray row matching the query must not trigger a crawl: the house
+    # has to dominate the first-pass rows.
+    mixed = rows("Some Other House", 7) + rows("Frederic Malle", 1)
+    check(
+        "a lone matching row does not trigger a bare-house crawl",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", mixed) == "",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", mixed),
+    )
+    check(
+        "no first-pass rows yields no bare-house label",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", []) == "",
+        engine.IdentityTools.bare_brand_label("Frederic Malle", []),
+    )
+
+
 def test_poisoned_db_records_are_filtered() -> None:
     print("Poisoned DB record filtering checks:")
     old_record_search = api.db.search_fragrance_records
@@ -1712,6 +1762,7 @@ def main() -> int:
     test_dolce_gabbana_identity_recovery_and_persistence()
     test_house_echo_poison_is_suppressed()
     test_brand_only_query_gets_catalog_labels()
+    test_multi_token_bare_brand_seeds_catalog_labels()
     test_poisoned_db_records_are_filtered()
     test_short_db_search_uses_word_boundaries()
     test_search_serialization_recovers_fragrantica_identity()
