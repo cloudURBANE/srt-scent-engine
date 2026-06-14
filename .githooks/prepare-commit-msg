@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# Backstop guardrail: block back-merging the base branch (main) into a feature
+# branch. The authoritative policy lives in CLAUDE.md > "Git workflow"; this
+# hook is the committed, portable hard stop so an accidental
+# `git merge origin/main` on a feature branch fails loudly instead of growing
+# the merge ladder.
+#
+# This file is tracked in .githooks/ and activated per clone via:
+#     git config core.hooksPath .githooks
+# (run once after cloning; see CLAUDE.md > "First-time setup").
+#
+# Why prepare-commit-msg (not pre-merge-commit): in git 2.40 the
+# pre-merge-commit hook runs BEFORE MERGE_HEAD is recorded, so it cannot tell
+# what is being merged. prepare-commit-msg runs with $2="merge" and MERGE_HEAD
+# populated, and exiting non-zero aborts the merge commit cleanly.
+#
+# Bypass when you genuinely need it (ask the user first): git merge --no-verify
+
+# $2 is the commit-message source; only "merge" matters to us.
+[ "$2" = "merge" ] || exit 0
+
+current_branch="$(git symbolic-ref --short -q HEAD)"
+
+# If we're on main itself (or detached), back-merge-into-feature can't apply.
+if [ "$current_branch" = "main" ] || [ -z "$current_branch" ]; then
+	exit 0
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+merge_head_file="$git_dir/MERGE_HEAD"
+[ -f "$merge_head_file" ] || exit 0
+
+main_remote="$(git rev-parse -q --verify origin/main 2>/dev/null)"
+main_local="$(git rev-parse -q --verify refs/heads/main 2>/dev/null)"
+
+# MERGE_HEAD may list several commits (octopus merge); check each line.
+while IFS= read -r incoming; do
+	[ -n "$incoming" ] || continue
+	if { [ -n "$main_remote" ] && [ "$incoming" = "$main_remote" ]; } ||
+	   { [ -n "$main_local" ] && [ "$incoming" = "$main_local" ]; }; then
+		echo "------------------------------------------------------------------" >&2
+		echo "BLOCKED: refusing to merge main into feature branch '$current_branch'." >&2
+		echo "" >&2
+		echo "Back-merging main into a feature branch creates the 'merge ladder'" >&2
+		echo "this repo avoids (see CLAUDE.md > Git workflow). Integration flows" >&2
+		echo "one way only: feature -> main, via PR." >&2
+		echo "" >&2
+		echo "To catch this branch up to main, rebase instead:" >&2
+		echo "    git merge --abort" >&2
+		echo "    git fetch origin && git rebase origin/main" >&2
+		echo "" >&2
+		echo "If you are certain you need this merge, ask the user first, then:" >&2
+		echo "    git merge --abort && git merge --no-verify <ref>" >&2
+		echo "------------------------------------------------------------------" >&2
+		exit 1
+	fi
+done < "$merge_head_file"
+
+exit 0
