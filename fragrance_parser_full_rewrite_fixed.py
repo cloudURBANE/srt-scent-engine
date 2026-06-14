@@ -10471,6 +10471,25 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
     overall = Deadline(getattr(args, "search_total_budget", None))
     candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True, timing=timing)
     if QueryRepair.needs_repair(bn_results, candidates):
+        # "Resolve faster, not looser." The structured Decodo brand-URL discovery
+        # is the leg that actually resolves cold niche houses on the
+        # Fragrantica-blocked runtime, and it is fast (~2-4s). Run it FIRST --
+        # before the spell-repair pass below, which runs a *second* full
+        # _search_core (initial_timeout + fg_timeout) and otherwise drains the
+        # overall budget, leaving this reliable leg only ~1.4s of runway -> Decodo
+        # read-timeout -> zero rows for cold-but-correctly-spelled queries
+        # ("Kayali Vanilla 28", "Cola Addict", "YSL Y"). This leg only returns
+        # rows when the provider actually resolves the brand, so a genuine typo
+        # (no such house) comes back empty here and still falls through to spell
+        # repair. Gated on a configured reserve so CLI/unbounded callers keep the
+        # original spell-repair-first ordering byte-for-byte.
+        reserve = getattr(args, "designer_provider_reserve", None) or 0.0
+        if reserve > 0 and not overall.expired():
+            early_designer = _designer_provider_fallback_results(
+                query, args, overall_deadline=overall
+            )
+            if early_designer:
+                return early_designer
         if args.spell_repair_budget > 0 and not overall.expired():
             suggestion = QueryRepair.suggest(
                 scraper, query, seconds=overall.timeout(args.spell_repair_budget)
@@ -10509,22 +10528,10 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
             bare_house = IdentityTools.bare_brand_label(query, [*candidates, *bn_results])
             if bare_house:
                 catalog_labels = IdentityTools.catalog_brand_keys(bare_house)
-        # "Resolve faster, not looser." The structured Decodo brand-URL discovery
-        # is the leg that actually resolves cold niche brand-only houses on the
-        # Fragrantica-blocked runtime, and it is fast (~2-4s). Run it FIRST -- while
-        # the full remaining budget is still available -- so a slow direct-FG
-        # catalog crawl (usually blocked in production anyway) can no longer
-        # consume the budget and leave the reliable resolver starved, which is
-        # what made cold "Imaginary Authors" / "Cola Addict" / "Bortnikoff"
-        # queries return zero rows. Gated on a configured reserve so CLI/unbounded
-        # callers keep the original catalog-first ordering byte-for-byte.
-        reserve = getattr(args, "designer_provider_reserve", None) or 0.0
-        if reserve > 0 and not overall.expired():
-            early_designer = _designer_provider_fallback_results(
-                query, args, overall_deadline=overall
-            )
-            if early_designer:
-                return early_designer
+        # The reserve-gated structured Decodo discovery already ran first (above,
+        # before spell repair) so it kept the full first-pass budget. The catalog
+        # crawl below still holds back `reserve` seconds so the final designer
+        # pass is never skipped for lack of time.
         if catalog_labels and not overall.expired():
             brand_results: list[UnifiedFragrance] = []
             seen: set[str] = set()
