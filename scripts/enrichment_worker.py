@@ -36,6 +36,7 @@ import random
 import re
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -234,6 +235,20 @@ class StopController:
         print("\nStop requested. Finishing the current safe step, then exiting.")
 
 
+def _concentration_uses_decodo() -> bool:
+    """True when the concentration SERP tier resolves through Decodo rather than
+    a local Chromium browser. Delegates to concentration_grabber so the policy
+    lives in one place; degrades to False if that module is unavailable."""
+    try:
+        from concentration_grabber import _decodo_concentration_enabled
+    except Exception:
+        return False
+    try:
+        return bool(_decodo_concentration_enabled())
+    except Exception:
+        return False
+
+
 class ConcentrationSerpState:
     """Lazy reusable browser page for concentration SERP fallback.
 
@@ -244,6 +259,13 @@ class ConcentrationSerpState:
     """
 
     def __init__(self, *, enabled: bool, debug: bool = False) -> None:
+        # When the Decodo structured SERP powers the concentration tier there is
+        # no Chromium page to reuse: analyze(page=None) fetches over Decodo's
+        # egress instead of booting a browser. Disabling the page pool here is
+        # what keeps the worker's concentration tier thread-safe (a shared
+        # DrissionPage is not), and is a prerequisite for parallel processing.
+        if enabled and _concentration_uses_decodo():
+            enabled = False
         self.enabled = enabled
         self.debug = debug
         self._page: Any = None
@@ -284,6 +306,11 @@ class WorkerConfig:
     detail_timeout: float
     debug: bool
     dry_run: bool
+    # Requested job-processing concurrency. 0 = auto (Decodo-aware default);
+    # >1 only takes effect when the Decodo egress path is active (see
+    # _effective_concurrency), since the single-IP clearance path must stay
+    # serial to avoid rate-limit blocks.
+    concurrency: int = 0
 
     @property
     def auth_configured(self) -> bool:
@@ -1937,6 +1964,111 @@ def _retry_batch(jobs: list[dict[str, Any]], requeued_ids: set[str]) -> list[dic
     ]
 
 
+class BlockGate:
+    """Cross-thread Fragrantica rate-limit backoff for parallel processing.
+
+    When any worker thread reports ``fg_resolver_blocked`` the gate trips and
+    new job starts pause until the backoff window elapses, so a block storm
+    does not get hammered in parallel by every other in-flight worker. This is
+    the concurrent equivalent of the serial path's 180s inter-job backoff.
+    """
+
+    def __init__(self, backoff_seconds: float = 180.0) -> None:
+        self._lock = threading.Lock()
+        self._blocked_until = 0.0
+        self._backoff = max(0.0, float(backoff_seconds))
+
+    def trip(self) -> None:
+        with self._lock:
+            self._blocked_until = max(
+                self._blocked_until, time.monotonic() + self._backoff
+            )
+
+    def wait(self, stop: StopController | None = None) -> None:
+        while True:
+            with self._lock:
+                remaining = self._blocked_until - time.monotonic()
+            if remaining <= 0 or (stop and stop.stop_requested):
+                return
+            time.sleep(min(1.0, remaining))
+
+
+def _effective_concurrency(config: WorkerConfig) -> int:
+    """Resolve the requested worker count into a safe effective value.
+
+    Parallelism is only safe when the Decodo egress path is active: detail
+    fetches then go over rotating premium-proxy IPs (not the single, easily
+    rate-limited clearance IP) and the concentration tier is browserless
+    (no shared, non-thread-safe Chromium page). When Decodo is off the worker
+    stays serial regardless of the request.
+    """
+    raw = max(0, int(getattr(config, "concurrency", 0) or 0))
+    decodo = _concentration_uses_decodo()
+    if raw <= 0:  # auto
+        return 4 if decodo else 1
+    if raw > 1 and not decodo:
+        print(
+            "Parallel processing needs the Decodo egress path (rotating proxies "
+            "+ browserless concentration); falling back to 1 worker."
+        )
+        return 1
+    return raw
+
+
+def _process_jobs_parallel(
+    client: ApiClient,
+    scraper,
+    engine_args: argparse.Namespace,
+    jobs: list[dict[str, Any]],
+    config: WorkerConfig,
+    concentration_serp: ConcentrationSerpState | None,
+    workers: int,
+    stop: StopController | None,
+) -> int:
+    """Process jobs across a bounded thread pool. Each job is claimed
+    server-side inside process_job, so the shared pending snapshot cannot be
+    double-processed; the concurrency cap (not per-job sleeps) paces throughput,
+    and a shared BlockGate enforces the rate-limit backoff across threads."""
+    total = len(jobs)
+    gate = BlockGate(180.0)
+    print(f"Processing {total} job(s) with {workers} parallel workers.")
+
+    def run_one(idx: int, job: dict[str, Any]) -> bool:
+        if stop and stop.stop_requested:
+            return False
+        gate.wait(stop)
+        if stop and stop.stop_requested:
+            return False
+        sink: dict[str, Any] = {}
+        ok = process_job(
+            client,
+            scraper,
+            engine_args,
+            job,
+            index_label=f"[{idx}/{total}]",
+            config=config,
+            result_sink=sink,
+            concentration_serp=concentration_serp,
+        )
+        if sink.get("error") == "fg_resolver_blocked":
+            print("Fragrantica looks rate-limited; pausing new job starts for 180s.")
+            gate.trip()
+        return ok
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(run_one, idx, job) for idx, job in enumerate(jobs, 1)
+        ]
+        for fut in as_completed(futures):
+            try:
+                if fut.result():
+                    completed += 1
+            except Exception as exc:  # a thread crash must not sink the batch
+                print(f"Worker thread error: {exc}")
+    return completed
+
+
 def process_pending(
     client: ApiClient,
     config: WorkerConfig,
@@ -1980,27 +2112,33 @@ def process_pending(
     )
     completed = 0
     total = len(jobs)
+    workers = _effective_concurrency(config)
     try:
-        for idx, job in enumerate(jobs, 1):
-            if stop and stop.stop_requested:
-                break
-            sink: dict[str, Any] = {}
-            ok = process_job(
-                client,
-                scraper,
-                engine_args,
-                job,
-                index_label=f"[{idx}/{total}]",
-                config=config,
-                result_sink=sink,
-                concentration_serp=concentration_serp,
+        if workers > 1:
+            completed = _process_jobs_parallel(
+                client, scraper, engine_args, jobs, config, concentration_serp, workers, stop
             )
-            completed += 1 if ok else 0
-            if idx < total and not (stop and stop.stop_requested):
-                if sink.get("error") == "fg_resolver_blocked":
-                    print("Fragrantica looks rate-limited; backing off 180s before the next job.")
-                    sleep_conservatively(180.0, 0.0, stop)
-                sleep_conservatively(config.delay, config.jitter, stop)
+        else:
+            for idx, job in enumerate(jobs, 1):
+                if stop and stop.stop_requested:
+                    break
+                sink: dict[str, Any] = {}
+                ok = process_job(
+                    client,
+                    scraper,
+                    engine_args,
+                    job,
+                    index_label=f"[{idx}/{total}]",
+                    config=config,
+                    result_sink=sink,
+                    concentration_serp=concentration_serp,
+                )
+                completed += 1 if ok else 0
+                if idx < total and not (stop and stop.stop_requested):
+                    if sink.get("error") == "fg_resolver_blocked":
+                        print("Fragrantica looks rate-limited; backing off 180s before the next job.")
+                        sleep_conservatively(180.0, 0.0, stop)
+                    sleep_conservatively(config.delay, config.jitter, stop)
     finally:
         concentration_serp.close()
     print(f"Processed {len(jobs)} job(s); completed {completed}.")
@@ -3516,6 +3654,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=_env_int("ENRICHMENT_DEFAULT_LIMIT", DEFAULT_LIMIT))
     parser.add_argument("--delay", type=float, default=_env_float("ENRICHMENT_DEFAULT_DELAY", DEFAULT_DELAY))
     parser.add_argument("--jitter", type=float, default=_env_float("ENRICHMENT_DEFAULT_JITTER", DEFAULT_JITTER))
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_env_int("ENRICHMENT_WORKER_CONCURRENCY", 0),
+        help=(
+            "Parallel job-processing workers (0 = auto: 4 when the Decodo egress "
+            "path is active, else 1). Values >1 are honored only with Decodo; the "
+            "single-IP clearance path is forced serial to avoid rate-limit blocks."
+        ),
+    )
     parser.add_argument("--once", action="store_true", help="Alias for --process-pending --limit 1.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve and parse without mutating worker job state.")
     parser.add_argument(
@@ -3544,6 +3692,7 @@ def build_config(opts: argparse.Namespace) -> WorkerConfig:
         detail_timeout=max(0.1, float(opts.detail_timeout)),
         debug=debug_on,
         dry_run=bool(opts.dry_run),
+        concurrency=max(0, int(getattr(opts, "workers", 0) or 0)),
     )
 
 
