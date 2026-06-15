@@ -2734,8 +2734,57 @@ def test_db_lifecycle() -> None:
         _cleanup()
 
 
+def test_heal_offline_exact_match_contract() -> None:
+    """heal_offline projects engine facts into wardrobe rows only on an exact
+    normalized brand+name match, and treats empty/"unknown" as absent so writes
+    stay merge-safe. Locking these pure helpers guards against silently
+    projecting the wrong family/concentration into a user's saved data."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import heal_offline as heal
+
+    # Normalization collapses case + punctuation so the same fragrance matches...
+    check(
+        "heal_offline: punctuation/case variants normalize equal",
+        heal._norm_key("Dior", "Sauvage Eau de Parfum")
+        == heal._norm_key("dior", "sauvage  eau-de-parfum"),
+    )
+    # ...but distinct fragrances never collide (no accidental cross-projection).
+    check(
+        "heal_offline: distinct fragrances normalize unequal",
+        heal._norm_key("Chanel", "Bleu de Chanel")
+        != heal._norm_key("Chanel", "Coco Mademoiselle"),
+    )
+    check(
+        "heal_offline: flanker not equal to base (Sauvage vs Sauvage Elixir)",
+        heal._norm_key("Dior", "Sauvage") != heal._norm_key("Dior", "Sauvage Elixir"),
+    )
+    # Concentration: a stored "Unknown"/empty is treated as ABSENT (so a real
+    # value can fill it), while a real value is returned verbatim.
+    check(
+        "heal_offline: 'Unknown' concentration treated as absent",
+        heal._record_concentration({"fg_raw": {"concentration": "Unknown"}}) is None,
+    )
+    check(
+        "heal_offline: real concentration returned",
+        heal._record_concentration({"fg_raw": {"concentration": "Eau de Parfum"}})
+        == "Eau de Parfum",
+    )
+    check(
+        "heal_offline: concentration falls back to raw_identity",
+        heal._record_concentration(
+            {"fg_raw": {"raw_identity": {"concentration": "Parfum"}}}
+        )
+        == "Parfum",
+    )
+    check(
+        "heal_offline: empty raw detected (no usable detail)",
+        heal._record_has_raw({"fg_raw": {}, "bn_raw": {}}) is False,
+    )
+
+
 def main() -> int:
     test_no_db_contract()
+    test_heal_offline_exact_match_contract()
     test_fragrantica_challenge_and_static_parse()
     test_fragrantica_clearance_session_lifecycle()
     test_mobile_new_device_session_binding()
