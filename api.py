@@ -4828,6 +4828,15 @@ class HealSweepRequest(BaseModel):
     max_requested_count: int | None = None
 
 
+class RecomputeMetricsRequest(BaseModel):
+    # Page through fragrance_records; db clamps limit to 500 per call. Mirrors
+    # the completeness/heal sweep so the same offset cursor pages both.
+    limit: int = 500
+    offset: int = 0
+    # Compute and report what would change, but write nothing.
+    dry_run: bool = False
+
+
 def _record_heal_job_key(record: dict[str, Any]) -> str:
     """Job key for a stored fragrance record, mirroring _enqueue_enrichment_job.
 
@@ -5049,6 +5058,103 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
         "missing_field_counts": field_counts,
         "queued_items": queued,
         "skipped_items": skipped,
+    }
+
+
+@app.post(
+    "/api/enrichment/recompute-metrics",
+    dependencies=[Depends(_require_worker_token)],
+)
+def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any]:
+    """Protected: bulk offline recompute of derived_metrics_json from stored raw.
+
+    A raw upsert deliberately invalidates derived_metrics_json to NULL whenever
+    fresh fg/bn raw lands, so a row's family, main accords and wear profile read
+    as Unknown until something recomputes the blob. The only other healer is a
+    read-time /details fetch, which only fires when a user actually opens that
+    fragrance -- so the bulk of the cache never recovers on its own. This sweep
+    reconstructs the canonical UnifiedDetails from the already-stored
+    fg_raw_json/bn_raw_json (no network -- the exact path a /details hydrate
+    uses) and persists fresh metrics for every NULL-metric row whose raw carries
+    enough to compute them. Strictly additive and idempotent: the write only
+    fills NULLs (db.set_record_derived_metrics never overwrites), so re-running
+    -- or racing the read-time healer -- is a no-op. Rows with empty raw are
+    left for the heal sweep + worker to scrape. Page with limit/offset like
+    GET /api/enrichment/completeness.
+    """
+    _require_db()
+    from derived_metrics_adapter import build_derived_metrics
+
+    records = db.list_fragrance_records(limit=payload.limit, offset=payload.offset)
+    scanned = len(records)
+    already_present = no_raw = recomputed = persisted = 0
+    family_resolved = no_accords = errors = 0
+    samples: list[dict[str, Any]] = []
+
+    for record in records:
+        if record.get("derived_metrics") is not None:
+            already_present += 1
+            continue
+        if not _record_has_detail_payload(record):
+            # Empty raw -- only a worker scrape can heal this. Recomputing would
+            # persist a hollow metrics blob; leave it for the heal sweep.
+            no_raw += 1
+            continue
+        try:
+            details = _details_from_fragrance_record(record)
+            dm = build_derived_metrics(details)
+        except Exception:
+            errors += 1
+            logger.exception(
+                "recompute-metrics: build failed record_key=%s",
+                record.get("record_key"),
+            )
+            continue
+        if not dm:
+            errors += 1
+            continue
+        recomputed += 1
+        family = derive_families({"derived_metrics": dm}, existing_family=None)
+        resolved = bool(family.get("primary_family"))
+        if resolved:
+            family_resolved += 1
+        else:
+            no_accords += 1
+        if len(samples) < 10:
+            samples.append(
+                {
+                    "record_key": record.get("record_key"),
+                    "house": record.get("house"),
+                    "name": record.get("name"),
+                    "family": family.get("primary_family"),
+                }
+            )
+        if payload.dry_run:
+            continue
+        try:
+            if db.set_record_derived_metrics(record.get("record_key"), dm):
+                persisted += 1
+        except Exception:
+            errors += 1
+            logger.exception(
+                "recompute-metrics: persist failed record_key=%s",
+                record.get("record_key"),
+            )
+
+    return {
+        "dry_run": payload.dry_run,
+        "total_records": db.count_fragrance_records(),
+        "limit": payload.limit,
+        "offset": payload.offset,
+        "scanned": scanned,
+        "already_present": already_present,
+        "no_raw": no_raw,
+        "recomputed": recomputed,
+        "persisted": persisted,
+        "family_resolved": family_resolved,
+        "no_accords": no_accords,
+        "errors": errors,
+        "samples": samples,
     }
 
 

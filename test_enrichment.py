@@ -1363,6 +1363,124 @@ def test_completeness_self_heal_sweep() -> None:
     )
 
 
+def test_recompute_derived_metrics_sweep() -> None:
+    print("Bulk derived-metrics recompute sweep checks (no DATABASE_URL required):")
+
+    def record(
+        key: str,
+        *,
+        derived_metrics: object,
+        fg_raw: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "record_key": key,
+            "canonical_fg_url": f"https://www.fragrantica.com/perfume/Test-House/{key}.html",
+            "bn_url": None,
+            "name": key,
+            "house": "Test House",
+            "year": 2024,
+            "gender": "Unisex",
+            "image_url": None,
+            "search": {},
+            "fg_raw": fg_raw if fg_raw is not None else {},
+            "bn_raw": {},
+            "derived_metrics": derived_metrics,
+        }
+
+    # Row 1: NULL metrics but real accords in fg_raw -> recompute resolves family.
+    recomputable = record(
+        "Recomputable-1",
+        derived_metrics=None,
+        fg_raw={
+            "frag_cards": {
+                "main accord": [
+                    {"label": "woody", "pct": 95.0},
+                    {"label": "citrus", "pct": 40.0},
+                ],
+                "Community Interest": [{"label": "Have", "count": "9"}],
+            },
+            "notes": {"top": ["bergamot"], "heart": ["cedar"], "base": ["musk"], "flat": []},
+        },
+    )
+    # Row 2: metrics already present -> left untouched (no overwrite).
+    already = record(
+        "Already-2",
+        derived_metrics={"main_accords": {"top_accords": ["rose"]}, "source_coverage": {}},
+        fg_raw={"frag_cards": {"main accord": [{"label": "rose", "pct": 90.0}]}},
+    )
+    # Row 3: NULL metrics AND empty raw -> needs a scrape, must be skipped.
+    empty = record("Empty-3", derived_metrics=None, fg_raw={})
+
+    saved_token = api._ENRICHMENT_WORKER_TOKEN
+    saved_enabled = db.ENABLED
+    saved_list = db.list_fragrance_records
+    saved_count = db.count_fragrance_records
+    saved_set = db.set_record_derived_metrics
+    writes: list[str] = []
+    client = TestClient(api.app)
+    auth = {"Authorization": "Bearer test-secret-token"}
+    try:
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
+        r = client.post("/api/enrichment/recompute-metrics", json={})
+        check("recompute endpoint requires bearer token", r.status_code == 401, str(r.status_code))
+
+        db.ENABLED = True
+        db.list_fragrance_records = lambda limit=200, offset=0: [recomputable, already, empty]
+        db.count_fragrance_records = lambda: 3
+
+        def fake_set(record_key, derived_metrics):
+            # Mirror the real guard: only the NULL-metric row is writable.
+            writes.append(record_key)
+            return True
+
+        db.set_record_derived_metrics = fake_set
+
+        # Dry run: computes and reports, writes nothing.
+        r = client.post("/api/enrichment/recompute-metrics", json={"dry_run": True}, headers=auth)
+        check("dry-run recompute responds 200", r.status_code == 200, str(r.status_code))
+        body = r.json()
+        check(
+            "dry-run recompute scans every row but persists nothing",
+            body.get("scanned") == 3 and body.get("persisted") == 0 and writes == [],
+            str(body),
+        )
+        check(
+            "dry-run recompute resolves family for the recomputable row only",
+            body.get("recomputed") == 1 and body.get("family_resolved") == 1,
+            str(body),
+        )
+        check(
+            "dry-run recompute skips empty-raw rows as no_raw",
+            body.get("no_raw") == 1,
+            str(body),
+        )
+        check(
+            "dry-run recompute leaves already-populated rows untouched",
+            body.get("already_present") == 1,
+            str(body),
+        )
+
+        # Real run: persists exactly the one recomputable NULL-metric row.
+        r = client.post("/api/enrichment/recompute-metrics", json={}, headers=auth)
+        body = r.json()
+        check(
+            "recompute persists only the recomputable NULL-metric row",
+            body.get("persisted") == 1 and writes == [recomputable["record_key"]],
+            f"{body} writes={writes}",
+        )
+        check(
+            "recompute never targets the already-populated row",
+            already["record_key"] not in writes and empty["record_key"] not in writes,
+            str(writes),
+        )
+    finally:
+        api._ENRICHMENT_WORKER_TOKEN = saved_token
+        db.ENABLED = saved_enabled
+        db.list_fragrance_records = saved_list
+        db.count_fragrance_records = saved_count
+        db.set_record_derived_metrics = saved_set
+
+
 def test_parfumo_partial_self_heal_alignment() -> None:
     print("Parfumo partial vs self-heal alignment checks (no DATABASE_URL required):")
     import enrichment_facts
@@ -2625,6 +2743,7 @@ def main() -> int:
     test_concentration_pipeline()
     test_stored_detail_completion_logic()
     test_completeness_self_heal_sweep()
+    test_recompute_derived_metrics_sweep()
     test_parfumo_partial_self_heal_alignment()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
