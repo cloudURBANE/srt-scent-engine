@@ -1493,6 +1493,47 @@ def list_fragrance_records(limit: int = 200, offset: int = 0) -> list[dict[str, 
         ctx.__exit__(None, None, None)
 
 
+def set_record_derived_metrics(
+    record_key: str, derived_metrics: dict[str, Any]
+) -> bool:
+    """Fill a record's derived_metrics_json in place, but only when it is NULL.
+
+    Backfill path for the bulk recompute sweep (api recompute_derived_metrics).
+    A raw upsert deliberately invalidates derived_metrics_json to NULL whenever
+    fresh fg/bn raw lands (see the CASE in upsert_fragrance_details /
+    upsert_fragrance_records), so a row's family/accords/wear-profile read as
+    Unknown until the metrics are recomputed from the stored raw. This writes
+    freshly computed metrics back, but the ``derived_metrics_json IS NULL``
+    guard keeps it strictly additive: it can never overwrite metrics that are
+    already present, so re-running the sweep -- or racing a read-time
+    /details hydrate -- is a harmless no-op. Returns True when a row was filled.
+    """
+    if not ENABLED or derived_metrics is None:
+        return False
+    from psycopg.types.json import Json
+
+    key = _clean_text(record_key)
+    if not key:
+        return False
+    ctx, conn = _conn()
+    try:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                UPDATE fragrance_records
+                SET derived_metrics_json = %s,
+                    metrics_computed_at = now(),
+                    updated_at = now()
+                WHERE record_key = %s
+                  AND derived_metrics_json IS NULL
+                """,
+                (Json(derived_metrics), key),
+            )
+            return bool(cur.rowcount and cur.rowcount > 0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def get_jobs_by_keys(job_keys: list[str]) -> dict[str, dict[str, Any]]:
     """Map job_key -> queue state for a batch of keys. Empty when disabled.
 
