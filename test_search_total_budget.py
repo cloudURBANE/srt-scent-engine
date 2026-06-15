@@ -177,9 +177,97 @@ def test_unbounded_budget_does_not_clamp():
         _restore(snap)
 
 
+def test_structured_discovery_runs_before_spell_repair():
+    """With a configured designer-provider reserve (the production HTTP setting),
+    the reliable structured Decodo discovery runs BEFORE the spell-repair pass.
+
+    Regression for the live cold-query starvation: the spell-repair pass runs a
+    *second* full ``_search_core`` (initial_timeout + fg_timeout) and, when it
+    ran first, drained the overall budget to ~1.4s -- below the 2-4s a Decodo URL
+    discovery call needs -- so the reliable designer leg read-timed-out and cold
+    but correctly-spelled queries ("Kayali Vanilla 28", "Cola Addict", "YSL Y")
+    returned zero rows. Running the designer leg first means a query it can
+    resolve never burns the spell-repair budget at all.
+    """
+    snap = _snapshot()
+    saved_designer = fp._designer_provider_fallback_results
+    try:
+        args = _build_args(total_budget=18.0, spell=4.0, catalog=3.5)
+        args.designer_provider_reserve = 7.0
+        order = []
+        row = fp.UnifiedFragrance(
+            name="Vanilla 28",
+            brand="Kayali",
+            year="",
+            frag_url="https://www.fragrantica.com/perfume/Kayali/Vanilla-28-1.html",
+        )
+
+        fp._search_core = lambda scraper, q, a, allow_repair=True, timing=None: ([], [], [])
+        fp.QueryRepair.needs_repair = staticmethod(lambda bn, cands: True)
+
+        def fake_designer(query, a, overall_deadline=None):
+            order.append("designer")
+            return [row]
+        fp._designer_provider_fallback_results = fake_designer
+
+        def fake_suggest(scraper, query, seconds=0.0):
+            order.append("spell")
+            return None
+        fp.QueryRepair.suggest = staticmethod(fake_suggest)
+
+        out = fp.search_once(None, "kayali vanilla 28", args)
+        assert out == [row], f"expected the structured designer rows, got {out!r}"
+        assert order == ["designer"], (
+            "structured discovery must run before (and pre-empt) spell repair when "
+            f"a reserve is configured; got call order {order}"
+        )
+        print("PASS structured_discovery_runs_before_spell_repair")
+    finally:
+        fp._designer_provider_fallback_results = saved_designer
+        _restore(snap)
+
+
+def test_no_reserve_keeps_spell_repair_first():
+    """Guardrail: with no configured reserve (CLI/unbounded default), the
+    designer leg does NOT pre-empt spell repair -- the original ordering is kept
+    byte-for-byte so this change is scoped to the production HTTP path."""
+    snap = _snapshot()
+    saved_designer = fp._designer_provider_fallback_results
+    try:
+        args = _build_args(total_budget=18.0, spell=4.0, catalog=3.5)
+        args.designer_provider_reserve = None
+        order = []
+
+        fp._search_core = lambda scraper, q, a, allow_repair=True, timing=None: ([], [], [])
+        fp.QueryRepair.needs_repair = staticmethod(lambda bn, cands: True)
+        fp.IdentityTools.catalog_brand_keys = staticmethod(lambda brand, q: [])
+        fp.IdentityTools.canonical_brand_query = staticmethod(lambda q: "")
+
+        def fake_designer(query, a, overall_deadline=None):
+            order.append("designer")
+            return []
+        fp._designer_provider_fallback_results = fake_designer
+
+        def fake_suggest(scraper, query, seconds=0.0):
+            order.append("spell")
+            return None
+        fp.QueryRepair.suggest = staticmethod(fake_suggest)
+
+        fp.search_once(None, "kayali vanilla 28", args)
+        assert order and order[0] == "spell", (
+            f"with no reserve, spell repair must run first (original ordering); got {order}"
+        )
+        print("PASS no_reserve_keeps_spell_repair_first")
+    finally:
+        fp._designer_provider_fallback_results = saved_designer
+        _restore(snap)
+
+
 if __name__ == "__main__":
     test_overall_budget_bounds_chain()
     test_catalog_crawl_is_clamped()
     test_designer_fallback_skips_when_expired()
     test_unbounded_budget_does_not_clamp()
+    test_structured_discovery_runs_before_spell_repair()
+    test_no_reserve_keeps_spell_repair_first()
     print("\nALL TESTS PASSED")
