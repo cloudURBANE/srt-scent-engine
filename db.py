@@ -48,7 +48,12 @@ _pool: Any = None  # psycopg_pool.ConnectionPool, lazily created in init_db()
 # Conservative limits for the worker list endpoint.
 DEFAULT_JOB_LIMIT = 20
 MAX_JOB_LIMIT = 100
-DEFAULT_DB_POOL_MAX_SIZE = 40
+# Railway hobby/basic-tier Postgres hard-caps concurrent connections at 20, so a
+# pool larger than that (the old default was 40) exhausts the server and surfaces
+# as fe_sendauth / "too many connections" hangs under load. Default conservative
+# and leave headroom for migrations/manual psql/the worker; raise via
+# DB_POOL_MAX_SIZE on tiers that allow more.
+DEFAULT_DB_POOL_MAX_SIZE = 15
 # Lease window for a claimed job; a processing job past this is reclaimable.
 DEFAULT_LEASE_SECONDS = 15 * 60
 # Hard cap on retryable failures before a job is forcibly demoted to 'failed'.
