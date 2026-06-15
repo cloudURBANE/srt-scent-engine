@@ -25,6 +25,31 @@ def _env_float(name, default, *, minimum=0.0):
     return value
 
 
+def _decodo_concentration_enabled() -> bool:
+    """True when the SERP consensus tier should fetch through the engine's
+    Decodo structured-search client instead of booting a local headless
+    Chromium DuckDuckGo browser.
+
+    Defaults to on whenever Decodo credentials are configured (the structured
+    provider is faster, runs over rotating premium-proxy egress, and needs no
+    browser — which is also what makes the enrichment worker safe to
+    parallelize). Set ``SCENT_CONCENTRATION_DISABLE_DECODO=1`` to fall back to
+    the legacy Chromium SERP (e.g. local runs without Decodo creds).
+    """
+    if (os.environ.get("SCENT_CONCENTRATION_DISABLE_DECODO") or "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return False
+    try:
+        from fragrance_parser_full_rewrite_fixed import DecodoScraperClient
+    except Exception:
+        return False
+    try:
+        return bool(DecodoScraperClient.enabled())
+    except Exception:
+        return False
+
+
 @dataclass
 class ScentProfile:
     query: str
@@ -500,6 +525,66 @@ class SemanticScentEngine:
         return []
 
     @staticmethod
+    def _decodo_serp_rows(query, site_filter, deadline=None):
+        """Structured-SERP equivalent of ``_retry_fetch``.
+
+        Fetches organic results for ``"<query> <site_filter>"`` through the
+        engine's Decodo client and maps each entry into the exact
+        ``{title, snippet, url, url_raw, domain}`` row shape ``_classify_result``
+        consumes. Transport only: the voting, tiering, and concentration
+        scoring downstream are unchanged. Returns ``[]`` on any failure or an
+        exhausted budget, mirroring ``_retry_fetch``'s loaded-but-empty
+        contract so the caller treats a missing provider exactly like an empty
+        SERP rather than an error.
+        """
+        try:
+            from fragrance_parser_full_rewrite_fixed import DecodoScraperClient
+        except Exception:
+            return []
+        if not DecodoScraperClient.enabled():
+            return []
+        search_query = f"{query} {site_filter}".strip()
+        timeout = DecodoScraperClient.MAX_TIMEOUT
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < DecodoScraperClient.MIN_VIABLE_BUDGET:
+                return []
+            timeout = min(timeout, remaining)
+        try:
+            payload = DecodoScraperClient._post_google(search_query, timeout)
+            entries = DecodoScraperClient._search_entries(payload)
+        except Exception as exc:
+            DecodoScraperClient._log_request_failure("concentration SERP", exc)
+            return []
+        rows = []
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            link = DecodoScraperClient._entry_link(entry)
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            # Mirror _fetch_serp's url normalization so _detect_url_concentration
+            # and _get_source_tier_key see the same token-friendly form.
+            url_clean = unquote(link).replace('-', ' ').replace('_', ' ').replace('/', ' ')
+            rows.append({
+                "title":   str(entry.get("title") or "").strip(),
+                "snippet": str(
+                    entry.get("snippet")
+                    or entry.get("description")
+                    or entry.get("desc")
+                    or ""
+                ).strip(),
+                "url":     url_clean,
+                "url_raw": link,
+                "domain":  SemanticScentEngine._domain_from(link),
+            })
+            if len(rows) >= 10:
+                break
+        return rows
+
+    @staticmethod
     def _new_serp_page(deadline=None):
         co = ChromiumOptions()
         co.set_argument('--window-position=-2000,-2000')
@@ -579,7 +664,11 @@ class SemanticScentEngine:
             print(f"{M}[BRAIN] Brand prior: '{brand_hit}' -> {brand_prior}{Z}")
 
         # 4. Multi-source engine data pulling loops
-        print(f"{Y}[SYS] Booting browser & fetching sources...{Z}")
+        use_decodo = page is None and _decodo_concentration_enabled()
+        if use_decodo:
+            print(f"{Y}[SYS] Fetching SERP sources via Decodo (no browser)...{Z}")
+        else:
+            print(f"{Y}[SYS] Booting browser & fetching sources...{Z}")
         t0 = time.monotonic()
         deadline = t0 + SemanticScentEngine.SERP_TOTAL_BUDGET_SEC
 
@@ -593,9 +682,9 @@ class SemanticScentEngine:
         sources_consulted = []
         per_source_rows = {}
 
-        owns_page = page is None
+        owns_page = page is None and not use_decodo
         try:
-            if page is None:
+            if page is None and not use_decodo:
                 page = SemanticScentEngine._new_serp_page(deadline)
 
             for label, site_filter in source_queries:
@@ -609,12 +698,17 @@ class SemanticScentEngine:
                     break
                 print(f"  {C}[FETCH] {label:11s}...{Z}", end="")
                 sys.stdout.flush()
-                rows = SemanticScentEngine._retry_fetch(
-                    page,
-                    fragrance_name,
-                    site_filter,
-                    deadline=deadline,
-                )
+                if use_decodo:
+                    rows = SemanticScentEngine._decodo_serp_rows(
+                        fragrance_name, site_filter, deadline=deadline
+                    )
+                else:
+                    rows = SemanticScentEngine._retry_fetch(
+                        page,
+                        fragrance_name,
+                        site_filter,
+                        deadline=deadline,
+                    )
                 per_source_rows[label] = rows
                 if rows:
                     sources_consulted.append(label)
