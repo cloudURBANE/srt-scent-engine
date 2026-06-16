@@ -59,6 +59,7 @@ from enrichment_facts import (
     derive_wear_profile,
     expand_raw_accords,
     missing_facts,
+    non_perfume_signal,
     record_source,
 )
 import fragrance_parser_full_rewrite_fixed as engine
@@ -4179,6 +4180,23 @@ def _enqueue_enrichment_job(
     coverage).
     """
     if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return None
+    is_non_perfume, why = non_perfume_signal(
+        selected.name,
+        selected.brand,
+        fg_url=selected.frag_url,
+        bn_url=selected.bn_url,
+    )
+    if is_non_perfume:
+        # The app is a fragrance app: do not spend enrichment budget on body-care
+        # products. A genuine perfume always carries an FG/Parfumo page, so the
+        # guard inside non_perfume_signal keeps this from skipping real entries.
+        logger.info(
+            "enqueue skipped (non-perfume: %s) name=%s house=%s",
+            why,
+            selected.name,
+            selected.brand,
+        )
         return None
     try:
         job_key = (

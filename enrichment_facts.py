@@ -306,3 +306,103 @@ def primary_season_from_wear_profile(wear_profile: Any) -> str | None:
             if is_fact_complete(season, "season"):
                 return str(season).strip()
     return None
+
+
+# --- Non-perfume detection ---------------------------------------------------
+# The app is a fragrance app; body-care products (lotions, mists, washes,
+# candles) are out of scope. This is a HIGH-PRECISION detector used both as an
+# ingest gate (skip enqueuing non-perfumes) and to generate cleanup candidates.
+# It must never flag a genuine perfume -- false positives delete real data.
+
+# Brands whose catalog reaching this pipeline is overwhelmingly scented
+# body-care, not eau de parfum. A brand only belongs here when the real-perfume
+# guard below still protects its rare genuine fragrance (which carries an
+# FG/Parfumo page). Keep this list conservative and curated.
+NON_PERFUME_BRANDS = frozenset(
+    {
+        "bath and body works",
+        "bath body works",
+        "pull bear",
+        "pull and bear",
+        "the body shop",
+        "body shop",
+    }
+)
+
+# Unambiguous non-perfume product tokens. DELIBERATELY excludes words real
+# perfumes use as names (e.g. Maison Margiela Replica "Bubble Bath",
+# "Beach Walk", "Coffee Break"), so a token match is always a true non-perfume.
+NON_PERFUME_TOKENS = (
+    "body lotion",
+    "body cream",
+    "body butter",
+    "body wash",
+    "shower gel",
+    "hand soap",
+    "hand cream",
+    "hand wash",
+    "body scrub",
+    "sugar scrub",
+    "shampoo",
+    "conditioner",
+    "deodorant",
+    "room spray",
+    "scented candle",
+    "wax melt",
+    "reed diffuser",
+)
+
+_TEST_IDENTITY_MARKERS = ("dummy", "empty-notes", "uncached")
+
+
+def _has_real_perfume_page(*urls: Any) -> bool:
+    """True when any URL is a genuine Fragrantica/Parfumo *perfume* page.
+
+    Pure string check (no engine import, avoids a circular dependency): a real
+    Fragrantica perfume URL contains ``/perfume/`` and a Parfumo one
+    ``/Perfumes/``. Basenotes-only or empty URLs are NOT a real-perfume page --
+    that is exactly the never-resolved state the brand/token guards then judge.
+    """
+    for url in urls:
+        text = str(url or "").lower()
+        if "fragrantica.com/perfume/" in text or ("parfumo." in text and "/perfumes/" in text):
+            return True
+    return False
+
+
+def non_perfume_signal(
+    name: Any,
+    house: Any,
+    *,
+    fg_url: Any = "",
+    parfumo_url: Any = "",
+    bn_url: Any = "",
+) -> tuple[bool, str]:
+    """(is_candidate, reason) -- conservative non-perfume classifier.
+
+    Never flags an item that resolved to a real perfume page. Otherwise flags
+    when the name carries an unambiguous non-perfume product token, when the
+    identity is obviously test/placeholder data, or when the brand is a known
+    body-care catalog. Returns ("", reason) so callers can log why.
+    """
+    name_l = str(name or "").strip().lower()
+    house_l = re.sub(r"[^a-z0-9 ]", " ", str(house or "").lower())
+    house_l = re.sub(r"\s+", " ", house_l).strip()
+
+    # Test/placeholder identities are always junk, regardless of URL.
+    blob = f"{name_l} {str(fg_url or '')} {str(bn_url or '')}".lower()
+    if any(marker in blob for marker in _TEST_IDENTITY_MARKERS):
+        return True, "test/placeholder identity"
+
+    # A genuine perfume page is decisive: never flag it.
+    if _has_real_perfume_page(fg_url, parfumo_url):
+        return False, ""
+
+    for token in NON_PERFUME_TOKENS:
+        if token in name_l:
+            return True, f"non-perfume product token: {token!r}"
+
+    if house_l in NON_PERFUME_BRANDS:
+        return True, "body-care brand, no real perfume page"
+
+    return False, ""
