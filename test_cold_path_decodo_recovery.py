@@ -329,6 +329,89 @@ def test_overshoot_budget_is_clamped() -> None:
     check("read timeout tracks the budget", abs(read - min(healthy, client.MAX_TIMEOUT)) < 1e-6, f"read={read}")
 
 
+# --------------------------------------------------------------------------- #
+# 4. Universal-egress budget (paid render must not be aborted at the SERP cap)
+# --------------------------------------------------------------------------- #
+
+def _capture_universal_request(deadline):
+    """Drive fetch_url_html with a captured post; return (timeout, payload)."""
+    saved = _save_env()
+    old_post = engine.requests.post
+    captured: dict = {}
+    try:
+        _enable_cold_decodo()
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            captured["timeout"] = timeout
+            captured["payload"] = json
+            return _FakeResponse(
+                {"results": [{"content": _COLD_FRAGRANTICA_HTML, "status_code": 200}]}
+            )
+
+        engine.requests.post = fake_post
+        engine.DecodoScraperClient.fetch_url_html(
+            "https://www.fragrantica.com/perfume/Imaginary-Authors/Cape-Heartache-30001.html",
+            deadline=deadline,
+        )
+    finally:
+        engine.requests.post = old_post
+        _restore_env(saved)
+    return captured.get("timeout"), captured.get("payload")
+
+
+def test_universal_fetch_gets_more_than_serp_cap() -> None:
+    print("Universal egress budget (background worker headroom):")
+    client = engine.DecodoScraperClient
+
+    # The whole money-on-lost-data bug: a generous (worker) deadline must let the
+    # *billed* universal render run well past the tight SERP MAX_TIMEOUT instead
+    # of being aborted at ~14.5s. With a 50s deadline the read budget should
+    # approach UNIVERSAL_MAX_TIMEOUT, not MAX_TIMEOUT.
+    timeout, payload = _capture_universal_request(engine.Deadline(50.0))
+    check("request timeout is a (connect, read) tuple", isinstance(timeout, tuple), str(timeout))
+    _connect, read = timeout
+    check(
+        "universal read budget exceeds the SERP MAX_TIMEOUT",
+        read > client.MAX_TIMEOUT + 1.0,
+        f"read={read} MAX_TIMEOUT={client.MAX_TIMEOUT}",
+    )
+    check(
+        "universal read budget is bounded by UNIVERSAL_MAX_TIMEOUT",
+        read <= client.UNIVERSAL_MAX_TIMEOUT + 1e-6,
+        f"read={read} UNIVERSAL_MAX_TIMEOUT={client.UNIVERSAL_MAX_TIMEOUT}",
+    )
+
+    # Interactive search (small deadline) is unaffected: the deadline still
+    # clamps the call well under the SERP cap.
+    timeout_small, _ = _capture_universal_request(engine.Deadline(5.0))
+    _c2, read_small = timeout_small
+    check(
+        "small (interactive) deadline still clamps the universal fetch",
+        read_small <= 5.0,
+        f"read={read_small}",
+    )
+
+    # The SERP legs keep the tight latency cap (no regression from the override).
+    serp_connect, serp_read = client._request_timeout(client._viable_budget(client.MAX_TIMEOUT, engine.Deadline(50.0)))
+    check("SERP request timeout still tracks MAX_TIMEOUT", serp_read <= client.MAX_TIMEOUT + 1e-6, f"serp_read={serp_read}")
+
+
+def test_universal_headless_cost_lever() -> None:
+    print("Universal egress headless cost lever (Premium+JS toggle):")
+    saved = _save_env()
+    try:
+        # Default: JS render (Premium+JS) preserved -> headless key present.
+        _, payload = _capture_universal_request(engine.Deadline(50.0))
+        check("default keeps headless=html (no behavioural change)", payload.get("headless") == "html", str(payload))
+
+        # Opt-out: drop JS rendering to the cheaper non-JS Premium tier.
+        os.environ["DECODO_UNIVERSAL_HEADLESS"] = "off"
+        _, payload_off = _capture_universal_request(engine.Deadline(50.0))
+        check("DECODO_UNIVERSAL_HEADLESS=off removes the JS-render key", "headless" not in payload_off, str(payload_off))
+    finally:
+        _restore_env(saved)
+
+
 if __name__ == "__main__":
     test_bing_fallback_recovers_fragrantica_url()
     test_bing_not_called_when_google_succeeds()
@@ -336,4 +419,6 @@ if __name__ == "__main__":
     test_universal_egress_recovers_challenge_page()
     test_universal_recovery_rejects_a_challenge_body()
     test_overshoot_budget_is_clamped()
+    test_universal_fetch_gets_more_than_serp_cap()
+    test_universal_headless_cost_lever()
     print("\nALL COLD-PATH TESTS PASSED")

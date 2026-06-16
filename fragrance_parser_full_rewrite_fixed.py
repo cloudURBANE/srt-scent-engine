@@ -3344,6 +3344,19 @@ class DecodoScraperClient:
     PROVIDER_NAME = "decodo"
     ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
     MAX_TIMEOUT = 15.0
+    # `MAX_TIMEOUT` is a *latency* cap for the interactive search legs (SERP URL
+    # discovery), where a slow call would blow the live-search budget. The
+    # universal-egress page fetch is a different animal: it is a billed Premium
+    # (optionally +JS) render of a full Fragrantica page, and Decodo charges for
+    # that scrape whether or not the client waits for the bytes. Aborting it at
+    # ~14.5s therefore *pays for the render and throws the page away* -> the
+    # caller records `parser_empty_frag_cards` and re-enqueues, paying again on
+    # every retry. Give the universal fetch a much larger read ceiling so the
+    # request we already paid for actually returns its HTML. The per-call
+    # `deadline` still governs, so latency-sensitive interactive search (small
+    # deadline) is unaffected; only the background enrichment worker (large
+    # deadline) spends this headroom.
+    UNIVERSAL_MAX_TIMEOUT = 45.0
     # `requests` applies `timeout` to connect and read separately, so a single
     # float lets one in-flight Decodo call run ~2x its budget and overshoot the
     # overall search deadline. Cap connect to this small value and bind the read
@@ -3475,22 +3488,34 @@ class DecodoScraperClient:
         return payload
 
     @classmethod
-    def _request_timeout(cls, budget: float) -> tuple[float, float]:
+    def _request_timeout(
+        cls, budget: float, *, max_timeout: float | None = None
+    ) -> tuple[float, float]:
         """A (connect, read) timeout tuple bounded by the call budget.
 
         A single-float requests timeout is applied to the connect phase *and*
         each read separately, so a slow connect could double the wall-clock
         cost of a call started near the deadline. Capping connect separately
-        keeps the worst case close to the read budget.
+        keeps the worst case close to the read budget. ``max_timeout`` overrides
+        the default `MAX_TIMEOUT` read ceiling for the universal-egress fetch,
+        which is allowed a larger budget than the latency-sensitive SERP legs.
         """
-        read = min(float(budget), cls.MAX_TIMEOUT)
+        cap = cls.MAX_TIMEOUT if max_timeout is None else float(max_timeout)
+        read = min(float(budget), cap)
         connect = min(cls.CONNECT_TIMEOUT, read)
         return (connect, read)
 
     @classmethod
-    def _viable_budget(cls, timeout: float, deadline: "Deadline | None") -> float:
-        """Request budget in seconds, or 0.0 when too starved to finish."""
-        budget = min(float(timeout), cls.MAX_TIMEOUT)
+    def _viable_budget(
+        cls, timeout: float, deadline: "Deadline | None", *, max_timeout: float | None = None
+    ) -> float:
+        """Request budget in seconds, or 0.0 when too starved to finish.
+
+        ``max_timeout`` overrides the default `MAX_TIMEOUT` ceiling so the billed
+        universal-egress page fetch can use a larger budget than the SERP legs.
+        """
+        cap = cls.MAX_TIMEOUT if max_timeout is None else float(max_timeout)
+        budget = min(float(timeout), cap)
         if deadline is not None:
             if deadline.expired():
                 return 0.0
@@ -3594,6 +3619,24 @@ class DecodoScraperClient:
         flag = (os.environ.get("DECODO_DISABLE_UNIVERSAL_FALLBACK") or "").strip().lower()
         return flag not in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _universal_headless() -> str | None:
+        """Render mode for the universal-egress page fetch (a cost lever).
+
+        Default ``html`` runs Decodo's browser render — the Premium **+ JS**
+        tier, ~50% dearer per request than plain Premium. Fragrantica is a
+        server-rendered site whose encrypted status payload and note pyramid are
+        embedded in the initial HTML, so the cheaper non-JS Premium tier may well
+        suffice. Operators can drop JS rendering by setting
+        ``DECODO_UNIVERSAL_HEADLESS=off`` (also: ``none``/``0``/``false``) once a
+        live smoke confirms the recovered HTML still parses notes + metrics.
+        Left at ``html`` by default so this change carries no behavioural risk.
+        """
+        mode = (os.environ.get("DECODO_UNIVERSAL_HEADLESS") or "html").strip().lower()
+        if mode in {"", "off", "none", "0", "false", "no"}:
+            return None
+        return "html"
+
     @classmethod
     def _extract_universal_html(cls, payload: Any) -> str:
         """Pull the rendered page HTML out of a ``universal`` scrape response.
@@ -3621,29 +3664,40 @@ class DecodoScraperClient:
         cls,
         url: str,
         deadline: "Deadline | None" = None,
-        timeout: float = MAX_TIMEOUT,
+        timeout: float = UNIVERSAL_MAX_TIMEOUT,
     ) -> str | None:
         """Fetch a page's rendered HTML through Decodo's unblocked egress.
 
         The deployed runtime's datacenter IP is Cloudflare-blocked from
         Fragrantica, so a direct fetch returns a challenge/empty body. The
         ``universal`` target retrieves the same URL through Decodo's premium
-        proxy pool with JS rendering, which is not datacenter-blocked, and hands
-        back the page HTML for the engine's normal parser. Returns ``None`` on
-        any failure so callers degrade exactly as they did before.
+        proxy pool (optionally JS-rendered), which is not datacenter-blocked, and
+        hands back the page HTML for the engine's normal parser. Returns ``None``
+        on any failure so callers degrade exactly as they did before.
+
+        This is a *billed* render: Decodo charges for the scrape even if the
+        client gives up before the bytes arrive. The budget is therefore capped
+        at `UNIVERSAL_MAX_TIMEOUT` (not the tighter SERP `MAX_TIMEOUT`) so we
+        actually receive the page we paid for instead of timing out at ~14.5s and
+        discarding it. The `deadline` still governs, so interactive search keeps
+        its short ceiling and only the background worker spends the headroom.
         """
         url = (url or "").strip()
         if not url or not cls.enabled() or not cls._universal_fallback_enabled():
             return None
-        budget = cls._viable_budget(timeout, deadline)
+        budget = cls._viable_budget(timeout, deadline, max_timeout=cls.UNIVERSAL_MAX_TIMEOUT)
         if budget <= 0:
             return None
+        payload: dict[str, Any] = {"target": "universal", "url": url}
+        headless = cls._universal_headless()
+        if headless:
+            payload["headless"] = headless
         try:
             res = requests.post(
                 cls.ENDPOINT,
-                json={"target": "universal", "url": url, "headless": "html"},
+                json=payload,
                 headers=cls._headers(),
-                timeout=cls._request_timeout(budget),
+                timeout=cls._request_timeout(budget, max_timeout=cls.UNIVERSAL_MAX_TIMEOUT),
             )
             res.raise_for_status()
             data = res.json() or {}
