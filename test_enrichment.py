@@ -2873,7 +2873,7 @@ def test_heal_offline_exact_match_contract() -> None:
     entry = {"derived_metrics": dm, "concentration": None}
 
     familied_junk = {"family": "Amber", "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"]}
-    fam, _cc, acc = heal.project_engine_facts(familied_junk, entry)
+    fam, _cc, acc, _yr, _gen = heal.project_engine_facts(familied_junk, entry)
     check(
         "heal_offline: already-familied row gets junk accords refreshed (not the family)",
         acc is True
@@ -2889,7 +2889,7 @@ def test_heal_offline_exact_match_contract() -> None:
     )
     # Unknown-family rows still get BOTH family and accords filled (unchanged).
     unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
-    fam_u, _c, acc_u = heal.project_engine_facts(unknown, entry)
+    fam_u, _c, acc_u, _yu, _gu = heal.project_engine_facts(unknown, entry)
     check(
         "heal_offline: unknown-family row fills family AND clean accords",
         fam_u is True
@@ -2901,9 +2901,31 @@ def test_heal_offline_exact_match_contract() -> None:
     untouched = {"family": "Amber", "accords": ["Woody"]}
     check(
         "heal_offline: no engine metrics leaves the wardrobe row untouched",
-        heal.project_engine_facts(untouched, {"derived_metrics": None, "concentration": None})
-        == (False, False, False)
+        heal.project_engine_facts(
+            untouched, {"derived_metrics": None, "concentration": None, "year": None, "gender": None}
+        )
+        == (False, False, False, False, False)
         and untouched["accords"] == ["Woody"],
+    )
+    # Year/gender are projected from the engine record (not derived_metrics) when
+    # the wardrobe row is missing them -- the bug where draining never healed years.
+    yearless = {"family": "Amber", "year": "", "gender": ""}
+    y_entry = {"derived_metrics": None, "concentration": None, "year": "2018", "gender": "Men"}
+    _f, _c2, _a2, y_filled, g_filled = heal.project_engine_facts(yearless, y_entry)
+    check(
+        "heal_offline: missing wardrobe year+gender filled from engine record",
+        y_filled is True
+        and g_filled is True
+        and yearless["year"] == "2018"
+        and yearless["gender"] == "Men",
+        detail=str(yearless),
+    )
+    # An existing wardrobe year is never downgraded by the engine value.
+    has_year = {"year": "1999", "gender": "Women"}
+    check(
+        "heal_offline: existing wardrobe year/gender left untouched",
+        heal.project_engine_facts(has_year, y_entry)[3:] == (False, False)
+        and has_year["year"] == "1999",
     )
 
 
