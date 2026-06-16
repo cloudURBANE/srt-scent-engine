@@ -439,10 +439,16 @@ class ApiClient:
         offset: int = 0,
         priority: int = 5,
         max_requested_count: int | None = None,
+        fields: list[str] | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"limit": limit, "offset": offset, "priority": priority}
         if max_requested_count is not None:
             body["max_requested_count"] = max_requested_count
+        if fields:
+            body["fields"] = list(fields)
+        if dry_run:
+            body["dry_run"] = True
         # The API audits a whole page of records in one call; give it headroom.
         return self._request(
             "POST", "/api/enrichment/heal", json=body, timeout=HTTP_WRITE_TIMEOUT
@@ -2880,6 +2886,74 @@ def _pick_stale_processing_job(client: ApiClient) -> dict[str, Any] | None:
     return stale[0] if stale else None
 
 
+def reopen_incomplete(
+    client: ApiClient,
+    *,
+    dry_run: bool = False,
+    fields: list[str] | None = None,
+    max_requested_count: int | None = None,
+    stop: StopController | None = None,
+) -> dict[str, int]:
+    """One-shot: page the whole engine DB through POST /api/enrichment/heal,
+    reopening every fact-incomplete row as a pending job so an ordinary drain
+    re-verifies it.
+
+    Safe and idempotent: the heal endpoint reuses db.recover_or_enqueue_job,
+    which leaves pending/processing jobs untouched, keeps deliberately-ignored
+    rows retired, and only reopens terminal incomplete rows -- complete rows are
+    never audited as incomplete, so they are not touched. ``max_requested_count``
+    skips rows already requeued that many times; the default (None) reopens
+    regardless, which is what a one-time post-fix re-verify wants (it reaches
+    rows the periodic churn guard had parked). ``fields`` limits the audit to
+    specific facts (e.g. ['year', 'concentration']).
+    """
+    offset = 0
+    page = 0
+    total_records: int | None = None
+    totals = {"audited": 0, "incomplete": 0, "queued": 0, "skipped": 0}
+    while True:
+        if stop and stop.stop_requested:
+            print("Stop requested; halting reopen sweep.")
+            break
+        try:
+            result = client.heal_sweep(
+                limit=HEAL_SWEEP_PAGE_LIMIT,
+                offset=offset,
+                priority=5,
+                max_requested_count=max_requested_count,
+                fields=fields,
+                dry_run=dry_run,
+            )
+        except WorkerError as exc:
+            print(f"  page {page + 1}: heal sweep failed ({exc.code}); stopping with partial progress.")
+            break
+        audited = int(result.get("audited") or 0)
+        if total_records is None:
+            total_records = int(result.get("total_records") or 0)
+        for key in totals:
+            totals[key] += int(result.get(key) or 0)
+        page += 1
+        print(
+            f"  page {page}: offset {offset} audited {audited} — "
+            f"{int(result.get('incomplete') or 0)} incomplete, "
+            f"{int(result.get('queued') or 0)} {'would reopen' if dry_run else 'reopened'}, "
+            f"{int(result.get('skipped') or 0)} skipped"
+        )
+        # Last page: the API returned fewer rows than a full page.
+        if audited < HEAL_SWEEP_PAGE_LIMIT:
+            break
+        offset += audited
+    verb = "Would reopen" if dry_run else "Reopened"
+    print(
+        f"{verb} {totals['queued']} incomplete row(s) "
+        f"({totals['incomplete']} fact-incomplete of {totals['audited']} audited; "
+        f"total records ~{total_records}); {totals['skipped']} skipped."
+    )
+    if not dry_run and totals["queued"]:
+        print("Run a drain now to re-verify them, e.g. scripts/drain_fast.ps1")
+    return totals
+
+
 def _maybe_run_heal_sweep(client: ApiClient, auto_state: dict[str, Any]) -> None:
     """Idle-queue self-healing: requeue stored fragrances with missing facts.
 
@@ -3729,6 +3803,28 @@ def parse_args() -> argparse.Namespace:
         "Or set ENRICHMENT_DASHBOARD_AUTO_APPROVE=1.",
     )
     parser.add_argument("--process-pending", action="store_true", help="Process pending enrichment jobs.")
+    parser.add_argument(
+        "--reopen-incomplete",
+        action="store_true",
+        help="One-shot: reopen every fact-incomplete stored fragrance as a pending job "
+        "(pages POST /api/enrichment/heal across the whole DB), then exit. Run a drain "
+        "afterwards to re-verify them. Idempotent. Add --dry-run to preview counts only.",
+    )
+    parser.add_argument(
+        "--reopen-fields",
+        default=None,
+        metavar="F1,F2",
+        help="With --reopen-incomplete: comma-separated fact fields to target "
+        "(e.g. 'year,concentration'). Default: any missing fact.",
+    )
+    parser.add_argument(
+        "--reopen-max-requested",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --reopen-incomplete: skip rows already requeued >= N times. "
+        "Default: no cap (reopen regardless, for a one-time post-fix re-verify).",
+    )
     parser.add_argument("--warm-list", help="Path to one-query-per-line warm list.")
     parser.add_argument(
         "--queue-diagnostics",
@@ -3814,6 +3910,17 @@ def main() -> int:
                     )
             initial_auto = opts.auto_approve or _env_bool("ENRICHMENT_DASHBOARD_AUTO_APPROVE", False)
             return run_live_dashboard(client, config, stop, initial_auto_approve=initial_auto)
+        if opts.reopen_incomplete:
+            ensure_token(config)
+            fields = [f.strip() for f in (opts.reopen_fields or "").split(",") if f.strip()] or None
+            reopen_incomplete(
+                client,
+                dry_run=opts.dry_run,
+                fields=fields,
+                max_requested_count=opts.reopen_max_requested,
+                stop=stop,
+            )
+            return 0
         if opts.process_pending or opts.once:
             ensure_token(config)
             process_pending(client, config, stop=stop)
