@@ -3666,7 +3666,21 @@ class DecodoScraperClient:
 
     @classmethod
     def _looks_like_entry(cls, value: Any) -> bool:
-        return isinstance(value, dict) and any(key in value for key in cls._ENTRY_FIELD_KEYS)
+        if not isinstance(value, dict):
+            return False
+        if not any(key in value for key in cls._ENTRY_FIELD_KEYS):
+            return False
+        # The Decodo v2 envelope wraps each result set in a dict that carries the
+        # SERP *request* URL at the top level (results[].url) alongside a nested
+        # ``content``/``results`` container. That wrapper has an entry field (a
+        # ``url``) but is not a leaf result: treating it as one short-circuits the
+        # walk in ``_collect_entries`` before it ever reaches the real ``organic``
+        # array, so every cold Decodo discovery returns zero Fragrantica URLs. A
+        # genuine leaf entry never nests one of the container keys, so a dict that
+        # does is an envelope/wrapper, not an entry.
+        if any(isinstance(value.get(key), (dict, list)) for key in cls._RESULT_CONTAINER_KEYS):
+            return False
+        return True
 
     @classmethod
     def _collect_entries(cls, node: Any, *, depth: int = 0) -> list[dict]:
