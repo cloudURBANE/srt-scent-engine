@@ -2782,8 +2782,75 @@ def test_heal_offline_exact_match_contract() -> None:
     )
 
 
+def test_non_perfume_signal() -> None:
+    """The non-perfume ingest gate is HIGH-PRECISION: it flags body-care
+    products and test junk but must never flag a genuine perfume -- a false
+    positive would skip enrichment for, or delete, real fragrance data."""
+    from enrichment_facts import non_perfume_signal
+
+    flagged = lambda *a, **k: non_perfume_signal(*a, **k)[0]
+
+    # A real perfume always carries an FG/Parfumo page -> never flagged, even
+    # from a body-care brand, even with a non-perfume-sounding name.
+    check(
+        "non_perfume: Margiela Replica 'Bubble Bath' (real FG page) NOT flagged",
+        not flagged(
+            "Bubble Bath",
+            "Maison Margiela",
+            fg_url="https://www.fragrantica.com/perfume/Maison-Margiela/Replica-Bubble-Bath-46115.html",
+        ),
+    )
+    check(
+        "non_perfume: real perfume from a body-care brand NOT flagged (FG page guard)",
+        not flagged(
+            "Pure Wonder",
+            "Bath and Body Works",
+            fg_url="https://www.fragrantica.com/perfume/Bath-and-Body-Works/Pure-Wonder-1.html",
+        ),
+    )
+    # A real luxury perfume that only has a Basenotes stub (the never-resolved
+    # bug state) must NOT be flagged -- brand not body-care, no junk token.
+    check(
+        "non_perfume: Roja with only a Basenotes URL NOT flagged",
+        not flagged(
+            "Elysium",
+            "Roja Dove",
+            bn_url="https://basenotes.com/fragrances/elysium-by-roja-dove.123",
+        ),
+    )
+
+    # Body-care brand + no real perfume page -> flagged.
+    is_np, why = non_perfume_signal(
+        "Pink Sugar Plum",
+        "Bath And Body Works",
+        bn_url="https://basenotes.com/fragrances/pink-sugar-plum-by-bath-and-body-works.1",
+    )
+    check("non_perfume: BBW 'Pink Sugar Plum' flagged", is_np)
+    check("non_perfume: reason mentions body-care brand", "body-care" in why)
+    check(
+        "non_perfume: Pull&Bear 'Frosted Pink' flagged",
+        flagged("Frosted Pink", "Pull Bear", bn_url="https://basenotes.com/x"),
+    )
+    # Unambiguous product token -> flagged regardless of brand.
+    check(
+        "non_perfume: 'Body Lotion' token flagged for any brand",
+        flagged("Vanilla Body Lotion", "Some Brand"),
+    )
+    # Test/placeholder identity -> always flagged.
+    check(
+        "non_perfume: dummy test URL flagged",
+        flagged("Empty Notes Test", "Empty Notes House", bn_url="https://basenotes.com/fragrances/empty-notes-dummy-url"),
+    )
+    # A normal designer perfume with no URL yet must NOT be flagged.
+    check(
+        "non_perfume: ordinary designer fragrance NOT flagged",
+        not flagged("Sauvage", "Dior"),
+    )
+
+
 def main() -> int:
     test_no_db_contract()
+    test_non_perfume_signal()
     test_heal_offline_exact_match_contract()
     test_fragrantica_challenge_and_static_parse()
     test_fragrantica_clearance_session_lifecycle()
