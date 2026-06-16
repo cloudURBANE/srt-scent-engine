@@ -2929,6 +2929,86 @@ def test_heal_offline_exact_match_contract() -> None:
     )
 
 
+def test_heal_offline_core_match_contract() -> None:
+    """The gender-label-stripped core match lets an abbreviated wardrobe name
+    inherit its canonical engine record ("Versace Dylan Blue" -> the record
+    cached as "Pour Homme Dylan Blue") ONLY when a *leading* gender label is the
+    difference and the match is unambiguous. A *trailing* gender label denotes a
+    real flanker (the men's "Eros" vs women's "Eros Pour Femme") and must never
+    be collapsed -- that is the data-corruption case the design forbids."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import heal_offline as heal
+
+    def entry(brand: str, name: str, year: str, gender: str = "") -> dict:
+        e = heal._new_entry()
+        e["year"], e["gender"] = year, (gender or None)
+        heal._register_core(e, brand, name)
+        return e
+
+    # LEADING gender labels are stripped (the Fragrantica glue artifact)...
+    check(
+        "heal_offline core: leading 'Pour Homme' is a stripped label + Men",
+        heal._strip_leading_gender("Pour Homme Dylan Blue") == ("dylan blue", "Men"),
+    )
+    # ...but a TRAILING gender label is a genuine flanker -> never stripped.
+    check(
+        "heal_offline core: trailing 'Pour Femme' is NOT stripped (real flanker)",
+        heal._strip_leading_gender("Eros Pour Femme") is None,
+    )
+    check(
+        "heal_offline core: a plain name has no gender label",
+        heal._strip_leading_gender("Dylan Blue") is None,
+    )
+
+    # The Dylan Blue heal: the canonical record indexes under the stripped core,
+    # which equals the abbreviated wardrobe row's own norm -> unique match.
+    dylan = entry("Versace", "Pour Homme Dylan Blue", "2016", "Men")
+    index = {heal._norm_key("Versace", "Pour Homme Dylan Blue"): dylan}
+    core_index = heal._build_core_index(index)
+    ward_norm = heal._norm_key("Versace", "Dylan Blue")
+    check(
+        "heal_offline core: 'Dylan Blue' resolves to 'Pour Homme Dylan Blue'",
+        heal._core_match(core_index, ward_norm) is dylan,
+    )
+    # And the scalar projection fills year + the implied gender (gap-fill only).
+    payload = {"year": "", "gender": ""}
+    c2, y2, g2 = heal.fill_core_scalars(payload, dylan)
+    check(
+        "heal_offline core: year+gender projected from canonical record",
+        (y2, g2) == (True, True) and payload["year"] == "2016" and payload["gender"] == "Men",
+        detail=str(payload),
+    )
+
+    # SAFETY: the men's "Eros" must NOT inherit the women's "Eros Pour Femme".
+    # The flanker's gender label is trailing -> it never enters the core index,
+    # so a women's-only catalog can never poison the men's row.
+    femme = entry("Versace", "Eros Pour Femme", "2014", "Women")
+    femme_index = {heal._norm_key("Versace", "Eros Pour Femme"): femme}
+    eros_norm = heal._norm_key("Versace", "Eros")
+    check(
+        "heal_offline core: 'Eros' does NOT inherit flanker 'Eros Pour Femme'",
+        heal._core_match(heal._build_core_index(femme_index), eros_norm) is None,
+    )
+
+    # AMBIGUITY GUARD: if both gendered editions are cached with leading labels,
+    # the shared core has two candidates -> refuse to guess either way.
+    ambig = {
+        heal._norm_key("Versace", "Pour Homme X"): entry("Versace", "Pour Homme X", "2010", "Men"),
+        heal._norm_key("Versace", "Pour Femme X"): entry("Versace", "Pour Femme X", "2012", "Women"),
+    }
+    check(
+        "heal_offline core: ambiguous men/women core refuses to match",
+        heal._core_match(heal._build_core_index(ambig), heal._norm_key("Versace", "X")) is None,
+    )
+
+    # Never downgrade an existing wardrobe value.
+    has = {"year": "1999", "gender": "Women"}
+    check(
+        "heal_offline core: existing year/gender left untouched",
+        heal.fill_core_scalars(has, dylan) == (False, False, False) and has["year"] == "1999",
+    )
+
+
 def test_non_perfume_signal() -> None:
     """The non-perfume ingest gate is HIGH-PRECISION: it flags body-care
     products and test junk but must never flag a genuine perfume -- a false
@@ -2999,6 +3079,7 @@ def main() -> int:
     test_no_db_contract()
     test_non_perfume_signal()
     test_heal_offline_exact_match_contract()
+    test_heal_offline_core_match_contract()
     test_fragrantica_challenge_and_static_parse()
     test_fragrantica_clearance_session_lifecycle()
     test_mobile_new_device_session_binding()

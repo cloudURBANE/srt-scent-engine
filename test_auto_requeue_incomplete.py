@@ -48,6 +48,35 @@ def main() -> int:
     )
     ok &= _check("parfumo unsuppliable facts filtered out", healable == ["year"])
 
+    # Page-determined facts (reviews + community vote scores) are excluded for
+    # EVERY source -- a metrics-complete page that lacks them stays lacking on a
+    # re-fetch, so they must never drive a requeue (the old drain-churn cause).
+    healable = w._heal_worthy_missing_facts(
+        {"source": "local_enrichment_worker"},
+        ["year", "reviews", "performance_score", "value_score", "community_interest_score", "wear_profile"],
+    )
+    ok &= _check("page-determined facts filtered for FG source", healable == ["year"])
+
+    # ...but the hard facts a retry CAN still improve stay heal-worthy.
+    healable = w._heal_worthy_missing_facts(
+        {"source": "local_enrichment_worker"}, ["year", "gender", "concentration", "family", "main_accords", "notes"]
+    )
+    ok &= _check(
+        "hard facts remain heal-worthy",
+        healable == ["year", "gender", "concentration", "family", "main_accords", "notes"],
+    )
+
+    # A row whose ONLY gaps are page-determined must not requeue at all.
+    c = _FakeClient()
+    w._auto_requeue_incomplete(
+        c,
+        {"id": "j0", "requested_count": 0, "priority": 5},
+        {"source": "local_enrichment_worker", "quality_status": "complete"},
+        ["reviews", "performance_score"],
+        index_label="[t]",
+    )
+    ok &= _check("page-determined-only gaps do not requeue", c.calls == [])
+
     # Metrics-complete + heal-worthy missing + under the cap -> requeue.
     c = _FakeClient()
     w._auto_requeue_incomplete(

@@ -57,6 +57,7 @@ if str(_REPO_ROOT) not in sys.path:
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
 from enrichment_facts import (  # noqa: E402
     FACT_FIELDS,
+    PAGE_DETERMINED_FACTS,
     SOURCE_UNSUPPLIABLE_FACTS,
     expand_raw_accords,
     record_fact_status,
@@ -1809,11 +1810,20 @@ def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]
 
     Mirrors the heal sweep's guard (api.heal_incomplete_enrichment): a terminal-
     partial source such as Parfumo can never grow FG-only facts, so those never
-    count as heal-worthy and must not trigger an endless requeue.
+    count as heal-worthy and must not trigger an endless requeue. On top of that,
+    PAGE_DETERMINED_FACTS (reviews + community vote scores) are excluded for every
+    source: this filter only runs once a row is already metrics-complete, so the
+    page WAS parsed -- if those facts are still missing the page lacks them and a
+    re-fetch of the same URL yields the same empty result. Re-queuing for them was
+    the cause of the endless drain churn.
     """
     source = str(payload.get("source") or "").strip().lower()
     unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(source) or frozenset()
-    return [field for field in facts_missing if field not in unsuppliable]
+    return [
+        field
+        for field in facts_missing
+        if field not in unsuppliable and field not in PAGE_DETERMINED_FACTS
+    ]
 
 
 def _auto_requeue_incomplete(
