@@ -63,6 +63,8 @@ def main() -> int:
         if not page:
             break
         for record in page:
+            if args.limit and scanned >= args.limit:
+                break  # cap rows *scanned* (must precede the clean-row continue)
             scanned += 1
             stored = _stored_top_accords(record)
             if not any(is_junk_accord_label(a) for a in stored):
@@ -88,8 +90,6 @@ def main() -> int:
                     repaired += 1
                 else:
                     unchanged += 1
-            if args.limit and scanned >= args.limit:
-                break
         if args.limit and scanned >= args.limit:
             break
         offset += PAGE

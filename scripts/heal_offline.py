@@ -23,11 +23,17 @@ canonical reconstruction and resolvers so the numbers match exactly what a
                        (reuses scripts/enrich_concentration.py --engine-gap).
   3. wardrobe       -- project the healed family + concentration from
                        fragrance_records into user_fragrances / global_fragrances
-                       by exact normalized brand+name (skips ambiguous rows).
+                       by exact normalized brand+name (skips ambiguous rows), and
+                       refresh the junk-filtered accords copy so the SPA card
+                       drops scrape-leak accords even on rows already familied.
 
 Every write is additive + merge-safe: metrics fill only NULLs, concentration
-never overwrites an existing value, and the wardrobe projection only fills facts
-that are currently Unknown. Re-running is a no-op. ``--dry-run`` writes nothing.
+never overwrites an existing value, and the wardrobe family/concentration
+projection only fills facts that are currently Unknown. The accords copy is the
+one exception -- it is re-projected from the canonical engine top accords
+whenever it differs (that is the scrape-leak repair), so it converges on the
+clean list rather than only filling blanks. Re-running is a no-op once clean.
+``--dry-run`` writes nothing.
 
 Usage (from search_engine/, Windows venv interpreter):
     .venv\\Scripts\\python.exe scripts\\heal_offline.py --dry-run
@@ -83,7 +89,7 @@ from psycopg.types.json import Json  # noqa: E402
 import db  # noqa: E402
 import api  # noqa: E402  (reuse _details_from_fragrance_record -- single source of truth)
 from derived_metrics_adapter import build_derived_metrics  # noqa: E402
-from enrichment_facts import derive_families, is_fact_complete  # noqa: E402
+from enrichment_facts import derive_families, is_fact_complete, top_accords_from  # noqa: E402
 import enrich_concentration as conc  # noqa: E402
 from enrich_database_metrics import _apply_derived_facts  # noqa: E402
 
@@ -99,6 +105,25 @@ def _norm_key(brand: str, name: str) -> str:
     project the wrong family/concentration into a user's saved data."""
     raw = f"{brand or ''} {name or ''}"
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
+
+
+def _str_accords(value: Any) -> list[str]:
+    """Normalize a stored accords copy to a flat list of trimmed strings.
+
+    The wardrobe accords copy can arrive as a list of plain strings (engine
+    projection) or, on older rows, a list of ``{"accord": ...}`` dicts. Coercing
+    both to the same shape lets us compare against the clean engine top accords
+    and skip a no-op write when nothing actually changed."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("accord") or item.get("name") or ""
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
 
 
 def _record_has_raw(record: dict[str, Any]) -> bool:
@@ -251,6 +276,42 @@ def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, An
     return index
 
 
+def project_engine_facts(
+    payload: dict[str, Any], entry: dict[str, Any]
+) -> tuple[bool, bool, bool]:
+    """Project one engine-cache entry's facts onto a wardrobe payload, in place.
+
+    Returns ``(family_filled, concentration_filled, accords_refreshed)``. Pure
+    apart from mutating ``payload`` -- no DB, so it is unit-testable. ``entry`` is
+    ``{"derived_metrics": <blob|None>, "concentration": <str|None>}``.
+    """
+    fam_filled = conc_filled = acc_refreshed = False
+    dm = entry.get("derived_metrics")
+    if dm is not None:
+        # Always re-project the junk-filtered top accords. The scrape leak
+        # (vote counts / Hate-Like / seasons) poisons the wardrobe accords copy
+        # too, and a row whose family is *already* set never enters the family
+        # branch below -- so without this, the SPA card keeps showing the stale
+        # junk accords even after the engine DB is repaired.
+        clean = top_accords_from(dm)
+        if clean and clean != _str_accords(payload.get("accords")):
+            payload["accords"] = clean
+            acc_refreshed = True
+        # Family + wear projection only when family is still Unknown
+        # (unchanged behavior -- never downgrades an existing family).
+        if not is_fact_complete(payload.get("family"), "family"):
+            before = payload.get("family")
+            _apply_derived_facts(payload, dm)
+            fam_filled = payload.get("family") != before and is_fact_complete(
+                payload.get("family"), "family"
+            )
+    if not is_fact_complete(payload.get("concentration"), "concentration") and entry.get("concentration"):
+        payload["concentration"] = entry["concentration"]
+        payload.setdefault("concentration_meta", {"source": "engine_cache_projection"})
+        conc_filled = True
+    return fam_filled, conc_filled, acc_refreshed
+
+
 def heal_wardrobe(
     index: dict[str, dict[str, Any]],
     *,
@@ -258,27 +319,19 @@ def heal_wardrobe(
     dry_run: bool,
 ) -> dict[str, int]:
     dsn = os.environ["DATABASE_URL"]
-    stats = {"uf_family": 0, "uf_conc": 0, "gf_family": 0, "gf_conc": 0, "no_match": 0}
+    stats = {
+        "uf_family": 0, "uf_conc": 0, "uf_acc": 0,
+        "gf_family": 0, "gf_conc": 0, "gf_acc": 0,
+        "no_match": 0,
+    }
 
-    def _project(payload: dict[str, Any], norm: str) -> tuple[bool, bool]:
-        """Returns (family_filled, concentration_filled)."""
+    def _project(payload: dict[str, Any], norm: str) -> tuple[bool, bool, bool]:
+        """Returns (family_filled, concentration_filled, accords_refreshed)."""
         entry = index.get(norm)
         if not entry:
             stats["no_match"] += 1
-            return False, False
-        fam_filled = conc_filled = False
-        family_unknown = not is_fact_complete(payload.get("family"), "family")
-        if family_unknown and entry["derived_metrics"] is not None:
-            before = payload.get("family")
-            _apply_derived_facts(payload, entry["derived_metrics"])
-            fam_filled = payload.get("family") != before and is_fact_complete(
-                payload.get("family"), "family"
-            )
-        if not is_fact_complete(payload.get("concentration"), "concentration") and entry["concentration"]:
-            payload["concentration"] = entry["concentration"]
-            payload.setdefault("concentration_meta", {"source": "engine_cache_projection"})
-            conc_filled = True
-        return fam_filled, conc_filled
+            return False, False, False
+        return project_engine_facts(payload, entry)
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         # user_fragrances
@@ -292,12 +345,14 @@ def heal_wardrobe(
             norm = _norm_key(str(fdata.get("brand") or ""), str(fdata.get("name") or ""))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc = _project(fdata, norm)
+            fam, cc, acc = _project(fdata, norm)
             if fam:
                 stats["uf_family"] += 1
             if cc:
                 stats["uf_conc"] += 1
-            if (fam or cc) and not dry_run:
+            if acc:
+                stats["uf_acc"] += 1
+            if (fam or cc or acc) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -317,12 +372,14 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc = _project(pdata, norm)
+            fam, cc, acc = _project(pdata, norm)
             if fam:
                 stats["gf_family"] += 1
             if cc:
                 stats["gf_conc"] += 1
-            if (fam or cc) and not dry_run:
+            if acc:
+                stats["gf_acc"] += 1
+            if (fam or cc or acc) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -331,8 +388,10 @@ def heal_wardrobe(
         if not dry_run:
             conn.commit()
     print(
-        f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']}] "
-        f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']}] "
+        f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
+        f"accords~{stats['uf_acc']}] "
+        f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
+        f"accords~{stats['gf_acc']}] "
         f"no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
     return stats
