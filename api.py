@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field
 import db
 from enrichment_facts import (
     FACT_FIELDS,
+    PAGE_DETERMINED_FACTS,
     SOURCE_UNSUPPLIABLE_FACTS,
     derive_families,
     derive_wear_profile,
@@ -5152,11 +5153,21 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
             continue
         incomplete += 1
         # Terminal-partial sources (e.g. Parfumo) can never deliver certain
-        # facts; when everything missing is unsuppliable, requeueing only burns
-        # resolver budget until the churn guard trips. Healable gaps (e.g. a
-        # missing concentration) still requeue normally.
-        unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(str(item.get("source") or ""))
-        if unsuppliable and all(field in unsuppliable for field in missing):
+        # facts, so those are always non-healable. PAGE_DETERMINED_FACTS (reviews
+        # + the community vote scores) are decided by what the page exposed -- but
+        # only once the row is metrics-complete (the four derived-metric groups
+        # parsed). If a score group is itself still missing the page parse hasn't
+        # finished, so a re-fetch CAN still add it and we must requeue. This
+        # mirrors the worker's `quality_status == "complete"` gate
+        # (scripts.enrichment_worker._auto_requeue_incomplete) so the inline and
+        # sweep requeue decisions stay identical and the queue can drain to zero.
+        non_healable = (
+            SOURCE_UNSUPPLIABLE_FACTS.get(str(item.get("source") or "")) or frozenset()
+        )
+        metric_groups = PAGE_DETERMINED_FACTS - {"reviews"}
+        if metric_groups.isdisjoint(missing):  # metrics-complete: page was parsed
+            non_healable = non_healable | PAGE_DETERMINED_FACTS
+        if all(field in non_healable for field in missing):
             _skip(item, "source_cannot_supply")
             continue
         if not item["job_key"]:

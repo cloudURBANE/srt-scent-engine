@@ -264,6 +264,25 @@ SOURCE_UNSUPPLIABLE_FACTS: dict[str, frozenset[str]] = {
     ),
 }
 
+# Facts whose presence is decided entirely by what a *successfully parsed* source
+# page exposes. Once a row is metrics-complete (the page fetched + the four
+# derived-metric groups parsed), these either came through or the page simply
+# has no community vote / review data -- which a re-fetch of the same URL cannot
+# change. Treating them as heal-worthy is what made the queue churn forever:
+# every drain re-scraped the same review-less page up to the requeue cap. They
+# are deliberately NARROW -- year, gender, concentration, family, main_accords,
+# and notes are NOT here, because a partial first parse can genuinely improve
+# those on retry. See memory: quality-status-vs-fact-completeness-gate.
+PAGE_DETERMINED_FACTS: frozenset[str] = frozenset(
+    {
+        "reviews",
+        "wear_profile",
+        "performance_score",
+        "value_score",
+        "community_interest_score",
+    }
+)
+
 
 def record_source(record: dict[str, Any]) -> str:
     """The stored row's enrichment source ("" when unrecorded / FG-native)."""

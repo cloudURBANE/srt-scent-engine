@@ -82,6 +82,14 @@ def _load_database_url() -> None:
 
 _load_database_url()
 
+
+def _wardrobe_dsn() -> str:
+    """DSN of the DB that holds the wardrobe tables (user_fragrances /
+    global_fragrances) -- always DATABASE_URL. Engine facts may be read from a
+    separate ENGINE_DATABASE_URL, but every wardrobe write targets this one."""
+    return os.environ["DATABASE_URL"]
+
+
 import psycopg  # noqa: E402
 from psycopg.rows import dict_row  # noqa: E402
 from psycopg.types.json import Json  # noqa: E402
@@ -105,6 +113,55 @@ def _norm_key(brand: str, name: str) -> str:
     project the wrong family/concentration into a user's saved data."""
     raw = f"{brand or ''} {name or ''}"
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
+
+
+# Gender-label phrases that some Fragrantica pages GLUE onto a name as a LEADING
+# token: the men's "Versace Dylan Blue" is cached as "Pour Homme Dylan Blue".
+# Only a *leading* occurrence is a label artifact -- a TRAILING one ("Eros Pour
+# Femme") denotes a genuine gender flanker, a distinct product, and must never be
+# stripped or the men's and women's editions would collide. Ordered longest-first
+# so "pour homme" matches before a bare "homme". The implied gender is captured
+# so the wardrobe row can inherit it too.
+_LEADING_GENDER_LABELS: tuple[tuple[str, str], ...] = (
+    ("pour homme", "Men"),
+    ("pour femme", "Women"),
+    ("for men", "Men"),
+    ("for women", "Women"),
+    ("for him", "Men"),
+    ("for her", "Women"),
+    ("homme", "Men"),
+    ("femme", "Women"),
+)
+
+
+def _strip_leading_gender(name: str) -> tuple[str, str] | None:
+    """If ``name`` starts with a glued gender label, return ``(rest, gender)``;
+    else ``None``. Leading-only on purpose (see _LEADING_GENDER_LABELS): this is
+    what lets the abbreviated wardrobe "Dylan Blue" inherit the canonical engine
+    record cached as "Pour Homme Dylan Blue" *without* ever collapsing a real
+    trailing-gender flanker into its base."""
+    low = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    for label, gender in _LEADING_GENDER_LABELS:
+        if low.startswith(label + " "):
+            rest = low[len(label):].strip()
+            if rest:
+                return rest, gender
+    return None
+
+
+def _core_match(
+    core_index: dict[str, list[dict[str, Any]]], lookup_key: str
+) -> dict[str, Any] | None:
+    """Resolve a wardrobe identity to its canonical engine entry via the
+    gender-label-stripped core index, but ONLY when the match is unambiguous.
+
+    ``core_index`` maps a stripped-core norm key -> the engine entries whose name
+    carried a leading gender label. If two distinct fragrances share a core (e.g.
+    a record cached as "Pour Homme X" *and* one as "Pour Femme X"), we refuse to
+    guess and return None -- so a heal never projects the wrong gender/year."""
+    cands = core_index.get(lookup_key) or []
+    unique = {id(e): e for e in cands}
+    return next(iter(unique.values())) if len(unique) == 1 else None
 
 
 def _str_accords(value: Any) -> list[str]:
@@ -279,31 +336,170 @@ def heal_concentration(
 # --------------------------------------------------------------------------
 # Step 3 -- wardrobe projection (family + concentration into user data)
 # --------------------------------------------------------------------------
-def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Exact-match index: normalized brand+name ->
-    {derived_metrics, concentration, year, gender}.
+def _new_entry() -> dict[str, Any]:
+    return {
+        "derived_metrics": None,
+        "concentration": None,
+        "year": None,
+        "gender": None,
+        "core": None,           # gender-label-stripped norm key (or None)
+        "implied_gender": None,  # gender read off a stripped leading label
+    }
 
-    A re-read of fragrance_records is intentional: the metrics/concentration steps
-    may have just filled values that ``records`` (read before the write) does not
-    carry, so we hydrate from the freshest engine state."""
-    index: dict[str, dict[str, Any]] = {}
-    for record in _all_records():
-        key = _norm_key(str(record.get("house") or ""), str(record.get("name") or ""))
+
+def _register_core(entry: dict[str, Any], brand: str, name: str) -> None:
+    """Record the gender-label-stripped core for an entry whose name carries a
+    leading gender label, so an abbreviated wardrobe row can resolve to it. Also
+    captures the implied gender when the entry has none. Idempotent: the norm key
+    is unique per (brand, name), so every fold of a key sees the same name."""
+    if entry.get("core"):
+        return
+    stripped = _strip_leading_gender(name)
+    if not stripped:
+        return
+    rest, gender = stripped
+    entry["core"] = _norm_key(brand, rest)
+    if entry.get("implied_gender") is None and is_fact_complete(gender, "gender"):
+        entry["implied_gender"] = gender
+
+
+def _fold_record(index: dict[str, dict[str, Any]], record: dict[str, Any]) -> None:
+    """Gap-fill an index entry from a fragrance_records-shaped row (engine cache).
+
+    Only fills slots still None, so the *first* source for a given identity wins
+    -- callers fold the highest-trust source (the local engine cache) first."""
+    brand, name = str(record.get("house") or ""), str(record.get("name") or "")
+    key = _norm_key(brand, name)
+    if not key:
+        return
+    entry = index.setdefault(key, _new_entry())
+    if entry["derived_metrics"] is None and record.get("derived_metrics") is not None:
+        entry["derived_metrics"] = record["derived_metrics"]
+    if entry["concentration"] is None:
+        entry["concentration"] = _record_concentration(record)
+    if entry["year"] is None:
+        entry["year"] = _record_year(record)
+    if entry["gender"] is None:
+        entry["gender"] = _record_gender(record)
+    _register_core(entry, brand, name)
+
+
+def _fold_global_fragrances(index: dict[str, dict[str, Any]]) -> int:
+    """Fold the wardrobe's own ``global_fragrances`` catalog into the index as a
+    *supplementary* fact source. This is what makes the heal self-sufficient on
+    one DB: the canonical 2016 for "Versace Pour Homme Dylan Blue" lives in
+    global_fragrances even when fragrance_records (the engine cache copy) lacks
+    it, so the abbreviated user_fragrances "Dylan Blue" row can still inherit it
+    via the lenient match. Reads from the wardrobe DSN (where the catalog lives).
+    Gap-fill only -- never overrides a fragrance_records value already folded."""
+    folded = 0
+    try:
+        with psycopg.connect(_wardrobe_dsn(), row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(brand, profile_data->>'brand') b,"
+                    " COALESCE(name, profile_data->>'name') n, profile_data p"
+                    " FROM global_fragrances"
+                )
+                rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [index] global_fragrances fold skipped: {exc}")
+        return 0
+    for row in rows:
+        brand, name = str(row.get("b") or ""), str(row.get("n") or "")
+        key = _norm_key(brand, name)
         if not key:
             continue
-        entry = index.setdefault(
-            key,
-            {"derived_metrics": None, "concentration": None, "year": None, "gender": None},
+        pdata = row.get("p") if isinstance(row.get("p"), dict) else {}
+        entry = index.setdefault(key, _new_entry())
+        if entry["year"] is None and is_fact_complete(str(pdata.get("year") or ""), "year"):
+            entry["year"] = str(pdata.get("year")).strip()
+            folded += 1
+        if entry["gender"] is None and is_fact_complete(str(pdata.get("gender") or ""), "gender"):
+            entry["gender"] = str(pdata.get("gender")).strip()
+            folded += 1
+        if entry["concentration"] is None and is_fact_complete(
+            str(pdata.get("concentration") or ""), "concentration"
+        ):
+            entry["concentration"] = str(pdata.get("concentration")).strip()
+            folded += 1
+        _register_core(entry, brand, name)
+    return folded
+
+
+def _fold_engine_database(index: dict[str, dict[str, Any]]) -> int:
+    """Fold a dedicated engine DB (ENGINE_DATABASE_URL, e.g. the viaduct cache)
+    into the index when configured and distinct from the wardrobe DSN. This is
+    the deterministic dual-DSN path: facts that live ONLY in the live engine
+    (never copied into the wardrobe DB's fragrance_records) become projectable
+    while writes still target the wardrobe DSN. Gap-fill only; no-op when unset."""
+    engine_dsn = (os.environ.get("ENGINE_DATABASE_URL") or "").strip()
+    if not engine_dsn or engine_dsn == _wardrobe_dsn():
+        return 0
+    try:
+        with psycopg.connect(engine_dsn, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT house, name, year, gender, derived_metrics_json,"
+                    " fg_raw_json FROM fragrance_records"
+                )
+                rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [index] ENGINE_DATABASE_URL fold skipped: {exc}")
+        return 0
+    before = sum(1 for e in index.values() if e["year"] or e["gender"] or e["concentration"])
+    for row in rows:
+        _fold_record(
+            index,
+            {
+                "house": row.get("house"),
+                "name": row.get("name"),
+                "year": row.get("year"),
+                "gender": row.get("gender"),
+                "derived_metrics": row.get("derived_metrics_json"),
+                "fg_raw": row.get("fg_raw_json") or {},
+            },
         )
-        if entry["derived_metrics"] is None and record.get("derived_metrics") is not None:
-            entry["derived_metrics"] = record["derived_metrics"]
-        if entry["concentration"] is None:
-            entry["concentration"] = _record_concentration(record)
-        if entry["year"] is None:
-            entry["year"] = _record_year(record)
-        if entry["gender"] is None:
-            entry["gender"] = _record_gender(record)
+    after = sum(1 for e in index.values() if e["year"] or e["gender"] or e["concentration"])
+    return after - before
+
+
+def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build the projection index: normalized brand+name ->
+    {derived_metrics, concentration, year, gender, core, implied_gender}.
+
+    Sourced (in trust order, gap-fill) from:
+      1. fragrance_records via the db module (the freshest local engine cache -- a
+         re-read is intentional since the metrics/concentration steps may have
+         just filled values ``records`` predates),
+      2. ENGINE_DATABASE_URL fragrance_records when configured (the live engine
+         cache, e.g. viaduct, for facts never copied locally), and
+      3. the wardrobe's own global_fragrances catalog (so the canonical full-name
+         record can heal an abbreviated user_fragrances row on a single DB).
+    ``core`` powers the gender-label-stripped match (see _strip_leading_gender)."""
+    index: dict[str, dict[str, Any]] = {}
+    for record in _all_records():
+        _fold_record(index, record)
+    eng = _fold_engine_database(index)
+    gf = _fold_global_fragrances(index)
+    if eng or gf:
+        print(f"  [index] supplementary facts folded: engine_db+{eng} global_fragrances+{gf}")
     return index
+
+
+def _build_core_index(
+    index: dict[str, dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Group index entries that carry a stripped gender-label core, keyed by that
+    core. An abbreviated wardrobe identity ("versacedylanblue") looks itself up
+    here to find the canonical record cached as "Pour Homme Dylan Blue"; multiple
+    entries under one core signal a real men/women ambiguity (see _core_match)."""
+    core_index: dict[str, list[dict[str, Any]]] = {}
+    for entry in index.values():
+        core = entry.get("core")
+        if core:
+            core_index.setdefault(core, []).append(entry)
+    return core_index
 
 
 def project_engine_facts(
@@ -354,28 +550,75 @@ def project_engine_facts(
     return fam_filled, conc_filled, acc_refreshed, year_filled, gender_filled
 
 
+def fill_core_scalars(
+    payload: dict[str, Any], entry: dict[str, Any]
+) -> tuple[bool, bool, bool]:
+    """Fill ONLY the scalar identity facts (concentration, year, gender) from a
+    gender-label-stripped core match -- the conservative subset that is safe to
+    inherit across the "Dylan Blue" <-> "Pour Homme Dylan Blue" name gap. Returns
+    ``(conc_filled, year_filled, gender_filled)``. Gap-fill only; never downgrades
+    an existing value. Derived metrics / accords are deliberately NOT projected
+    here (those come only from an exact identity match)."""
+    conc_filled = year_filled = gender_filled = False
+    if not is_fact_complete(payload.get("concentration"), "concentration") and is_fact_complete(
+        entry.get("concentration"), "concentration"
+    ):
+        payload["concentration"] = entry["concentration"]
+        payload.setdefault("concentration_meta", {"source": "engine_cache_projection"})
+        conc_filled = True
+    if not is_fact_complete(payload.get("year"), "year") and is_fact_complete(entry.get("year"), "year"):
+        payload["year"] = entry["year"]
+        year_filled = True
+    gender_val = entry.get("gender") if is_fact_complete(entry.get("gender"), "gender") else entry.get("implied_gender")
+    if not is_fact_complete(payload.get("gender"), "gender") and is_fact_complete(gender_val, "gender"):
+        payload["gender"] = gender_val
+        gender_filled = True
+    return conc_filled, year_filled, gender_filled
+
+
 def heal_wardrobe(
     index: dict[str, dict[str, Any]],
     *,
     only_keys: set[str] | None,
     dry_run: bool,
 ) -> dict[str, int]:
-    dsn = os.environ["DATABASE_URL"]
+    dsn = _wardrobe_dsn()
+    core_index = _build_core_index(index)
     stats = {
         "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_year": 0, "uf_gender": 0,
         "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_year": 0, "gf_gender": 0,
-        "no_match": 0,
+        "no_match": 0, "core_match": 0,
     }
 
     def _project(
-        payload: dict[str, Any], norm: str
+        payload: dict[str, Any], norm: str, brand: str, name: str
     ) -> tuple[bool, bool, bool, bool, bool]:
         """Returns (family, concentration, accords, year, gender) filled flags."""
         entry = index.get(norm)
-        if not entry:
+        fam = cc = acc = yr = gen = False
+        if entry is not None:
+            fam, cc, acc, yr, gen = project_engine_facts(payload, entry)
+        # If scalar facts are still missing, resolve the abbreviated wardrobe name
+        # to its canonical record via the gender-label-stripped core (the "Dylan
+        # Blue" -> "Pour Homme Dylan Blue" heal). The wardrobe's own norm is the
+        # lookup key, since the canonical record indexes under that stripped core.
+        # Unambiguous matches only (see _core_match); skip the entry we just used.
+        if not (
+            is_fact_complete(payload.get("year"), "year")
+            and is_fact_complete(payload.get("gender"), "gender")
+            and is_fact_complete(payload.get("concentration"), "concentration")
+        ):
+            stripped = _strip_leading_gender(name)
+            lookup = _norm_key(brand, stripped[0]) if stripped else norm
+            core_entry = _core_match(core_index, lookup)
+            if core_entry is not None and core_entry is not entry:
+                c2, y2, g2 = fill_core_scalars(payload, core_entry)
+                if c2 or y2 or g2:
+                    stats["core_match"] += 1
+                cc, yr, gen = cc or c2, yr or y2, gen or g2
+        if entry is None and not (cc or yr or gen):
             stats["no_match"] += 1
-            return False, False, False, False, False
-        return project_engine_facts(payload, entry)
+        return fam, cc, acc, yr, gen
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         # user_fragrances
@@ -386,10 +629,12 @@ def heal_wardrobe(
             fdata = row["fragrance_data"] or {}
             if not isinstance(fdata, dict):
                 continue
-            norm = _norm_key(str(fdata.get("brand") or ""), str(fdata.get("name") or ""))
+            brand_uf = str(fdata.get("brand") or "")
+            name_uf = str(fdata.get("name") or "")
+            norm = _norm_key(brand_uf, name_uf)
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen = _project(fdata, norm)
+            fam, cc, acc, yr, gen = _project(fdata, norm, brand_uf, name_uf)
             if fam:
                 stats["uf_family"] += 1
             if cc:
@@ -420,7 +665,7 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen = _project(pdata, norm)
+            fam, cc, acc, yr, gen = _project(pdata, norm, str(brand), str(name))
             if fam:
                 stats["gf_family"] += 1
             if cc:
@@ -444,7 +689,7 @@ def heal_wardrobe(
         f"accords~{stats['uf_acc']} year+{stats['uf_year']} gender+{stats['uf_gender']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
         f"accords~{stats['gf_acc']} year+{stats['gf_year']} gender+{stats['gf_gender']}] "
-        f"no_engine_match={stats['no_match']} dry_run={dry_run}"
+        f"core_match={stats['core_match']} no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
     return stats
 
