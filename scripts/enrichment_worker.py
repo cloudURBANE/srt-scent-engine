@@ -55,7 +55,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
-from enrichment_facts import FACT_FIELDS, expand_raw_accords, record_fact_status  # noqa: E402
+from enrichment_facts import (  # noqa: E402
+    FACT_FIELDS,
+    SOURCE_UNSUPPLIABLE_FACTS,
+    expand_raw_accords,
+    record_fact_status,
+)
 
 DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
@@ -91,6 +96,14 @@ HEAL_SWEEP_PAGE_LIMIT = 200
 # Churn guard: stop re-opening a job after this many total requests -- a row
 # whose upstream sources genuinely lack a fact should not loop forever.
 HEAL_SWEEP_MAX_REQUESTED = int(os.environ.get("ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED", "8"))
+# Inline self-heal: when a worker run completes a row that is metrics-complete
+# but still missing heal-worthy facts (year, concentration, gender, ...),
+# re-enqueue it immediately so a later run fills the gap -- no manual heal sweep
+# or 30-minute idle wait needed. Bounded by HEAL_SWEEP_MAX_REQUESTED. Set the
+# env to 0/false to disable and rely on the periodic sweep only.
+AUTO_REQUEUE_INCOMPLETE = os.environ.get(
+    "ENRICHMENT_AUTO_REQUEUE_INCOMPLETE", "1"
+).strip().lower() not in ("0", "false", "off", "no")
 # Resolver misses get this many retryable failures before going terminal.
 # Queue analysis showed every resolver miss was marked non-retryable on its
 # first attempt, so transient SERP/budget hiccups became permanent failures.
@@ -1785,6 +1798,70 @@ def _build_parfumo_payload(
     return payload
 
 
+def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]) -> list[str]:
+    """Missing facts a re-fetch could still resolve for this payload's source.
+
+    Mirrors the heal sweep's guard (api.heal_incomplete_enrichment): a terminal-
+    partial source such as Parfumo can never grow FG-only facts, so those never
+    count as heal-worthy and must not trigger an endless requeue.
+    """
+    source = str(payload.get("source") or "").strip().lower()
+    unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(source) or frozenset()
+    return [field for field in facts_missing if field not in unsuppliable]
+
+
+def _auto_requeue_incomplete(
+    client: ApiClient,
+    job: dict[str, Any],
+    payload: dict[str, Any],
+    facts_missing: list[str],
+    *,
+    index_label: str,
+) -> None:
+    """Re-open a just-completed row that is metrics-complete yet fact-incomplete.
+
+    The worker marks a row ``quality_status="complete"`` as soon as the four
+    derived-metric groups parse -- even if year / concentration / gender are
+    still missing. Such a row used to go terminal, and only the periodic heal
+    sweep would ever retry it. Here we requeue it inline so the gap closes on an
+    ordinary worker run, with no manual ``POST /api/enrichment/heal`` and no
+    30-minute idle wait.
+
+    Loop-safe: every requeue bumps ``requested_count`` server-side and we stop at
+    HEAL_SWEEP_MAX_REQUESTED, so a fact the sources genuinely lack is retried a
+    bounded number of times and then left complete. The requeued job returns to
+    ``pending`` and is claimed on a *later* run -- process_pending claims a fixed
+    batch up front -- so it is never re-scraped back-to-back within this batch.
+    """
+    if not AUTO_REQUEUE_INCOMPLETE or HEAL_SWEEP_MAX_REQUESTED <= 0:
+        return
+    # Target only the metrics-complete-but-fact-incomplete case. Partial-metrics
+    # rows are already retried by the normal /details path; Parfumo stays terminal.
+    if payload.get("quality_status") != "complete":
+        return
+    healable = _heal_worthy_missing_facts(payload, facts_missing)
+    if not healable:
+        return
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return
+    requested = int(job.get("requested_count") or 0)
+    if requested >= HEAL_SWEEP_MAX_REQUESTED:
+        print(
+            f"{index_label} Auto-heal: still missing {', '.join(healable)} but "
+            f"requeue cap reached ({requested}/{HEAL_SWEEP_MAX_REQUESTED}); leaving complete"
+        )
+        return
+    try:
+        client.requeue_job(job_id, priority=max(5, int(job.get("priority") or 0)))
+        print(
+            f"{index_label} Auto-heal: requeued to fill {', '.join(healable)} "
+            f"(attempt {requested + 1}/{HEAL_SWEEP_MAX_REQUESTED})"
+        )
+    except WorkerError as exc:
+        print(f"{index_label} Auto-heal requeue failed: {exc.code}")
+
+
 def process_job(
     client: ApiClient,
     scraper,
@@ -1863,6 +1940,7 @@ def process_job(
                 ) from exc
             raise
         print(f"{index_label} Completed and uploaded cache")
+        _auto_requeue_incomplete(client, job, payload, facts_missing, index_label=index_label)
         return True
 
     except KeyboardInterrupt:
