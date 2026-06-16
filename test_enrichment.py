@@ -2865,6 +2865,47 @@ def test_heal_offline_exact_match_contract() -> None:
         heal._record_has_raw({"fg_raw": {}, "bn_raw": {}}) is False,
     )
 
+    # Wardrobe accords projection: the scrape-leak repair must reach rows whose
+    # family is ALREADY set -- those never enter the family branch, so without an
+    # unconditional accords refresh the SPA card keeps the stale junk accords
+    # even after the engine DB is repaired (the "Dylan Blue shows two" bug).
+    dm = {"main_accords": {"top_accords": ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"]}}
+    entry = {"derived_metrics": dm, "concentration": None}
+
+    familied_junk = {"family": "Amber", "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"]}
+    fam, _cc, acc = heal.project_engine_facts(familied_junk, entry)
+    check(
+        "heal_offline: already-familied row gets junk accords refreshed (not the family)",
+        acc is True
+        and fam is False
+        and familied_junk["family"] == "Amber"
+        and familied_junk["accords"] == ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"],
+        detail=str(familied_junk),
+    )
+    # Re-running over the now-clean row writes nothing (idempotent / no churn).
+    check(
+        "heal_offline: accords projection is idempotent once clean",
+        heal.project_engine_facts(dict(familied_junk), entry)[2] is False,
+    )
+    # Unknown-family rows still get BOTH family and accords filled (unchanged).
+    unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
+    fam_u, _c, acc_u = heal.project_engine_facts(unknown, entry)
+    check(
+        "heal_offline: unknown-family row fills family AND clean accords",
+        fam_u is True
+        and unknown["family"] == "Amber"
+        and unknown["accords"] == ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"],
+        detail=str(unknown),
+    )
+    # No engine derived_metrics -> nothing is touched.
+    untouched = {"family": "Amber", "accords": ["Woody"]}
+    check(
+        "heal_offline: no engine metrics leaves the wardrobe row untouched",
+        heal.project_engine_facts(untouched, {"derived_metrics": None, "concentration": None})
+        == (False, False, False)
+        and untouched["accords"] == ["Woody"],
+    )
+
 
 def test_non_perfume_signal() -> None:
     """The non-perfume ingest gate is HIGH-PRECISION: it flags body-care
