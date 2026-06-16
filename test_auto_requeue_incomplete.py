@@ -57,14 +57,27 @@ def main() -> int:
     )
     ok &= _check("page-determined facts filtered for FG source", healable == ["year"])
 
-    # ...but the hard facts a retry CAN still improve stay heal-worthy.
+    # ...but before a row is metrics-complete, the hard facts a retry CAN still
+    # improve stay heal-worthy (no quality_status => the completion guard below
+    # does not fire).
     healable = w._heal_worthy_missing_facts(
         {"source": "local_enrichment_worker"}, ["year", "gender", "concentration", "family", "main_accords", "notes"]
     )
     ok &= _check(
-        "hard facts remain heal-worthy",
+        "hard facts remain heal-worthy pre-completion",
         healable == ["year", "gender", "concentration", "family", "main_accords", "notes"],
     )
+
+    # Completion guard: once an FG worker page is metrics-complete it has yielded
+    # everything its identical URL can. year/concentration/gender are then
+    # page-determined too -- a re-fetch reruns the same deterministic extraction
+    # and off-page concentration resolver, so NOTHING is heal-worthy. This is the
+    # fix for the year/concentration drain churn (8 attempts then stall).
+    healable = w._heal_worthy_missing_facts(
+        {"source": "local_enrichment_worker", "quality_status": "complete"},
+        ["year", "gender", "concentration", "family", "main_accords", "notes"],
+    )
+    ok &= _check("complete FG page has no heal-worthy facts", healable == [])
 
     # A row whose ONLY gaps are page-determined must not requeue at all.
     c = _FakeClient()
@@ -77,7 +90,8 @@ def main() -> int:
     )
     ok &= _check("page-determined-only gaps do not requeue", c.calls == [])
 
-    # Metrics-complete + heal-worthy missing + under the cap -> requeue.
+    # A metrics-complete FG page whose only gaps are its own (now page-determined)
+    # facts must NOT requeue -- this is the churn that made every drain stall.
     c = _FakeClient()
     w._auto_requeue_incomplete(
         c,
@@ -86,7 +100,20 @@ def main() -> int:
         ["year", "concentration"],
         index_label="[t]",
     )
-    ok &= _check("complete+incomplete under cap requeues once", c.calls == [("j1", 5)])
+    ok &= _check("complete FG year/concentration gaps do not requeue", c.calls == [])
+
+    # The requeue mechanism itself is intact: a completing source NOT covered by
+    # the FG completion guard, with a heal-worthy gap under the cap, still requeues
+    # once at the bumped priority.
+    c = _FakeClient()
+    w._auto_requeue_incomplete(
+        c,
+        {"id": "j1b", "requested_count": 2, "priority": 5},
+        {"source": "other_source", "quality_status": "complete"},
+        ["year", "concentration"],
+        index_label="[t]",
+    )
+    ok &= _check("non-FG completing source still requeues once", c.calls == [("j1b", 5)])
 
     # Partial-metrics rows are handled by the normal retry path -> no requeue.
     c = _FakeClient()

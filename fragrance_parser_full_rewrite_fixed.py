@@ -162,6 +162,13 @@ class UnifiedDetails:
     notes: NotesList
     gender: str = "Unisex / Unspecified"
     description: str = ""
+    # Launch year mined from durable structured page sources (the description
+    # "launched in <year>" sentence or JSON-LD datePublished) at parse time, so
+    # heal_missing_gender_and_year is not forced to re-mine the fragile prose.
+    launch_year: str = ""
+    # Raw page/og title text. FG appends the launch year to it, so it is the
+    # brand-year-filtered fallback when the structured sources are absent.
+    page_title: str = ""
     bn_consensus: dict[str, tuple[int, int]] = field(default_factory=dict)
     frag_cards: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     pros_cons: list[str] = field(default_factory=list)
@@ -4526,7 +4533,9 @@ def _mint_clearance_with_raw_cdp(
 
     args = [
         chromium_path,
-        "--window-position=-2000,-2000",
+        # Off-screen only when headless; a headful operator-solve mint needs the
+        # window visible to click the Cloudflare challenge (see _mint_*_clearance).
+        "--window-position=-2000,-2000" if headless else "--window-position=40,40",
         "--window-size=1280,900",
         "--mute-audio",
         "--no-first-run",
@@ -5035,7 +5044,16 @@ def _mint_basenotes_clearance():
                 options.set_browser_path(chromium_path)
             except Exception as exc:
                 _BASENOTES_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-        options.set_argument("--window-position=-2000,-2000")
+        headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
+        # Headful (local) mints exist so an operator can solve the Cloudflare
+        # challenge by hand. Shoving the window to -2000,-2000 hides it off-screen
+        # and makes the Turnstile impossible to click, so only do that when
+        # headless; otherwise bring the window on-screen and focused.
+        if headless:
+            options.set_argument("--window-position=-2000,-2000")
+        else:
+            options.set_argument("--window-position=40,40")
+            options.set_argument("--window-size=1280,900")
         options.set_argument("--mute-audio")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
@@ -5046,7 +5064,6 @@ def _mint_basenotes_clearance():
         options.set_argument("--disable-background-networking")
         options.set_argument("--remote-allow-origins=*")
         options.set_argument(f"--user-data-dir={user_data_dir}")
-        headless = os.environ.get("BASENOTES_CHROMIUM_HEADLESS", "").lower() in {"1", "true", "yes"}
         if headless:
             options.headless(True)
             options.set_argument("--headless=new")
@@ -5302,7 +5319,13 @@ def _mint_fragrantica_clearance():
                 opts.set_browser_path(chromium_path)
             except Exception as exc:
                 _FRAGRANTICA_LAST_MINT_ERROR = f"{type(exc).__name__}: {exc}"
-            opts.set_argument("--window-position=-2000,-2000")
+            # Headful (operator-solve) mints need the window on-screen so the
+            # Cloudflare challenge can be clicked; only hide it when headless.
+            if headless_env.lower() in {"1", "true", "yes"}:
+                opts.set_argument("--window-position=-2000,-2000")
+            else:
+                opts.set_argument("--window-position=40,40")
+                opts.set_argument("--window-size=1280,900")
             opts.set_argument("--mute-audio")
             opts.set_argument("--no-sandbox")
             opts.set_argument("--disable-dev-shm-usage")
@@ -7695,6 +7718,23 @@ class FragranticaEngine:
         if not unified_details.description:
             unified_details.description = FragranticaEngine.extract_description(soup)
 
+        # Capture a durable launch year + the page title here, while the parsed
+        # soup is in scope. Year was previously mined ONLY from the prose
+        # description in heal_missing_gender_and_year; when FG reshapes that
+        # paragraph's markup the year silently goes null forever even though the
+        # page clearly shows it. JSON-LD datePublished and the title's trailing
+        # launch year are far more stable, so read them now as fallbacks.
+        if not unified_details.launch_year:
+            unified_details.launch_year = FragranticaEngine.extract_launch_year(
+                soup, unified_details.description
+            )
+        if not unified_details.page_title:
+            og_title = soup.select_one('meta[property="og:title"]')
+            title_text = (og_title.get("content") if og_title else "") or ""
+            if not title_text and soup.title:
+                title_text = soup.title.string or ""
+            unified_details.page_title = TextSanitizer.clean(title_text)
+
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
         diag["has_status_payload"] = bool(status_payload)
@@ -7854,6 +7894,51 @@ class FragranticaEngine:
             candidate = safe_get_text(tag, separator=" ")
             if candidate and re.search(r"\b(?:was\s+)?launched in\b", candidate, re.IGNORECASE):
                 return candidate
+        return ""
+
+    @staticmethod
+    def extract_launch_year(soup: BeautifulSoup, description: str = "") -> str:
+        """Best-effort launch year from the FG detail page's structured sources.
+
+        Order is precision-first and brand-year-safe (neither source carries the
+        "Casamorati 1888" founding-year trap, so no name/brand filtering needed):
+
+          1. the description's "(was) launched in <year>" sentence, and
+          2. JSON-LD ``datePublished`` / ``releaseDate`` / ``dateCreated``.
+
+        The looser title fallback (which CAN carry a founding year) is left to
+        heal_missing_gender_and_year, which has the brand/name to filter against.
+        Returns "" when nothing usable is found.
+        """
+        if description:
+            m = re.search(
+                r"(?:was\s+)?launched in\s*(\b(?:17|18|19|20)\d{2}\b)",
+                description,
+                re.IGNORECASE,
+            )
+            if m:
+                return m.group(1)
+        if soup is None:
+            return ""
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text() or ""
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw.strip())
+            except Exception:
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                for key in ("datePublished", "releaseDate", "dateCreated"):
+                    val = node.get(key)
+                    if not val:
+                        continue
+                    ym = re.search(r"\b((?:17|18|19|20)\d{2})\b", str(val))
+                    if ym:
+                        return ym.group(1)
         return ""
 
     @staticmethod
@@ -10791,19 +10876,36 @@ def heal_missing_gender_and_year(selected: UnifiedFragrance, details: UnifiedDet
     # 2. Year Healing
     year_str = str(selected.year).strip() if selected.year is not None else ""
     if not year_str or year_str == "0":
-        desc = details.description or ""
-        launch_match = re.search(r"(?:launched in|was launched in)\s*(\b(?:17|18|19|20)\d{2}\b)", desc, re.IGNORECASE)
-        if launch_match:
-            selected.year = launch_match.group(1)
+        # Prefer the durable year captured at parse time (launch sentence /
+        # JSON-LD datePublished). Falling back to re-mining prose here is what
+        # left every record yearless whenever FG reshaped the description markup.
+        captured = str(getattr(details, "launch_year", "") or "").strip()
+        if captured:
+            selected.year = captured
         else:
-            all_years = re.findall(r"\b((?:17|18|19|20)\d{2})\b", desc)
-            if all_years:
-                selected.year = all_years[0]
+            desc = details.description or ""
+            launch_match = re.search(r"(?:launched in|was launched in)\s*(\b(?:17|18|19|20)\d{2}\b)", desc, re.IGNORECASE)
+            if launch_match:
+                selected.year = launch_match.group(1)
             else:
-                # Last resort fallback: parse from the fragrance name
-                name_match = re.search(r"\b((?:17|18|19|20)\d{2})\b", selected.name or "")
-                if name_match:
-                    selected.year = name_match.group(1)
+                # FG appends the launch year to the page/og title. Filter the
+                # brand/name year tokens (the "Casamorati 1888" founding-year
+                # trap) before trusting it.
+                title = str(getattr(details, "page_title", "") or "")
+                title_year = TextSanitizer.pick_launch_year(
+                    title, brand=selected.brand, name=selected.name
+                ) if title else ""
+                if title_year:
+                    selected.year = title_year
+                else:
+                    all_years = re.findall(r"\b((?:17|18|19|20)\d{2})\b", desc)
+                    if all_years:
+                        selected.year = all_years[0]
+                    else:
+                        # Last resort fallback: parse from the fragrance name
+                        name_match = re.search(r"\b((?:17|18|19|20)\d{2})\b", selected.name or "")
+                        if name_match:
+                            selected.year = name_match.group(1)
 
 
 def build_parser() -> argparse.ArgumentParser:

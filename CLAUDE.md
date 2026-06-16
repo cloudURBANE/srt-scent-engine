@@ -1,5 +1,22 @@
 # Project instructions
 
+## Skills (load proactively)
+
+These live in `search_engine/.claude/skills/` and load **only** when you launch Claude
+from this repo (`search_engine/`). They will NOT load from the workspace root or from
+`huge_monorepo/`.
+
+| Skill | Use it when |
+|---|---|
+| `engine-live-verify` | After any engine deploy/redeploy, validating a Decodo/SERP change, or any "empty / Basenotes-only / Unknown-family" cold-search report. The cold-Decodo-discovery canary. |
+| `wardrobe-completeness-heal` | The owner reports a fragrance shows no year/concentration/accords/metric cards, or "the app isn't improving even though drains ran". The two-DB (engine viaduct vs Supabase wardrobe) heal trap + recovery passes + how to verify a fragrance on the account. |
+
+**Cross-repo note:** the web app (`huge_monorepo/`) has its OWN skill set
+(`repo-map`, `dev-commands`, `git-guardrails`, `cross-service-contract`,
+`fix-playbooks`, plus UI/device skills) indexed in `huge_monorepo/CLAUDE.md`. Those
+load only from `huge_monorepo/`, not here — launch Claude in the repo whose skills you
+need. There is no shared/global skills dir; each repo manages its own.
+
 ## First-time setup (run once per clone)
 
 Activate the committed git hooks so the merge-ladder guardrail is enforced

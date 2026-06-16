@@ -178,7 +178,7 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     }
     $prevPending = $pending
 
-    $wArgs = @("--process-pending", "--limit", $BatchLimit, "--workers", $Workers, "--delay", "0", "--jitter", "0")
+    $wArgs = @("--process-pending", "--limit", $BatchLimit, "--workers", $Workers, "--delay", "0", "--jitter", "0.9")
     if ($WorkerDebug) { $wArgs += "--debug" }
     Write-Host "-> $($wArgs -join ' ')" -ForegroundColor DarkGray
     # Stream stdout live: timestamp each line, echo to console AND append to log.
