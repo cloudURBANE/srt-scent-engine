@@ -25,14 +25,32 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-env_path = _REPO_ROOT.parent / "huge_monorepo" / ".env"
-if env_path.exists():
+def _load_local_env() -> None:
+    """Populate os.environ from huge_monorepo/.env for CLI runs.
+
+    Invoked only when this file is executed as a script (the __main__ guard
+    below), *before* ``import db`` so the CLI's DATABASE_URL is frozen into
+    db.ENABLED. Importing this module (e.g. test_concentration_backfill.py
+    exercising the pure resolvers, or heal_offline.py reusing them) must NOT
+    mutate os.environ: doing this at import scope silently injected the
+    production DATABASE_URL and pointed the offline test suite at prod.
+    """
+    env_path = _REPO_ROOT.parent / "huge_monorepo" / ".env"
+    if not env_path.exists():
+        return
     with open(env_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, val = line.split("=", 1)
                 os.environ.setdefault(key.strip(), val.strip())
+
+
+# Load .env *before* importing db (whose ENABLED/DATABASE_URL freeze at import),
+# but only when run as a script -- never on a bare import -- so the CLI keeps its
+# DATABASE_URL while unit-test imports stay hermetic.
+if __name__ == "__main__":
+    _load_local_env()
 
 import db
 from concentration_grabber import SemanticScentEngine, to_scentcast_concentration
