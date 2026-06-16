@@ -61,9 +61,18 @@ DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
 DEFAULT_JITTER = 15.0
 DEFAULT_LIMIT = 10
-# Per-page fetch deadline (FG+BN). Previously 8s, which left FG without
-# headroom on slow responses and surfaced as parser_empty_frag_cards.
-DEFAULT_DETAIL_TIMEOUT = 15.0
+# Per-page fetch deadline (FG+BN). History: 8s -> 15s -> 55s. On the deployed
+# datacenter IP the direct Fragrantica fetch is always Cloudflare-blocked (429),
+# so every record falls through to Decodo's *billed* universal-egress render of
+# the page. That render of a full Fragrantica page routinely needs 20-40s; a 15s
+# deadline aborted it at ~14.5s, so we paid for the scrape, got nothing, logged
+# parser_empty_frag_cards, and re-enqueued to pay again (up to MAX_RETRYABLE
+# times). This is a background worker — latency is irrelevant, completeness is
+# everything — so give the FG fetch enough runway to receive the page we paid
+# for. Pairs with DecodoScraperClient.UNIVERSAL_MAX_TIMEOUT (45s); the deadline
+# must exceed it so the universal leg gets its full budget after the direct
+# fetch. Override per-run with --detail-timeout.
+DEFAULT_DETAIL_TIMEOUT = 55.0
 SCHEMA_VERSION = 1
 MAX_LIST_LIMIT = 100
 # Dashboard/list reads fail fast; complete/fail uploads get more headroom.
