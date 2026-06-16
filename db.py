@@ -216,6 +216,16 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT worker_heartbeat_singleton CHECK (id = 1)
 );
+
+-- Durable "this brand has already been swept" ledger. The search path claims a
+-- brand here exactly once (atomic INSERT ... ON CONFLICT DO NOTHING), so the
+-- background brand-catalog discovery fires once per brand ever -- across restarts
+-- and across multiple engine processes -- and never re-pays the Decodo cost.
+CREATE TABLE IF NOT EXISTS brand_sweeps (
+    brand_key   TEXT PRIMARY KEY,
+    swept_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    found_count INTEGER
+);
 """
 
 
@@ -396,6 +406,7 @@ def _enqueue_job_row(
     year: int | None,
     bn_url: str | None,
     fg_url: str | None,
+    priority: int = 0,
 ) -> Any | None:
     """Upsert a job by job_key and return its resulting status/count row.
 
@@ -403,6 +414,11 @@ def _enqueue_job_row(
     a completed job is not resurrected) except that a `failed` job is returned
     to `pending`, and an `ignored` job is never touched at all -- it was
     deliberately retired.
+
+    `priority` is only applied on first insert; the worker orders pending jobs by
+    `priority DESC`, so speculative background work (e.g. brand sweeps) can enqueue
+    at a negative priority to stay behind user-requested jobs. A later, higher
+    priority request for the same job_key never demotes the existing row.
     """
     if not ENABLED:
         return None
@@ -413,10 +429,10 @@ def _enqueue_job_row(
                 """
                 INSERT INTO enrichment_jobs
                     (id, job_key, query, name, house, year, bn_url, fg_url,
-                     status, requested_count, created_at, last_requested_at)
+                     status, priority, requested_count, created_at, last_requested_at)
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s, %s,
-                     'pending', 1, now(), now())
+                     'pending', %s, 1, now(), now())
                 ON CONFLICT (job_key) DO UPDATE SET
                     status            = CASE
                         WHEN enrichment_jobs.status = 'failed' THEN 'pending'
@@ -453,7 +469,8 @@ def _enqueue_job_row(
                 WHERE enrichment_jobs.status <> 'ignored'
                 RETURNING status, requested_count
                 """,
-                (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url),
+                (str(uuid.uuid4()), job_key, query, name, house, year, bn_url, fg_url,
+                 priority),
             ).fetchone()
             return row
     finally:
@@ -499,6 +516,7 @@ def enqueue_job_state(
     year: int | None,
     bn_url: str | None,
     fg_url: str | None,
+    priority: int = 0,
 ) -> dict[str, Any] | None:
     """Upsert a job and return the actual queue state after the write."""
     row = _enqueue_job_row(
@@ -509,6 +527,7 @@ def enqueue_job_state(
         year=year,
         bn_url=bn_url,
         fg_url=fg_url,
+        priority=priority,
     )
     if not row:
         return None
@@ -516,6 +535,58 @@ def enqueue_job_state(
         "status": row["status"],
         "requested_count": row["requested_count"],
     }
+
+
+def claim_brand_sweep(brand_key: str) -> bool:
+    """Atomically claim a brand for a one-time background catalog sweep.
+
+    Returns True only when this caller inserted the `brand_sweeps` row -- i.e.
+    won the claim and is responsible for running the sweep. Returns False when
+    the brand was already claimed (sweep already ran or is running) or when
+    storage is disabled. The INSERT ... ON CONFLICT DO NOTHING RETURNING is
+    race-free across concurrent searches and durable across restarts, so a brand
+    is swept exactly once, ever.
+    """
+    if not ENABLED:
+        return False
+    key = (brand_key or "").strip()
+    if not key:
+        return False
+    ctx, conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            INSERT INTO brand_sweeps (brand_key)
+            VALUES (%s)
+            ON CONFLICT (brand_key) DO NOTHING
+            RETURNING brand_key
+            """,
+            (key,),
+        ).fetchone()
+        return row is not None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def mark_brand_sweep_done(brand_key: str, found_count: int) -> None:
+    """Backfill the discovered-candidate count for an already-claimed brand.
+
+    Observability only -- the claim itself is what enforces once-ever. Never
+    raises into the caller's background thread.
+    """
+    if not ENABLED:
+        return
+    key = (brand_key or "").strip()
+    if not key:
+        return
+    ctx, conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE brand_sweeps SET found_count = %s WHERE brand_key = %s",
+            (int(found_count), key),
+        )
+    finally:
+        ctx.__exit__(None, None, None)
 
 
 def requeue_or_enqueue_job(

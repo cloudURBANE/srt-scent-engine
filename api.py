@@ -1052,6 +1052,128 @@ def _spawn_warm_refresh(query: str) -> bool:
     return True
 
 
+# Background per-search brand sweep. The first time we ever see a brand (derived
+# from the top result), discover the rest of that brand's catalog and drop any
+# newly-found fragrances into the pending enrichment queue, so the catalog
+# self-seeds from real traffic. Bounded + deduped exactly like warm-refresh; the
+# durable db.claim_brand_sweep() guarantees once-ever across restarts/processes.
+_brand_sweep_lock = threading.Lock()
+_brand_sweep_inflight: set[str] = set()
+_BRAND_SWEEP_MAX_INFLIGHT = 1
+# Speculative work: enqueue below the default (0) so a brand sweep never serves
+# ahead of a user-requested /details job in the worker's priority-ordered queue.
+_BRAND_SWEEP_JOB_PRIORITY = -10
+
+
+def _brand_sweep_key(brand: str) -> str:
+    """Stable, alias-collapsed key for a brand label (empty when unkeyable).
+
+    Maps known aliases (MFK, D&G, ...) to one canonical key so the same house is
+    not swept twice under different labels; falls back to the normalized identity
+    for brands not in the alias table.
+    """
+    brand = (brand or "").strip()
+    if not brand:
+        return ""
+    return (
+        engine.IdentityTools.canonical_brand_query(brand)
+        or engine.TextSanitizer.normalize_identity(brand)
+    )
+
+
+def _maybe_spawn_brand_sweep(
+    results: list[engine.UnifiedFragrance],
+) -> bool:
+    """Fire a one-time background brand-catalog sweep for the top result's brand.
+
+    No-op when results are empty, the brand is unkeyable, the brand was already
+    swept (durable db claim), the engine is saturated, or a sweep for this brand
+    is already inflight in this process. The common path -- brand already swept --
+    costs a single indexed insert-attempt: no thread, no Decodo spend. Returns
+    True only when a sweep thread was actually started.
+    """
+    if not results:
+        return False
+    brand = results[0].brand or ""
+    brand_key = _brand_sweep_key(brand)
+    if not brand_key:
+        return False
+
+    with _brand_sweep_lock:
+        if brand_key in _brand_sweep_inflight:
+            return False
+        if len(_brand_sweep_inflight) >= _BRAND_SWEEP_MAX_INFLIGHT:
+            return False
+        _brand_sweep_inflight.add(brand_key)
+
+    # Durable once-ever claim. Cheap common path: returns False immediately when
+    # the brand was already swept (or storage is disabled) -> no thread spawned.
+    claimed = False
+    try:
+        claimed = db.claim_brand_sweep(brand_key)
+    except Exception:
+        logger.warning(
+            "brand-sweep claim failed brand_key=%s", brand_key, exc_info=True
+        )
+    if not claimed:
+        with _brand_sweep_lock:
+            _brand_sweep_inflight.discard(brand_key)
+        return False
+
+    # Share the live-search backpressure: a saturated engine simply skips the
+    # sweep. The brand stays claimed (true "once ever") -- we accept a missed
+    # sweep over re-spending budget on retries.
+    if not _try_acquire_gate(_LIVE_SEARCH_SEMAPHORE, 0.0):
+        with _brand_sweep_lock:
+            _brand_sweep_inflight.discard(brand_key)
+        return False
+
+    def _run() -> None:
+        found = 0
+        try:
+            scraper = engine.get_scraper()
+            # The bare brand label routes through the brand-only catalog path
+            # (query_is_brand_only -> catalog crawl -> designer fallback), which
+            # returns the full brand listing with link-attach + relevance gating
+            # already applied.
+            discovered = engine.search_once(scraper, brand, _ARGS) or []
+            for cand in discovered:
+                if _enqueue_candidate(
+                    cand,
+                    query=f"brand-sweep:{brand_key}",
+                    priority=_BRAND_SWEEP_JOB_PRIORITY,
+                ):
+                    found += 1
+            try:
+                db.mark_brand_sweep_done(brand_key, found)
+            except Exception:
+                logger.warning(
+                    "brand-sweep mark-done failed brand_key=%s", brand_key,
+                    exc_info=True,
+                )
+            logger.info(
+                "brand-sweep complete brand_key=%s discovered=%d enqueued=%d",
+                brand_key, len(discovered), found,
+            )
+        except Exception:
+            logger.warning(
+                "brand-sweep failed brand_key=%s", brand_key, exc_info=True
+            )
+        finally:
+            _release_gate(_LIVE_SEARCH_SEMAPHORE)
+            with _brand_sweep_lock:
+                _brand_sweep_inflight.discard(brand_key)
+
+    try:
+        threading.Thread(target=_run, name="brand-sweep", daemon=True).start()
+    except Exception:
+        _release_gate(_LIVE_SEARCH_SEMAPHORE)
+        with _brand_sweep_lock:
+            _brand_sweep_inflight.discard(brand_key)
+        raise
+    return True
+
+
 _FG_METRIC_GROUPS = ("performance_score", "value_score",
                      "community_interest_score", "wear_profile")
 
@@ -2067,6 +2189,7 @@ def search(
         diagnostics["cache_source"] = strong_source
         diagnostics["cache_mode"] = "precheck"
         diagnostics["live_search_skipped"] = True
+        _maybe_spawn_brand_sweep(strong_results)
         return {
             "query": query,
             "results": [_search_result_to_dict(item) for item in strong_results],
@@ -2095,6 +2218,7 @@ def search(
         # True when a live re-resolve is now running; the client may choose to
         # re-query shortly to pick up fresher breadth. Never blocks this response.
         diagnostics["background_refresh"] = refreshing
+        _maybe_spawn_brand_sweep(warm_results)
         return {
             "query": query,
             "results": [_search_result_to_dict(item) for item in warm_results],
@@ -2173,6 +2297,7 @@ def search(
                 f"{fallback_label}."
             )
 
+    _maybe_spawn_brand_sweep(results)
     return {
         "query": query,
         "results": [_search_result_to_dict(item) for item in results],
@@ -4162,22 +4287,27 @@ def _identity_job_key(selected: engine.UnifiedFragrance) -> str:
     return f"id:{brand}|{name}"
 
 
-def _enqueue_enrichment_job(
-    selected: engine.UnifiedFragrance, req: DetailRequest
+def _enqueue_candidate(
+    selected: engine.UnifiedFragrance,
+    *,
+    query: str | None = None,
+    priority: int = 0,
 ) -> dict[str, Any] | None:
-    """Enqueue (or upsert) an enrichment job for a partial detail result.
+    """Gate + enqueue (or upsert) an enrichment job for one candidate.
 
     Job key prefers the canonical Fragrantica URL, falls back to the canonical
     Basenotes URL, then to a brand|name identity slug -- so a BN-only candidate
     still gets a pending row that the worker can resolve to FG at claim time.
     Repeated requests for the same fragrance bump requested_count instead of
-    duplicating. Any failure here is swallowed -- enrichment is a background
-    nicety and must never break the user-facing /details response.
+    duplicating. The non-perfume gate keeps body-care out of the queue. Any
+    failure here is swallowed -- enrichment is a background nicety and must never
+    break a user-facing response.
 
-    Returns the job's actual resulting status/count row on success. This keeps
-    `/details` from labeling duplicate requests as "pending" when the durable
-    queue row is already terminal (for example, completed-but-partial source
-    coverage).
+    `priority` is applied on first insert only (the worker serves higher
+    `priority DESC` first); background brand sweeps pass a negative value so they
+    never outrank user-driven `/details` jobs.
+
+    Returns the job's actual resulting status/count row on success.
     """
     if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
         return None
@@ -4208,12 +4338,13 @@ def _enqueue_enrichment_job(
             return None
         return db.enqueue_job_state(
             job_key=job_key,
-            query=(req.source_url or None),
+            query=query,
             name=selected.name or None,
             house=selected.brand or None,
             year=_coerce_year(selected.year),
             bn_url=selected.bn_url or None,
             fg_url=selected.frag_url or None,
+            priority=priority,
         )
     except Exception:
         # Best-effort: never let queue write failures surface to the client.
@@ -4224,6 +4355,19 @@ def _enqueue_enrichment_job(
             selected.brand,
         )
         return None
+
+
+def _enqueue_enrichment_job(
+    selected: engine.UnifiedFragrance, req: DetailRequest
+) -> dict[str, Any] | None:
+    """Enqueue an enrichment job for a partial /details result (thin wrapper).
+
+    Delegates to `_enqueue_candidate`, threading `req.source_url` into the job's
+    `query` column for traceability. Returns the job's resulting status/count row
+    so `/details` does not label a duplicate request as "pending" when the
+    durable queue row is already terminal (e.g. completed-but-partial coverage).
+    """
+    return _enqueue_candidate(selected, query=(req.source_url or None))
 
 
 def _enrichment_status_from_job_state(
