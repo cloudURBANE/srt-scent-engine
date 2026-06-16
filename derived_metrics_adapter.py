@@ -29,6 +29,8 @@ import math
 import re
 from typing import Any
 
+from enrichment_facts import is_junk_accord_label
+
 __all__ = ["build_derived_metrics"]
 
 
@@ -427,6 +429,10 @@ def _main_accords(details: Any) -> dict[str, Any] | None:
     for m in metrics:
         label = str(m.get("label", "")).strip()
         if not label:
+            continue
+        # Drop scraped vote-count / rating-word leakage (14.9K, Hate, ...) so the
+        # junk never enters the stored blob nor sorts above the real accords.
+        if is_junk_accord_label(label):
             continue
         try:
             score = float(m.get("pct") or 0.0)

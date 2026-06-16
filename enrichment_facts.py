@@ -115,6 +115,48 @@ def _derived_metrics_from(source: Any) -> dict[str, Any]:
     return dm if isinstance(dm, dict) else {}
 
 
+# Vote-count tokens ("14.9K", "11.2K", "6.5K", "1,204") and love/hate rating
+# words ("Hate", "Like", ...) leak into Fragrantica's "Main accords" card when
+# the scraper's container detection over-captures the adjacent Rating
+# Distribution / Community Interest widgets. Because those bars carry high
+# percentages they sort ABOVE the real accords and crowd them off the card
+# (the "Dylan Blue only shows two accords" bug). A real accord is always an
+# alphabetic label -- never a number, never a love/hate rating bucket -- so
+# these are unambiguously junk and safe to drop on every read/write path.
+_VOTE_COUNT_RE = re.compile(r"^\d[\d.,]*\s*[kmb]?$", re.IGNORECASE)
+_RATING_WORD_LABELS = {"love", "like", "ok", "okay", "dislike", "hate", "neutral"}
+# "When to wear" widget buckets -- seasons and time-of-day -- that bleed in from
+# the same over-capture. None of these is ever a real Fragrantica accord.
+_SEASON_TIME_LABELS = {
+    "spring", "summer", "fall", "autumn", "winter", "day", "night",
+}
+# Shopping/ad copy that the scraper occasionally swept up ("Many Items For Sale
+# On ..."). No accord ever contains these phrases.
+_AD_TEXT_MARKERS = ("for sale", "items for sale", "in stock", "shop ", " ad")
+
+
+def is_junk_accord_label(label: Any) -> bool:
+    """True when an 'accord' label is actually scraped noise rather than a scent.
+
+    Catches the three leaks that the Fragrantica "Main accords" card picks up when
+    its container over-captures adjacent widgets: vote-count tokens (14.9K), the
+    love/hate rating buckets (Hate, Like), the "When to wear" season/time buckets
+    (Summer, Night), and stray shopping copy. A real accord is always an
+    alphabetic scent label, so all of these are unambiguously junk.
+    """
+    s = str(label or "").strip()
+    if not s:
+        return True
+    if _VOTE_COUNT_RE.match(s):
+        return True
+    low = s.lower()
+    if low in _RATING_WORD_LABELS or low in _SEASON_TIME_LABELS:
+        return True
+    if any(marker in low for marker in _AD_TEXT_MARKERS):
+        return True
+    return False
+
+
 def top_accords_from(source: Any) -> list[str]:
     dm = _derived_metrics_from(source)
     main = dm.get("main_accords") if isinstance(dm, dict) else None
@@ -122,7 +164,11 @@ def top_accords_from(source: Any) -> list[str]:
         return []
     top = main.get("top_accords")
     if isinstance(top, list):
-        return [str(item).strip() for item in top if str(item or "").strip()]
+        return [
+            s
+            for item in top
+            if (s := str(item).strip()) and not is_junk_accord_label(s)
+        ]
     vector = main.get("scent_vector")
     if isinstance(vector, list):
         ordered = sorted(
@@ -131,9 +177,10 @@ def top_accords_from(source: Any) -> list[str]:
             reverse=True,
         )
         return [
-            str(item.get("accord") or "").strip()
+            s
             for item in ordered
-            if str(item.get("accord") or "").strip()
+            if (s := str(item.get("accord") or "").strip())
+            and not is_junk_accord_label(s)
         ]
     return []
 

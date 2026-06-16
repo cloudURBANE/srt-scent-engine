@@ -1499,19 +1499,26 @@ def list_fragrance_records(limit: int = 200, offset: int = 0) -> list[dict[str, 
 
 
 def set_record_derived_metrics(
-    record_key: str, derived_metrics: dict[str, Any]
+    record_key: str, derived_metrics: dict[str, Any], *, force: bool = False
 ) -> bool:
-    """Fill a record's derived_metrics_json in place, but only when it is NULL.
+    """Fill a record's derived_metrics_json in place.
 
     Backfill path for the bulk recompute sweep (api recompute_derived_metrics).
     A raw upsert deliberately invalidates derived_metrics_json to NULL whenever
     fresh fg/bn raw lands (see the CASE in upsert_fragrance_details /
     upsert_fragrance_records), so a row's family/accords/wear-profile read as
     Unknown until the metrics are recomputed from the stored raw. This writes
-    freshly computed metrics back, but the ``derived_metrics_json IS NULL``
-    guard keeps it strictly additive: it can never overwrite metrics that are
-    already present, so re-running the sweep -- or racing a read-time
-    /details hydrate -- is a harmless no-op. Returns True when a row was filled.
+    freshly computed metrics back.
+
+    By default the ``derived_metrics_json IS NULL`` guard keeps the write
+    strictly additive: it can never overwrite metrics that are already present,
+    so re-running the sweep -- or racing a read-time /details hydrate -- is a
+    harmless no-op. Pass ``force=True`` to drop that guard and overwrite an
+    existing blob: the repair path for blobs that are non-NULL but *corrupted*
+    (e.g. scraped vote-count tokens leaked into the accords), which the additive
+    path can never reach. ``force`` rebuilds are still a pure function of the
+    stored raw, so they remain deterministic and idempotent. Returns True when a
+    row was written.
     """
     if not ENABLED or derived_metrics is None:
         return False
@@ -1520,17 +1527,18 @@ def set_record_derived_metrics(
     key = _clean_text(record_key)
     if not key:
         return False
+    guard = "" if force else "AND derived_metrics_json IS NULL"
     ctx, conn = _conn()
     try:
         with conn.transaction():
             cur = conn.execute(
-                """
+                f"""
                 UPDATE fragrance_records
                 SET derived_metrics_json = %s,
                     metrics_computed_at = now(),
                     updated_at = now()
                 WHERE record_key = %s
-                  AND derived_metrics_json IS NULL
+                  {guard}
                 """,
                 (Json(derived_metrics), key),
             )

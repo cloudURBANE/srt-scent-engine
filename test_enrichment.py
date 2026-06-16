@@ -1428,9 +1428,14 @@ def test_recompute_derived_metrics_sweep() -> None:
         db.list_fragrance_records = lambda limit=200, offset=0: [recomputable, already, empty]
         db.count_fragrance_records = lambda: 3
 
-        def fake_set(record_key, derived_metrics):
-            # Mirror the real guard: only the NULL-metric row is writable.
+        forced: list[str] = []
+
+        def fake_set(record_key, derived_metrics, *, force=False):
+            # Mirror the real guard: additive writes only fill NULL rows, while
+            # force overwrites any row (the corrupted-blob repair path).
             writes.append(record_key)
+            if force:
+                forced.append(record_key)
             return True
 
         db.set_record_derived_metrics = fake_set
@@ -1473,12 +1478,91 @@ def test_recompute_derived_metrics_sweep() -> None:
             already["record_key"] not in writes and empty["record_key"] not in writes,
             str(writes),
         )
+
+        # Force/repair run: rebuilds AND overwrites the already-populated row too
+        # (the corrupted-blob repair path), but still skips empty-raw rows.
+        writes.clear()
+        forced.clear()
+        r = client.post("/api/enrichment/recompute-metrics", json={"force": True}, headers=auth)
+        body = r.json()
+        check(
+            "force recompute overwrites the populated row and fills the NULL row",
+            body.get("persisted") == 2
+            and body.get("repaired") == 1
+            and set(forced) == {recomputable["record_key"], already["record_key"]},
+            f"{body} forced={forced}",
+        )
+        check(
+            "force recompute still skips empty-raw rows",
+            body.get("no_raw") == 1 and empty["record_key"] not in writes,
+            str(body),
+        )
     finally:
         api._ENRICHMENT_WORKER_TOKEN = saved_token
         db.ENABLED = saved_enabled
         db.list_fragrance_records = saved_list
         db.count_fragrance_records = saved_count
         db.set_record_derived_metrics = saved_set
+
+
+def test_junk_accord_filtering() -> None:
+    print("Junk accord (vote-count / rating-word) filtering (no DATABASE_URL required):")
+    import enrichment_facts
+    from derived_metrics_adapter import build_derived_metrics
+    from fragrance_parser_full_rewrite_fixed import NotesList, UnifiedDetails
+
+    # Classifier: vote counts and love/hate buckets are junk; real accords are not.
+    for junk in [
+        "14.9K", "11.2K", "6.5K", "9.4K", "2.2K", "1.6K", "1,204", "100",
+        "Hate", "Like", "OK",
+        "Summer", "Winter", "Spring", "Fall", "Day", "Night",
+        "Many Items For Sale On",
+    ]:
+        check(f"is_junk_accord_label flags {junk!r}", enrichment_facts.is_junk_accord_label(junk), junk)
+    for real in ["Amber", "Citrus", "Fresh Spicy", "Warm Spicy", "Woody", "Aquatic", "Musky", "Green", "Fresh"]:
+        check(f"is_junk_accord_label keeps {real!r}", not enrichment_facts.is_junk_accord_label(real), real)
+
+    # This is exactly Dylan Blue's polluted "Main accords" card: 10 real accords
+    # followed by 11 leaked rating/vote-count bars carrying high percentages.
+    polluted_card = [
+        {"label": "Amber", "pct": 100.0}, {"label": "Citrus", "pct": 91.6},
+        {"label": "Fresh Spicy", "pct": 74.3}, {"label": "Musky", "pct": 70.9},
+        {"label": "Aquatic", "pct": 69.3}, {"label": "Warm Spicy", "pct": 64.5},
+        {"label": "Woody", "pct": 54.1}, {"label": "Fresh", "pct": 52.2},
+        {"label": "Aromatic", "pct": 51.3}, {"label": "Smoky", "pct": 49.8},
+        {"label": "11.1K", "pct": 45.0}, {"label": "9.4K", "pct": 38.1},
+        {"label": "2.2K", "pct": 9.0}, {"label": "1.6K", "pct": 6.4},
+        {"label": "Hate", "pct": 1.3}, {"label": "6.5K", "pct": 43.8},
+        {"label": "14.6K", "pct": 98.3}, {"label": "14.9K", "pct": 100.0},
+        {"label": "11.8K", "pct": 79.6}, {"label": "14.4K", "pct": 96.9},
+        {"label": "11.2K", "pct": 75.5},
+    ]
+    details = UnifiedDetails(notes=NotesList())
+    details.frag_cards = {"Main accords": polluted_card}
+    dm = build_derived_metrics(details)
+    top = (dm.get("main_accords") or {}).get("top_accords") or []
+    check(
+        "adapter rebuild drops every junk accord from top_accords",
+        not any(enrichment_facts.is_junk_accord_label(a) for a in top),
+        str(top),
+    )
+    check(
+        "adapter rebuild keeps the real accords ordered by percentage",
+        top[:3] == ["Amber", "Citrus", "Fresh Spicy"],
+        str(top),
+    )
+
+    # Read path: a legacy stored blob that still carries junk must read clean,
+    # so projection into the wardrobe never copies the junk forward.
+    legacy = {"derived_metrics": {"main_accords": {"top_accords": ["Amber", "14.9K", "Citrus", "11.2K", "Hate"]}}}
+    cleaned = enrichment_facts.top_accords_from(legacy)
+    check("top_accords_from sanitizes a legacy polluted blob", cleaned == ["Amber", "Citrus"], str(cleaned))
+    fam = enrichment_facts.derive_families(legacy)
+    check(
+        "derive_families resolves family from the cleaned accords only",
+        fam.get("primary_family") == "Amber" and not any(enrichment_facts.is_junk_accord_label(a) for a in fam.get("accords", [])),
+        str(fam),
+    )
 
 
 def test_parfumo_partial_self_heal_alignment() -> None:
@@ -2860,6 +2944,7 @@ def main() -> int:
     test_stored_detail_completion_logic()
     test_completeness_self_heal_sweep()
     test_recompute_derived_metrics_sweep()
+    test_junk_accord_filtering()
     test_parfumo_partial_self_heal_alignment()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()

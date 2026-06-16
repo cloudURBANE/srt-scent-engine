@@ -4853,6 +4853,11 @@ class RecomputeMetricsRequest(BaseModel):
     offset: int = 0
     # Compute and report what would change, but write nothing.
     dry_run: bool = False
+    # Repair mode: also rebuild rows that already carry a (possibly corrupted)
+    # derived_metrics blob and overwrite it. The default additive sweep can only
+    # fill NULLs, so it can never heal a non-NULL-but-wrong blob (e.g. scraped
+    # vote-count tokens leaked into the accords). force=True closes that gap.
+    force: bool = False
 
 
 def _record_heal_job_key(record: dict[str, Any]) -> str:
@@ -5094,10 +5099,17 @@ def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any
     reconstructs the canonical UnifiedDetails from the already-stored
     fg_raw_json/bn_raw_json (no network -- the exact path a /details hydrate
     uses) and persists fresh metrics for every NULL-metric row whose raw carries
-    enough to compute them. Strictly additive and idempotent: the write only
-    fills NULLs (db.set_record_derived_metrics never overwrites), so re-running
-    -- or racing the read-time healer -- is a no-op. Rows with empty raw are
-    left for the heal sweep + worker to scrape. Page with limit/offset like
+    enough to compute them. Strictly additive and idempotent by default: the
+    write only fills NULLs (db.set_record_derived_metrics never overwrites), so
+    re-running -- or racing the read-time healer -- is a no-op. Rows with empty
+    raw are left for the heal sweep + worker to scrape.
+
+    Pass ``force=true`` to also rebuild rows that already carry a derived_metrics
+    blob and overwrite it (counted as ``repaired``). This is the repair path for
+    blobs that are non-NULL but *corrupted* -- e.g. the scraped vote-count tokens
+    (14.9K, 11.2K) that leaked into the main accords and crowded the real accords
+    off the card. The rebuild is still a pure function of the stored raw, so even
+    force mode is deterministic and safe to re-run. Page with limit/offset like
     GET /api/enrichment/completeness.
     """
     _require_db()
@@ -5105,12 +5117,13 @@ def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any
 
     records = db.list_fragrance_records(limit=payload.limit, offset=payload.offset)
     scanned = len(records)
-    already_present = no_raw = recomputed = persisted = 0
+    already_present = no_raw = recomputed = persisted = repaired = 0
     family_resolved = no_accords = errors = 0
     samples: list[dict[str, Any]] = []
 
     for record in records:
-        if record.get("derived_metrics") is not None:
+        had_metrics = record.get("derived_metrics") is not None
+        if had_metrics and not payload.force:
             already_present += 1
             continue
         if not _record_has_detail_payload(record):
@@ -5150,8 +5163,12 @@ def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any
         if payload.dry_run:
             continue
         try:
-            if db.set_record_derived_metrics(record.get("record_key"), dm):
+            if db.set_record_derived_metrics(
+                record.get("record_key"), dm, force=payload.force
+            ):
                 persisted += 1
+                if had_metrics:
+                    repaired += 1
         except Exception:
             errors += 1
             logger.exception(
@@ -5161,6 +5178,7 @@ def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any
 
     return {
         "dry_run": payload.dry_run,
+        "force": payload.force,
         "total_records": db.count_fragrance_records(),
         "limit": payload.limit,
         "offset": payload.offset,
@@ -5169,6 +5187,7 @@ def recompute_derived_metrics(payload: RecomputeMetricsRequest) -> dict[str, Any
         "no_raw": no_raw,
         "recomputed": recomputed,
         "persisted": persisted,
+        "repaired": repaired,
         "family_resolved": family_resolved,
         "no_accords": no_accords,
         "errors": errors,
