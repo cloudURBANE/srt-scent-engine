@@ -55,7 +55,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
-from enrichment_facts import FACT_FIELDS, expand_raw_accords, record_fact_status  # noqa: E402
+from enrichment_facts import (  # noqa: E402
+    FACT_FIELDS,
+    SOURCE_UNSUPPLIABLE_FACTS,
+    expand_raw_accords,
+    record_fact_status,
+)
 
 DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
 DEFAULT_DELAY = 60.0
@@ -91,6 +96,14 @@ HEAL_SWEEP_PAGE_LIMIT = 200
 # Churn guard: stop re-opening a job after this many total requests -- a row
 # whose upstream sources genuinely lack a fact should not loop forever.
 HEAL_SWEEP_MAX_REQUESTED = int(os.environ.get("ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED", "8"))
+# Inline self-heal: when a worker run completes a row that is metrics-complete
+# but still missing heal-worthy facts (year, concentration, gender, ...),
+# re-enqueue it immediately so a later run fills the gap -- no manual heal sweep
+# or 30-minute idle wait needed. Bounded by HEAL_SWEEP_MAX_REQUESTED. Set the
+# env to 0/false to disable and rely on the periodic sweep only.
+AUTO_REQUEUE_INCOMPLETE = os.environ.get(
+    "ENRICHMENT_AUTO_REQUEUE_INCOMPLETE", "1"
+).strip().lower() not in ("0", "false", "off", "no")
 # Resolver misses get this many retryable failures before going terminal.
 # Queue analysis showed every resolver miss was marked non-retryable on its
 # first attempt, so transient SERP/budget hiccups became permanent failures.
@@ -426,10 +439,16 @@ class ApiClient:
         offset: int = 0,
         priority: int = 5,
         max_requested_count: int | None = None,
+        fields: list[str] | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"limit": limit, "offset": offset, "priority": priority}
         if max_requested_count is not None:
             body["max_requested_count"] = max_requested_count
+        if fields:
+            body["fields"] = list(fields)
+        if dry_run:
+            body["dry_run"] = True
         # The API audits a whole page of records in one call; give it headroom.
         return self._request(
             "POST", "/api/enrichment/heal", json=body, timeout=HTTP_WRITE_TIMEOUT
@@ -1785,6 +1804,70 @@ def _build_parfumo_payload(
     return payload
 
 
+def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]) -> list[str]:
+    """Missing facts a re-fetch could still resolve for this payload's source.
+
+    Mirrors the heal sweep's guard (api.heal_incomplete_enrichment): a terminal-
+    partial source such as Parfumo can never grow FG-only facts, so those never
+    count as heal-worthy and must not trigger an endless requeue.
+    """
+    source = str(payload.get("source") or "").strip().lower()
+    unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(source) or frozenset()
+    return [field for field in facts_missing if field not in unsuppliable]
+
+
+def _auto_requeue_incomplete(
+    client: ApiClient,
+    job: dict[str, Any],
+    payload: dict[str, Any],
+    facts_missing: list[str],
+    *,
+    index_label: str,
+) -> None:
+    """Re-open a just-completed row that is metrics-complete yet fact-incomplete.
+
+    The worker marks a row ``quality_status="complete"`` as soon as the four
+    derived-metric groups parse -- even if year / concentration / gender are
+    still missing. Such a row used to go terminal, and only the periodic heal
+    sweep would ever retry it. Here we requeue it inline so the gap closes on an
+    ordinary worker run, with no manual ``POST /api/enrichment/heal`` and no
+    30-minute idle wait.
+
+    Loop-safe: every requeue bumps ``requested_count`` server-side and we stop at
+    HEAL_SWEEP_MAX_REQUESTED, so a fact the sources genuinely lack is retried a
+    bounded number of times and then left complete. The requeued job returns to
+    ``pending`` and is claimed on a *later* run -- process_pending claims a fixed
+    batch up front -- so it is never re-scraped back-to-back within this batch.
+    """
+    if not AUTO_REQUEUE_INCOMPLETE or HEAL_SWEEP_MAX_REQUESTED <= 0:
+        return
+    # Target only the metrics-complete-but-fact-incomplete case. Partial-metrics
+    # rows are already retried by the normal /details path; Parfumo stays terminal.
+    if payload.get("quality_status") != "complete":
+        return
+    healable = _heal_worthy_missing_facts(payload, facts_missing)
+    if not healable:
+        return
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return
+    requested = int(job.get("requested_count") or 0)
+    if requested >= HEAL_SWEEP_MAX_REQUESTED:
+        print(
+            f"{index_label} Auto-heal: still missing {', '.join(healable)} but "
+            f"requeue cap reached ({requested}/{HEAL_SWEEP_MAX_REQUESTED}); leaving complete"
+        )
+        return
+    try:
+        client.requeue_job(job_id, priority=max(5, int(job.get("priority") or 0)))
+        print(
+            f"{index_label} Auto-heal: requeued to fill {', '.join(healable)} "
+            f"(attempt {requested + 1}/{HEAL_SWEEP_MAX_REQUESTED})"
+        )
+    except WorkerError as exc:
+        print(f"{index_label} Auto-heal requeue failed: {exc.code}")
+
+
 def process_job(
     client: ApiClient,
     scraper,
@@ -1863,6 +1946,7 @@ def process_job(
                 ) from exc
             raise
         print(f"{index_label} Completed and uploaded cache")
+        _auto_requeue_incomplete(client, job, payload, facts_missing, index_label=index_label)
         return True
 
     except KeyboardInterrupt:
@@ -2802,6 +2886,74 @@ def _pick_stale_processing_job(client: ApiClient) -> dict[str, Any] | None:
     return stale[0] if stale else None
 
 
+def reopen_incomplete(
+    client: ApiClient,
+    *,
+    dry_run: bool = False,
+    fields: list[str] | None = None,
+    max_requested_count: int | None = None,
+    stop: StopController | None = None,
+) -> dict[str, int]:
+    """One-shot: page the whole engine DB through POST /api/enrichment/heal,
+    reopening every fact-incomplete row as a pending job so an ordinary drain
+    re-verifies it.
+
+    Safe and idempotent: the heal endpoint reuses db.recover_or_enqueue_job,
+    which leaves pending/processing jobs untouched, keeps deliberately-ignored
+    rows retired, and only reopens terminal incomplete rows -- complete rows are
+    never audited as incomplete, so they are not touched. ``max_requested_count``
+    skips rows already requeued that many times; the default (None) reopens
+    regardless, which is what a one-time post-fix re-verify wants (it reaches
+    rows the periodic churn guard had parked). ``fields`` limits the audit to
+    specific facts (e.g. ['year', 'concentration']).
+    """
+    offset = 0
+    page = 0
+    total_records: int | None = None
+    totals = {"audited": 0, "incomplete": 0, "queued": 0, "skipped": 0}
+    while True:
+        if stop and stop.stop_requested:
+            print("Stop requested; halting reopen sweep.")
+            break
+        try:
+            result = client.heal_sweep(
+                limit=HEAL_SWEEP_PAGE_LIMIT,
+                offset=offset,
+                priority=5,
+                max_requested_count=max_requested_count,
+                fields=fields,
+                dry_run=dry_run,
+            )
+        except WorkerError as exc:
+            print(f"  page {page + 1}: heal sweep failed ({exc.code}); stopping with partial progress.")
+            break
+        audited = int(result.get("audited") or 0)
+        if total_records is None:
+            total_records = int(result.get("total_records") or 0)
+        for key in totals:
+            totals[key] += int(result.get(key) or 0)
+        page += 1
+        print(
+            f"  page {page}: offset {offset} audited {audited} — "
+            f"{int(result.get('incomplete') or 0)} incomplete, "
+            f"{int(result.get('queued') or 0)} {'would reopen' if dry_run else 'reopened'}, "
+            f"{int(result.get('skipped') or 0)} skipped"
+        )
+        # Last page: the API returned fewer rows than a full page.
+        if audited < HEAL_SWEEP_PAGE_LIMIT:
+            break
+        offset += audited
+    verb = "Would reopen" if dry_run else "Reopened"
+    print(
+        f"{verb} {totals['queued']} incomplete row(s) "
+        f"({totals['incomplete']} fact-incomplete of {totals['audited']} audited; "
+        f"total records ~{total_records}); {totals['skipped']} skipped."
+    )
+    if not dry_run and totals["queued"]:
+        print("Run a drain now to re-verify them, e.g. scripts/drain_fast.ps1")
+    return totals
+
+
 def _maybe_run_heal_sweep(client: ApiClient, auto_state: dict[str, Any]) -> None:
     """Idle-queue self-healing: requeue stored fragrances with missing facts.
 
@@ -3651,6 +3803,28 @@ def parse_args() -> argparse.Namespace:
         "Or set ENRICHMENT_DASHBOARD_AUTO_APPROVE=1.",
     )
     parser.add_argument("--process-pending", action="store_true", help="Process pending enrichment jobs.")
+    parser.add_argument(
+        "--reopen-incomplete",
+        action="store_true",
+        help="One-shot: reopen every fact-incomplete stored fragrance as a pending job "
+        "(pages POST /api/enrichment/heal across the whole DB), then exit. Run a drain "
+        "afterwards to re-verify them. Idempotent. Add --dry-run to preview counts only.",
+    )
+    parser.add_argument(
+        "--reopen-fields",
+        default=None,
+        metavar="F1,F2",
+        help="With --reopen-incomplete: comma-separated fact fields to target "
+        "(e.g. 'year,concentration'). Default: any missing fact.",
+    )
+    parser.add_argument(
+        "--reopen-max-requested",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --reopen-incomplete: skip rows already requeued >= N times. "
+        "Default: no cap (reopen regardless, for a one-time post-fix re-verify).",
+    )
     parser.add_argument("--warm-list", help="Path to one-query-per-line warm list.")
     parser.add_argument(
         "--queue-diagnostics",
@@ -3736,6 +3910,17 @@ def main() -> int:
                     )
             initial_auto = opts.auto_approve or _env_bool("ENRICHMENT_DASHBOARD_AUTO_APPROVE", False)
             return run_live_dashboard(client, config, stop, initial_auto_approve=initial_auto)
+        if opts.reopen_incomplete:
+            ensure_token(config)
+            fields = [f.strip() for f in (opts.reopen_fields or "").split(",") if f.strip()] or None
+            reopen_incomplete(
+                client,
+                dry_run=opts.dry_run,
+                fields=fields,
+                max_requested_count=opts.reopen_max_requested,
+                stop=stop,
+            )
+            return 0
         if opts.process_pending or opts.once:
             ensure_token(config)
             process_pending(client, config, stop=stop)
