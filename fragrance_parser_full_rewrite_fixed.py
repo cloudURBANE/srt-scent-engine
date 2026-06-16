@@ -7773,6 +7773,7 @@ class FragranticaEngine:
     @staticmethod
     def extract_main_accords(soup: BeautifulSoup) -> list[dict[str, Any]]:
         """Surgical extraction dedicated to Main Accords, actively bypassing hidden screen reader strings."""
+        from enrichment_facts import is_junk_accord_label
         header = soup.find(lambda tag: getattr(tag, "name", None) in {"h2", "h3", "h4", "div", "span", "b", "p"} and "main accords" in tag.get_text(" ", strip=True).lower())
         if not header:
             return []
@@ -7817,6 +7818,11 @@ class FragranticaEngine:
                 valid = []
                 for t in texts:
                     if re.match(r"^[\d.,%()]+$", t):
+                        continue
+                    # Drop vote-count ("14.9K") / love-hate rating ("Hate") bars
+                    # that bleed in from the adjacent Rating Distribution widget
+                    # when the card container over-captures -- those aren't accords.
+                    if is_junk_accord_label(t):
                         continue
                     # Hard-skip tiny connector words that slip past the phrase blocks
                     if t.lower() in {"or", "and", "at", "on", "in", "by", "for", "buy"}:
