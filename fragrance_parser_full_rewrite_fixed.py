@@ -7686,6 +7686,15 @@ class FragranticaEngine:
             return
         soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
 
+        # Capture the descriptive paragraph (it states "<name> was launched in
+        # <year>"). Without this, heal_missing_gender_and_year has no text to
+        # read for Fragrantica-sourced fragrances, so their launch year stays
+        # null forever -- the Basenotes parser populated description but this one
+        # never did. Only set when empty so a Basenotes description (fetched in
+        # the same bundle) is not clobbered.
+        if not unified_details.description:
+            unified_details.description = FragranticaEngine.extract_description(soup)
+
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
         diag["has_status_payload"] = bool(status_payload)
@@ -7823,6 +7832,29 @@ class FragranticaEngine:
             + len(unified_details.notes.base)
             + len(unified_details.notes.flat)
         )
+
+    @staticmethod
+    def extract_description(soup: BeautifulSoup) -> str:
+        """Pull the page's descriptive paragraph (the one stating
+        "<name> was launched in <year>").
+
+        Fragrantica marks it up with schema.org's ``itemprop="description"``;
+        some variant/older pages use a ``fragdesc``-flavoured class. As a last
+        resort, fall back to any block whose text actually contains a launch
+        phrase so year/gender healing still has something to read after markup
+        drift. Returns "" when nothing usable is found.
+        """
+        node = soup.find("div", itemprop="description") or soup.find(
+            "div", class_=re.compile(r"fragdesc|descript", re.I)
+        )
+        text = safe_get_text(node, separator="\n")
+        if text:
+            return text
+        for tag in soup.find_all(["p", "div"]):
+            candidate = safe_get_text(tag, separator=" ")
+            if candidate and re.search(r"\b(?:was\s+)?launched in\b", candidate, re.IGNORECASE):
+                return candidate
+        return ""
 
     @staticmethod
     def extract_main_accords(soup: BeautifulSoup) -> list[dict[str, Any]]:
