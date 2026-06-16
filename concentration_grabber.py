@@ -849,7 +849,7 @@ _SCENTCAST_MAP = {
     "Extrait / Parfum Extract": "Extrait",
     "Parfum (Profumo)": "Parfum",
     "Le Parfum": "Parfum",
-    "Elixir": "Parfum",
+    "Elixir": "Elixir",
     "EDP Intense": "Eau de Parfum",
     "EDT Intense": "Eau de Toilette",
     "Body Mist / Hair Mist": "Body Spray",

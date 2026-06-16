@@ -49,7 +49,7 @@ def test_house_with_parfum_token_does_not_leak():
         ("No 5 Eau De Toilette", "Eau de Toilette"),
         ("No 5 Eau De Cologne", "Eau de Cologne"),
         ("Baccarat Rouge 540 Extrait De Parfum", "Extrait"),
-        ("Sauvage Elixir", "Parfum"),  # Elixir collapses to Parfum in the scentcast union
+        ("Sauvage Elixir", "Elixir"),  # Elixir is a first-class concentration in the scentcast union
         ("Guilty Eau De Parfum Intense Pour Femme", "Eau de Parfum"),
         ("J Adore Body Mist", "Body Spray"),
     ],
