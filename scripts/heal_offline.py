@@ -698,7 +698,7 @@ def heal_wardrobe(
 # Step 4 -- seed (queue wardrobe fragrances absent from the engine cache)
 # --------------------------------------------------------------------------
 def seed_missing_wardrobe(
-    index: dict[str, dict[str, Any]], *, dry_run: bool
+    index: dict[str, dict[str, Any]], *, dry_run: bool, include_catalog: bool = True
 ) -> dict[str, int]:
     """Enqueue an enrichment job for every wardrobe fragrance that has NO engine
     record yet, so the live worker (residential IP) can scrape it.
@@ -708,25 +708,41 @@ def seed_missing_wardrobe(
     scraped, so projection can't help -- they must be resolved + parsed by the
     worker, which on /complete persists family + concentration. This step keys
     each job exactly like api._enqueue_enrichment_job (brand|name identity slug)
-    so it dedupes with the queue the SPA's /details path writes."""
+    so it dedupes with the queue the SPA's /details path writes.
+
+    Coverage is decided by the *scraped engine cache* (fragrance_records) ONLY --
+    NOT the full projection index. ``index`` also folds the global_fragrances
+    catalog, but a catalog entry is not a scraped record: a wardrobe row whose
+    only match is an incomplete catalog row has no facts to inherit and still
+    needs the worker, so it must NOT be treated as covered here.
+
+    ``include_catalog`` controls breadth: when False, only the user's own
+    user_fragrances rows are candidates (the global_fragrances catalog -- which
+    holds entries no user owns -- is skipped). Default True keeps the original
+    cache-population behavior."""
     dsn = os.environ["DATABASE_URL"]
+    scraped_keys = {
+        _norm_key(str(r.get("house") or ""), str(r.get("name") or ""))
+        for r in _all_records()
+    }
     candidates: dict[str, tuple[str, str]] = {}
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT fragrance_data->>'brand' b, fragrance_data->>'name' n FROM user_fragrances")
             rows = cur.fetchall()
-            cur.execute(
-                "SELECT COALESCE(brand, profile_data->>'brand') b,"
-                " COALESCE(name, profile_data->>'name') n FROM global_fragrances"
-            )
-            rows += cur.fetchall()
+            if include_catalog:
+                cur.execute(
+                    "SELECT COALESCE(brand, profile_data->>'brand') b,"
+                    " COALESCE(name, profile_data->>'name') n FROM global_fragrances"
+                )
+                rows += cur.fetchall()
     for row in rows:
         brand = str(row.get("b") or "").strip()
         name = str(row.get("n") or "").strip()
         if not name:
             continue
-        if _norm_key(brand, name) in index:
-            continue  # already in the engine cache -- offline projection covers it
+        if _norm_key(brand, name) in scraped_keys:
+            continue  # already in the scraped engine cache -- worker has parsed it
         selected = api.engine.UnifiedFragrance(name=name, brand=brand, year="")
         job_key = api._identity_job_key(selected)
         if job_key:
@@ -766,6 +782,12 @@ def main() -> int:
         help="comma list subset of: metrics,concentration,wardrobe,seed "
         "(seed is opt-in: it queues wardrobe fragrances absent from the engine "
         "cache for the live worker, and is NOT in the default set)",
+    )
+    parser.add_argument(
+        "--seed-user-only",
+        action="store_true",
+        help="restrict seed to the user's own user_fragrances rows; skip the "
+        "global_fragrances catalog entries no user owns (only affects the seed step)",
     )
     parser.add_argument(
         "--record-key",
@@ -815,7 +837,11 @@ def main() -> int:
         if scoped:
             print("seed: skipped (not supported with --record-key scoping)")
         else:
-            seed_missing_wardrobe(_build_engine_index(all_records), dry_run=args.dry_run)
+            seed_missing_wardrobe(
+                _build_engine_index(all_records),
+                dry_run=args.dry_run,
+                include_catalog=not args.seed_user_only,
+            )
     print("=== done ===")
     return 0
 

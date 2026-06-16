@@ -1816,8 +1816,22 @@ def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]
     page WAS parsed -- if those facts are still missing the page lacks them and a
     re-fetch of the same URL yields the same empty result. Re-queuing for them was
     the cause of the endless drain churn.
+
+    Final guard: a metrics-complete FG worker page (`local_enrichment_worker`)
+    has already surrendered everything its URL can. year/gender/family/accords/
+    notes are parsed deterministically from that exact HTML, and concentration is
+    resolved off-page by the dedicated `enrich_concentration --engine-gap` path --
+    never improved by re-scraping FG. Re-fetching the identical URL re-runs
+    identical extraction and yields identical gaps, which is exactly the
+    "8 attempts then stall" churn the operator sees (year/concentration looping
+    on Azzaro et al.). Once such a page is complete, treat ITS OWN facts as
+    page-determined too: nothing is heal-worthy via an inline re-scrape. Genuinely
+    new fragrances are still filled by their FIRST scrape; the rare true gap is
+    closed by the targeted concentration/seed paths, not blind requeueing.
     """
     source = str(payload.get("source") or "").strip().lower()
+    if source == "local_enrichment_worker" and payload.get("quality_status") == "complete":
+        return []
     unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(source) or frozenset()
     return [
         field
