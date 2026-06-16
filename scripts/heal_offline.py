@@ -142,6 +142,28 @@ def _record_concentration(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _record_year(record: dict[str, Any]) -> str | None:
+    """First engine-complete year for a record (column, then fg raw_identity)."""
+    fg_raw = record.get("fg_raw") or {}
+    raw_identity = fg_raw.get("raw_identity") or {}
+    for value in (record.get("year"), raw_identity.get("year")):
+        text = str(value or "").strip()
+        if is_fact_complete(text, "year"):
+            return text
+    return None
+
+
+def _record_gender(record: dict[str, Any]) -> str | None:
+    """First engine-complete gender for a record (column, then fg raw_identity)."""
+    fg_raw = record.get("fg_raw") or {}
+    raw_identity = fg_raw.get("raw_identity") or {}
+    for value in (record.get("gender"), raw_identity.get("gender")):
+        text = str(value or "").strip()
+        if is_fact_complete(text, "gender"):
+            return text
+    return None
+
+
 def _all_records() -> list[dict[str, Any]]:
     """Every fragrance_records row, paged through list_fragrance_records."""
     out: list[dict[str, Any]] = []
@@ -258,7 +280,8 @@ def heal_concentration(
 # Step 3 -- wardrobe projection (family + concentration into user data)
 # --------------------------------------------------------------------------
 def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Exact-match index: normalized brand+name -> {derived_metrics, concentration}.
+    """Exact-match index: normalized brand+name ->
+    {derived_metrics, concentration, year, gender}.
 
     A re-read of fragrance_records is intentional: the metrics/concentration steps
     may have just filled values that ``records`` (read before the write) does not
@@ -268,24 +291,32 @@ def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, An
         key = _norm_key(str(record.get("house") or ""), str(record.get("name") or ""))
         if not key:
             continue
-        entry = index.setdefault(key, {"derived_metrics": None, "concentration": None})
+        entry = index.setdefault(
+            key,
+            {"derived_metrics": None, "concentration": None, "year": None, "gender": None},
+        )
         if entry["derived_metrics"] is None and record.get("derived_metrics") is not None:
             entry["derived_metrics"] = record["derived_metrics"]
         if entry["concentration"] is None:
             entry["concentration"] = _record_concentration(record)
+        if entry["year"] is None:
+            entry["year"] = _record_year(record)
+        if entry["gender"] is None:
+            entry["gender"] = _record_gender(record)
     return index
 
 
 def project_engine_facts(
     payload: dict[str, Any], entry: dict[str, Any]
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool]:
     """Project one engine-cache entry's facts onto a wardrobe payload, in place.
 
-    Returns ``(family_filled, concentration_filled, accords_refreshed)``. Pure
-    apart from mutating ``payload`` -- no DB, so it is unit-testable. ``entry`` is
-    ``{"derived_metrics": <blob|None>, "concentration": <str|None>}``.
+    Returns ``(family_filled, concentration_filled, accords_refreshed,
+    year_filled, gender_filled)``. Pure apart from mutating ``payload`` -- no DB,
+    so it is unit-testable. ``entry`` is ``{"derived_metrics": <blob|None>,
+    "concentration": <str|None>, "year": <str|None>, "gender": <str|None>}``.
     """
-    fam_filled = conc_filled = acc_refreshed = False
+    fam_filled = conc_filled = acc_refreshed = year_filled = gender_filled = False
     dm = entry.get("derived_metrics")
     if dm is not None:
         # Always re-project the junk-filtered top accords. The scrape leak
@@ -309,7 +340,18 @@ def project_engine_facts(
         payload["concentration"] = entry["concentration"]
         payload.setdefault("concentration_meta", {"source": "engine_cache_projection"})
         conc_filled = True
-    return fam_filled, conc_filled, acc_refreshed
+    # Year + gender are stored on the engine record (not derived_metrics), so the
+    # family/accords/concentration projection above never carried them -- which is
+    # why a wardrobe row could stay yearless no matter how many drains ran. Fill
+    # them from the engine only when the wardrobe value is still missing; never
+    # downgrade an existing value.
+    if not is_fact_complete(payload.get("year"), "year") and is_fact_complete(entry.get("year"), "year"):
+        payload["year"] = entry["year"]
+        year_filled = True
+    if not is_fact_complete(payload.get("gender"), "gender") and is_fact_complete(entry.get("gender"), "gender"):
+        payload["gender"] = entry["gender"]
+        gender_filled = True
+    return fam_filled, conc_filled, acc_refreshed, year_filled, gender_filled
 
 
 def heal_wardrobe(
@@ -320,17 +362,19 @@ def heal_wardrobe(
 ) -> dict[str, int]:
     dsn = os.environ["DATABASE_URL"]
     stats = {
-        "uf_family": 0, "uf_conc": 0, "uf_acc": 0,
-        "gf_family": 0, "gf_conc": 0, "gf_acc": 0,
+        "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_year": 0, "uf_gender": 0,
+        "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_year": 0, "gf_gender": 0,
         "no_match": 0,
     }
 
-    def _project(payload: dict[str, Any], norm: str) -> tuple[bool, bool, bool]:
-        """Returns (family_filled, concentration_filled, accords_refreshed)."""
+    def _project(
+        payload: dict[str, Any], norm: str
+    ) -> tuple[bool, bool, bool, bool, bool]:
+        """Returns (family, concentration, accords, year, gender) filled flags."""
         entry = index.get(norm)
         if not entry:
             stats["no_match"] += 1
-            return False, False, False
+            return False, False, False, False, False
         return project_engine_facts(payload, entry)
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
@@ -345,14 +389,18 @@ def heal_wardrobe(
             norm = _norm_key(str(fdata.get("brand") or ""), str(fdata.get("name") or ""))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc = _project(fdata, norm)
+            fam, cc, acc, yr, gen = _project(fdata, norm)
             if fam:
                 stats["uf_family"] += 1
             if cc:
                 stats["uf_conc"] += 1
             if acc:
                 stats["uf_acc"] += 1
-            if (fam or cc or acc) and not dry_run:
+            if yr:
+                stats["uf_year"] += 1
+            if gen:
+                stats["uf_gender"] += 1
+            if (fam or cc or acc or yr or gen) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -372,14 +420,18 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc = _project(pdata, norm)
+            fam, cc, acc, yr, gen = _project(pdata, norm)
             if fam:
                 stats["gf_family"] += 1
             if cc:
                 stats["gf_conc"] += 1
             if acc:
                 stats["gf_acc"] += 1
-            if (fam or cc or acc) and not dry_run:
+            if yr:
+                stats["gf_year"] += 1
+            if gen:
+                stats["gf_gender"] += 1
+            if (fam or cc or acc or yr or gen) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -389,9 +441,9 @@ def heal_wardrobe(
             conn.commit()
     print(
         f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
-        f"accords~{stats['uf_acc']}] "
+        f"accords~{stats['uf_acc']} year+{stats['uf_year']} gender+{stats['uf_gender']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
-        f"accords~{stats['gf_acc']}] "
+        f"accords~{stats['gf_acc']} year+{stats['gf_year']} gender+{stats['gf_gender']}] "
         f"no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
     return stats
