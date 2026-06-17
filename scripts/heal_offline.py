@@ -83,11 +83,95 @@ def _load_database_url() -> None:
 _load_database_url()
 
 
+def _env_file_database_url() -> str | None:
+    """Return the DATABASE_URL configured in a checked-out .env, or None.
+
+    This is the APP wardrobe DSN (the monorepo Supabase DB the phone reads). It
+    is read WITHOUT mutating os.environ, so it can be compared against whatever
+    DATABASE_URL the process was launched with (e.g. the viaduct engine DSN that
+    `railway run -s lively-adaptation` injects)."""
+    for candidate in (_REPO_ROOT / ".env", _REPO_ROOT.parent / "huge_monorepo" / ".env"):
+        if not candidate.exists():
+            continue
+        for line in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(r"\s*DATABASE_URL\s*=\s*(.*)\s*$", line)
+            if m:
+                val = m.group(1).strip().strip('"').strip("'")
+                if val:
+                    return val
+    return None
+
+
+def _mask_dsn(dsn: str) -> str:
+    return re.sub(r"://[^@]+@", "://****@", dsn or "")[:72]
+
+
+_ENGINE_DSN_PROBE: dict[str, bool] = {}
+
+
+def _dsn_is_engine_cache(dsn: str) -> bool:
+    """True iff ``dsn`` points at the ENGINE cache -- detected by the presence of
+    a ``fragrance_records`` table, which the app wardrobe DB never has. Result is
+    cached per-DSN. Fail-safe: any connection/probe error returns False so we
+    never redirect on uncertainty (preserves the legacy 'write DATABASE_URL'
+    behavior when we cannot prove the trap)."""
+    if dsn in _ENGINE_DSN_PROBE:
+        return _ENGINE_DSN_PROBE[dsn]
+    result = False
+    try:
+        import psycopg as _pg  # local import: this runs well after module import
+        with _pg.connect(dsn, connect_timeout=8) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.fragrance_records') IS NOT NULL")
+                row = cur.fetchone()
+                result = bool(row and row[0])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [wardrobe] engine-cache probe skipped: {exc}")
+        result = False
+    _ENGINE_DSN_PROBE[dsn] = result
+    return result
+
+
+_WARDROBE_DSN_CACHE: str | None = None
+
+
 def _wardrobe_dsn() -> str:
     """DSN of the DB that holds the wardrobe tables (user_fragrances /
-    global_fragrances) -- always DATABASE_URL. Engine facts may be read from a
-    separate ENGINE_DATABASE_URL, but every wardrobe write targets this one."""
-    return os.environ["DATABASE_URL"]
+    global_fragrances) -- the APP database the phone reads.
+
+    Defaults to DATABASE_URL, but SELF-CORRECTS the dual-DB trap: when a drain is
+    launched via ``railway run -s lively-adaptation``, Railway injects the ENGINE
+    service's DSN as DATABASE_URL (the viaduct cache, which carries its own STALE
+    user_fragrances copy). Writing the wardrobe there silently no-ops for the app.
+    So when DATABASE_URL is detected as the engine cache AND a distinct app DSN is
+    configured (WARDROBE_DATABASE_URL, or DATABASE_URL in a checked-out .env), we
+    route wardrobe writes to the app DB instead -- automatically, so the standard
+    drain heals the phone with no operator ceremony. Engine reads/writes still
+    target DATABASE_URL via the db module, unchanged. Cached after first resolve."""
+    global _WARDROBE_DSN_CACHE
+    if _WARDROBE_DSN_CACHE is not None:
+        return _WARDROBE_DSN_CACHE
+
+    current = os.environ["DATABASE_URL"]
+    override = (os.environ.get("WARDROBE_DATABASE_URL") or "").strip()
+    app_dsn = override or _env_file_database_url()
+
+    resolved = current
+    # Redirect ONLY in the unambiguous trap: a distinct app DSN exists and the
+    # injected DATABASE_URL is provably the engine cache. Same DSN -> no-op (the
+    # common local / heal_app_wardrobe case); probe failure -> keep DATABASE_URL.
+    if app_dsn and app_dsn != current and _dsn_is_engine_cache(current):
+        print(
+            "  [wardrobe] DATABASE_URL is the engine cache; routing wardrobe writes to "
+            f"the app DB {_mask_dsn(app_dsn)} (engine still read from DATABASE_URL)"
+        )
+        resolved = app_dsn
+        # No need to set ENGINE_DATABASE_URL: DATABASE_URL is unchanged (still the
+        # engine), so _all_records() already folds the live engine cache. Adding
+        # the explicit fold path here would only re-scan the same viaduct rows.
+
+    _WARDROBE_DSN_CACHE = resolved
+    return resolved
 
 
 import psycopg  # noqa: E402
@@ -99,7 +183,19 @@ import api  # noqa: E402  (reuse _details_from_fragrance_record -- single source
 from derived_metrics_adapter import build_derived_metrics  # noqa: E402
 from enrichment_facts import derive_families, is_fact_complete, top_accords_from  # noqa: E402
 import enrich_concentration as conc  # noqa: E402
+
+# enrich_database_metrics runs an import-time loader that UNCONDITIONALLY clobbers
+# os.environ from huge_monorepo/.env -- intentional for its OWN standalone run
+# (it writes user_fragrances metrics and must target the app DB), but a hidden
+# side effect we must NOT inherit here. If it silently flips DATABASE_URL out from
+# under us, db (already imported above, frozen on the injected engine DSN) and the
+# wardrobe writer would point at different DBs by accident of import order. We pull
+# in only the pure _apply_derived_facts helper, snapshotting/restoring DATABASE_URL
+# so this module's DSN routing stays EXPLICIT (via _wardrobe_dsn, not a side effect).
+_DSN_BEFORE_EDM_IMPORT = os.environ.get("DATABASE_URL")
 from enrich_database_metrics import _apply_derived_facts  # noqa: E402
+if _DSN_BEFORE_EDM_IMPORT is not None and os.environ.get("DATABASE_URL") != _DSN_BEFORE_EDM_IMPORT:
+    os.environ["DATABASE_URL"] = _DSN_BEFORE_EDM_IMPORT
 
 
 # --------------------------------------------------------------------------
@@ -697,6 +793,30 @@ def heal_wardrobe(
 # --------------------------------------------------------------------------
 # Step 4 -- seed (queue wardrobe fragrances absent from the engine cache)
 # --------------------------------------------------------------------------
+# Job statuses the queue will never re-act on. A `completed` job means the
+# worker DID scrape the fragrance -- the engine has it, almost always under a
+# canonical name the exact-match coverage check can't see ("Dylan Blue" stored
+# as "Pour Homme Dylan Blue"; "Initio" as "Initio Parfums Prives"). An `ignored`
+# job was deliberately retired. enqueue_job_state never resurrects either, so a
+# candidate in one of these states is unscrapeable churn, not a real gap.
+_TERMINAL_JOB_STATES = frozenset({"completed", "ignored"})
+
+
+def _drop_terminal_jobs(
+    candidates: dict[str, tuple[str, str]],
+    states: dict[str, dict[str, Any]],
+) -> int:
+    """Remove from ``candidates`` (in place) every job_key whose existing job is
+    in a terminal state, returning how many were dropped. Keeps only rows the
+    queue can still act on (no job yet, or a failed/pending one)."""
+    dropped = 0
+    for key, st in states.items():
+        if (st.get("status") or "") in _TERMINAL_JOB_STATES and key in candidates:
+            del candidates[key]
+            dropped += 1
+    return dropped
+
+
 def seed_missing_wardrobe(
     index: dict[str, dict[str, Any]], *, dry_run: bool, include_catalog: bool = True
 ) -> dict[str, int]:
@@ -720,7 +840,12 @@ def seed_missing_wardrobe(
     user_fragrances rows are candidates (the global_fragrances catalog -- which
     holds entries no user owns -- is skipped). Default True keeps the original
     cache-population behavior."""
-    dsn = os.environ["DATABASE_URL"]
+    # Enumerate the APP wardrobe (the phone's DB), not whatever DATABASE_URL was
+    # injected -- under `railway run` that is the engine cache's STALE wardrobe
+    # copy, so seeding off it would chase the wrong missing-rows set. Scraped
+    # coverage is still decided by the engine cache (_all_records reads the engine
+    # via DATABASE_URL); only the wardrobe enumeration moves to the app DB.
+    dsn = _wardrobe_dsn()
     scraped_keys = {
         _norm_key(str(r.get("house") or ""), str(r.get("name") or ""))
         for r in _all_records()
@@ -747,6 +872,20 @@ def seed_missing_wardrobe(
         job_key = api._identity_job_key(selected)
         if job_key:
             candidates.setdefault(job_key, (brand, name))
+
+    # Drop rows whose IDENTITY JOB already reached a terminal state (see
+    # _drop_terminal_jobs): a `completed`/`ignored` job is a guaranteed
+    # enqueue_job_state no-op, so re-seeding them is the churn that reports them
+    # "missing" forever. Only genuinely unscraped rows reach the queue.
+    terminal_skipped = 0
+    if candidates:
+        states = db.get_jobs_by_keys(list(candidates))
+        terminal_skipped = _drop_terminal_jobs(candidates, states)
+    if terminal_skipped:
+        print(
+            f"seed: {terminal_skipped} wardrobe row(s) already scraped (identity job "
+            "completed/ignored under a canonical name) -- not re-enqueued"
+        )
     print(f"seed: {len(candidates)} wardrobe fragrances missing from engine cache")
     for job_key, (brand, name) in list(candidates.items())[:8]:
         print(f"  [seed] {brand} | {name}  (job_key={job_key})")
