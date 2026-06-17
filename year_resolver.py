@@ -23,6 +23,16 @@ _RELEASE_RE = re.compile(
     r"(?:in|on|during)\s+(?P<year>(?:17|18|19|20)\d{2})\b"
 )
 _COPYRIGHT_RE = re.compile(r"(?i)\b(?:copyright|©|updated|published|posted)\b")
+# Authoritative "no launch year exists" statement. A retailer omitting a date
+# proves nothing, but Parfumo/Fragrantica explicitly printing "The release year
+# is unknown" is positive evidence that no launch year is published anywhere.
+_YEAR_UNKNOWN_RE = re.compile(
+    r"\b(?:release|launch)\s+year\s+is\s+unknown\b"
+    r"|\byear\s+of\s+(?:release|launch)\s+is\s+unknown\b",
+    re.IGNORECASE,
+)
+# Canonical fragrance databases whose explicit "unknown" we trust as a negative.
+_AUTHORITATIVE_YEAR_DOMAINS = ("parfumo.com", "fragrantica.com")
 
 
 @dataclass(frozen=True)
@@ -142,6 +152,91 @@ def choose_year(evidence: Iterable[YearEvidence]) -> dict[str, Any] | None:
     }
 
 
+def _row_url(row: dict[str, Any]) -> str:
+    return str(row.get("url_raw") or row.get("url") or row.get("link") or "").strip()
+
+
+def _row_snippet(row: dict[str, Any]) -> str:
+    return str(row.get("snippet") or row.get("description") or row.get("desc") or "").strip()
+
+
+def _tokens(text: Any) -> set[str]:
+    return set(_normal(text).split())
+
+
+def _all_tokens_present(text: str, *parts: str) -> bool:
+    """True when every token of each part appears somewhere in ``text`` (any
+    order). Unlike :func:`_exact_name_in` this tolerates an interleaved brand —
+    Parfumo/Fragrantica list "Ramz Lattafa Gold" for a "Lattafa / Ramz Gold"
+    query — which is safe for the negative "year unknown" signal because no year
+    is asserted; a sibling ("Ramz Silver") still fails on the missing token."""
+    haystack = _tokens(text)
+    needed: set[str] = set()
+    for part in parts:
+        needed |= _tokens(part)
+    return bool(needed) and needed <= haystack
+
+
+def _is_authoritative_domain(domain: str) -> bool:
+    return any(
+        domain == d or domain.endswith("." + d) for d in _AUTHORITATIVE_YEAR_DOMAINS
+    )
+
+
+def extract_year_unknown_signal(
+    rows: Iterable[dict[str, Any]], brand: str, name: str
+) -> dict[str, Any] | None:
+    """Authoritative evidence that this fragrance's launch year is genuinely
+    unpublished, or ``None``.
+
+    Distinguishes "the resolver failed to find a year" from "no launch year
+    exists" — the latter lets the worker mark the gap source-unsuppliable and
+    stop re-billing Decodo for an undated fragrance forever. Requires an
+    explicit "release year is unknown" statement on a canonical fragrance DB
+    (Parfumo/Fragrantica) whose result is actually about the requested perfume.
+    """
+    matches: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        url = _row_url(row)
+        domain = _domain(url, str(row.get("domain") or ""))
+        if not _is_authoritative_domain(domain):
+            continue
+        snippet = _row_snippet(row)
+        if not _YEAR_UNKNOWN_RE.search(snippet):
+            continue
+        title = str(row.get("title") or "")
+        # The result must be about the requested fragrance, not a sibling. Use a
+        # token-subset (name + brand) match so an interleaved brand spelling
+        # ("Ramz Lattafa Gold" for "Lattafa / Ramz Gold") still binds.
+        if not _all_tokens_present(f"{title} {snippet}", name, brand):
+            continue
+        if domain in seen:
+            continue
+        seen.add(domain)
+        matches.append((domain, snippet, url))
+    if not matches:
+        return None
+    return {
+        "year": None,
+        "unresolvable": True,
+        "year_meta": {
+            "confidence": 90,
+            "source": "decodo_serp_authoritative_unknown",
+            "domains": sorted({d for d, _, _ in matches}),
+            "evidence_count": len(matches),
+            "evidence": [
+                {"url": u, "domain": d, "sentence": s} for d, s, u in matches[:4]
+            ],
+            "resolved_at": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        },
+    }
+
+
 def _payload_rows(client: Any, payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for entry in client._search_entries(payload):
@@ -178,8 +273,11 @@ def resolve_year_decodo(
         return None
     query = f'"{brand} {name}" release date'
     evidence: list[YearEvidence] = []
+    all_rows: list[dict[str, Any]] = []
     try:
-        evidence.extend(extract_year_evidence(_payload_rows(client, client._post_google(query, timeout)), brand, name))
+        google_rows = _payload_rows(client, client._post_google(query, timeout))
+        all_rows.extend(google_rows)
+        evidence.extend(extract_year_evidence(google_rows, brand, name))
     except Exception as exc:
         (logger or client._log_request_failure)("year Google SERP", exc)
     google_choice = choose_year(evidence)
@@ -187,7 +285,16 @@ def resolve_year_decodo(
     if len(google_domains) >= 2:
         return google_choice
     try:
-        evidence.extend(extract_year_evidence(_payload_rows(client, client._post_bing(query, timeout)), brand, name))
+        bing_rows = _payload_rows(client, client._post_bing(query, timeout))
+        all_rows.extend(bing_rows)
+        evidence.extend(extract_year_evidence(bing_rows, brand, name))
     except Exception as exc:
         (logger or client._log_request_failure)("year Bing SERP", exc)
-    return choose_year(evidence)
+    resolved = choose_year(evidence)
+    if resolved:
+        return resolved
+    # No explicit launch year anywhere. Before giving up, check whether a
+    # canonical fragrance DB explicitly says the year is unknown — that turns a
+    # silent miss into a durable "source-unsuppliable" fact the worker can stop
+    # re-billing Decodo for.
+    return extract_year_unknown_signal(all_rows, brand, name)
