@@ -499,10 +499,15 @@ class SemanticScentEngine:
         return rows
 
     @staticmethod
-    def _retry_fetch(page, query, site_filter, attempts=3, deadline=None):
-        """Retry only on fetch/parse failures (None). A SERP that loaded fine
-        with zero results is a real answer -- retrying it just burns the job's
-        time budget and looks like a hang from the worker dashboard."""
+    def _retry_fetch(page, query, site_filter, attempts=1, deadline=None):
+        """Fetch a SERP, optionally retrying on fetch/parse failures (None).
+
+        Default is a single attempt: each retry re-issues a billed/bandwidth
+        fetch, and across a batch those retries were a primary driver of the
+        runaway proxy spend. A SERP that loaded fine with zero results is a real
+        answer -- retrying it just burns budget and looks like a hang from the
+        worker dashboard. Callers that genuinely need resilience on a flaky leg
+        can still pass a higher ``attempts``."""
         for attempt in range(attempts):
             timeout = None
             if deadline is not None:

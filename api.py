@@ -191,6 +191,18 @@ _DETAIL_FETCH_QUEUE_TIMEOUT = max(
 _LIVE_SEARCH_SEMAPHORE = threading.BoundedSemaphore(_LIVE_SEARCH_MAX_CONCURRENT)
 _DETAIL_FETCH_SEMAPHORE = threading.BoundedSemaphore(_DETAIL_FETCH_MAX_CONCURRENT)
 
+# Default churn cap for the /api/enrichment/heal sweep. The offline worker
+# already self-bounds at ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED (default 8), but the
+# HTTP endpoint previously left max_requested_count unset (None => unbounded), so
+# any *other* caller -- a manual heal script, an ad-hoc drain -- could requeue an
+# un-fillable row on every sweep forever, each requeue costing a billed re-fetch.
+# Default the cap here so the endpoint is safe regardless of caller; an explicit
+# request value still overrides it (pass a large number for a deliberate deep
+# sweep). Mirrors the worker constant name so both tiers cap identically.
+_HEAL_SWEEP_DEFAULT_MAX_REQUESTED = max(
+    1, _env_int("ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED", 8)
+)
+
 
 _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
 _DERIVED_METRICS_LOCK_GUARD = threading.Lock()
@@ -2303,6 +2315,36 @@ def search(
         "query": query,
         "results": [_search_result_to_dict(item) for item in results],
         "diagnostics": diagnostics,
+    }
+
+
+@app.get("/api/fragrances/image-search")
+def image_search(
+    q: str = Query(..., min_length=1, description="Bottle-image search query"),
+    limit: int = Query(12, ge=1, le=20, description="Max image candidates to return"),
+) -> dict[str, Any]:
+    """Decodo-backed bottle-image candidate search.
+
+    1:1 replacement for the monorepo's legacy Serper ``/images`` call (see
+    huge_monorepo serperService.ts ``searchEngineImageCandidates``). Returns
+    candidates already normalized to the camelCase shape the app's scorer reads
+    (``imageUrl``/``title``/``source``/``imageWidth``/``imageHeight``, plus
+    ``thumbnailUrl``/``link``/``position``/``source_provider`` which the app
+    drops). The billed Decodo call reserves against ``_DecodoProxyBudget`` inside
+    ``_post_request``; if the daily cap is tripped (or the provider is disabled),
+    ``search_image_candidates`` degrades to ``[]`` rather than raising, so this
+    route returns an empty candidate list instead of a 5xx and the app's pipeline
+    soft-fails to its cache/placeholder path exactly as it does for Serper.
+    """
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
+
+    candidates = engine.DecodoScraperClient.search_image_candidates(query, max_results=limit)
+    return {
+        "query": query,
+        "results": candidates,
+        "diagnostics": {"count": len(candidates), "provider": engine.DecodoScraperClient.PROVIDER_NAME},
     }
 
 
@@ -4988,7 +5030,11 @@ class HealSweepRequest(BaseModel):
     fields: list[str] | None = None
     # Skip rows whose durable job has already been requested this many times --
     # churn protection for fragrances that genuinely lack a fact upstream.
-    max_requested_count: int | None = None
+    # Defaults to the worker's cap (ENRICHMENT_HEAL_SWEEP_MAX_REQUESTED, default
+    # 8) instead of None so the sweep is bounded for EVERY caller, not just the
+    # worker that happened to pass the value. Pass a large explicit value to
+    # force a deliberate deep sweep.
+    max_requested_count: int | None = _HEAL_SWEEP_DEFAULT_MAX_REQUESTED
 
 
 class RecomputeMetricsRequest(BaseModel):
