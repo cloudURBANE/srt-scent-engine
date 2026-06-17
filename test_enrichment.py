@@ -2994,6 +2994,92 @@ def test_heal_offline_exact_match_contract() -> None:
     )
 
 
+def test_heal_offline_number_norm_contract() -> None:
+    """Numbered fragrances are spelled inconsistently across sources ("No 22" on
+    the engine vs "N22"/"N°22" in a wardrobe row). The number-norm bridge collapses
+    every no/n/n°/number-<digits> spelling to one identity so the row inherits the
+    engine year, WITHOUT ever merging two genuinely different fragrances (the brand
+    stays in the key, suffix flankers stay distinct, bare trailing digits untouched)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import heal_offline as heal
+
+    # All number-word spellings of the SAME number collapse to one bridging key...
+    bridged = heal._number_norm_key("Chanel", "Les Exclusifs De Chanel N22")
+    check(
+        "heal_offline number: 'N22' bridges to the 'No 22' identity",
+        bridged == heal._norm_key("Chanel", "Les Exclusifs De Chanel No 22"),
+        detail=bridged,
+    )
+    canon22 = heal._norm_key("Chanel", "No 22")  # the canonical spelling's plain norm
+    check(
+        "heal_offline number: every variant spelling bridges to canonical 'No 22'",
+        heal._number_norm_key("Chanel", "N°22") == canon22
+        and heal._number_norm_key("Chanel", "Number 22") == canon22
+        and heal._number_norm_key("Chanel", "N22") == canon22,
+    )
+    # The already-canonical "No 22" needs no DISTINCT bridge key, so it returns ""
+    # (it matches variants directly through its plain norm == canon22 instead).
+    check(
+        "heal_offline number: already-canonical 'No 22' yields no extra bridge key",
+        heal._number_norm_key("Chanel", "No 22") == ""
+        and heal._norm_key("Chanel", "No 22") == canon22,
+    )
+    # ...and a name with NO number token yields "" (never a spurious bridge key).
+    check(
+        "heal_offline number: non-numbered name has no bridge key",
+        heal._number_norm_key("Dior", "Sauvage") == "",
+    )
+    # Distinct numbers never collide (bridge keys of variant spellings differ), and
+    # a bare trailing number ("212") is left alone so it can't merge with "No 212".
+    check(
+        "heal_offline number: distinct numbers stay distinct",
+        heal._number_norm_key("Chanel", "N5") != heal._number_norm_key("Chanel", "N22"),
+    )
+    check(
+        "heal_offline number: bare '212' is not rewritten into a number word",
+        heal._number_canonical("212 Men") == "212 Men"
+        and heal._number_canonical("No 212") == "no212",
+    )
+    # A suffix flanker stays a distinct identity (no over-merge of base vs flanker).
+    check(
+        "heal_offline number: 'No 5' base != 'No 5 Parfum' flanker",
+        heal._number_norm_key("Chanel", "No 5")
+        != heal._norm_key("Chanel", "No 5 Parfum"),
+    )
+
+    # END-TO-END: an engine record folded as "No 22" is reachable from the wardrobe
+    # row's "N22" number key and projects its year/gender (gap-fill, no downgrade).
+    index: dict[str, dict] = {}
+    heal._fold_record(
+        index,
+        {
+            "house": "Chanel",
+            "name": "Les Exclusifs De Chanel No 22",
+            "year": "2007",
+            "gender": "Feminine",
+            "fg_raw": {},
+            "derived_metrics": None,
+            "image_url": None,
+        },
+    )
+    ward_brand, ward_name = "Chanel", "Les Exclusifs De Chanel N22"
+    number_entry = index.get(heal._number_norm_key(ward_brand, ward_name))
+    check(
+        "heal_offline number: 'N22' row finds the 'No 22' engine entry",
+        number_entry is not None and number_entry.get("year") == "2007",
+    )
+    payload = {"brand": ward_brand, "name": ward_name, "year": "", "gender": ""}
+    _f, _c, _a, _w, y_filled, g_filled, _i = heal.project_engine_facts(payload, number_entry or {})
+    check(
+        "heal_offline number: 'N22' inherits year 2007 + gender from 'No 22'",
+        y_filled is True
+        and g_filled is True
+        and payload["year"] == "2007"
+        and payload["gender"] == "Feminine",
+        detail=str(payload),
+    )
+
+
 def test_heal_offline_core_match_contract() -> None:
     """The gender-label-stripped core match lets an abbreviated wardrobe name
     inherit its canonical engine record ("Versace Dylan Blue" -> the record

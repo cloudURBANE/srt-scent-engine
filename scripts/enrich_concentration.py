@@ -75,6 +75,94 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+# Concentration labels that are pure strength markers and never themselves a
+# distinct product name -- safe to read straight off a canonical product title
+# ("Ramz Gold Eau de Parfum by Lattafa"). Flanker-prone labels (Elixir, Extrait,
+# Intense, ...) are intentionally excluded: "Sauvage Elixir" is a different
+# fragrance from "Sauvage", so a title-only read of those must not bind.
+_PURE_TITLE_CONC_LABELS = {
+    "EDP (Eau de Parfum)",
+    "EDT (Eau de Toilette)",
+    "EDC (Cologne)",
+    "Eau Fraiche",
+    "Parfum (Profumo)",
+}
+_TITLE_CONNECTOR_RE = re.compile(
+    r"(?i)\b(eau|de|du|des|spray|ml|oz|the|by|for|and|new|vintage|edp|edt|edc)\b"
+)
+
+
+def _concentration_from_product_title(title: str, brand: str, name: str) -> str | None:
+    """Extract a concentration ENGINE LABEL from a canonical product-page title.
+
+    Basenotes/Fragrantica title their product pages "<name> <concentration> by
+    <brand>" -- an authoritative statement the SERP-vote consensus can dilute into
+    noise (the Lattafa Ramz Gold case: Basenotes says "Eau de Parfum" outright, yet
+    the vote split EDT/Parfum/EDP). This reads it back precisely:
+
+      * every distinctive name token must appear in the title (exact product, not a
+        sibling), and
+      * after stripping the query/brand tokens and the matched concentration phrase
+        nothing distinctive may remain -- so a flanker ("...Intense Eau de Parfum",
+        "Sauvage Elixir ...") is rejected rather than mis-bound.
+
+    Returns the engine label (e.g. "EDP (Eau de Parfum)") or None. Pure helper --
+    no network -- so it is unit-testable in isolation."""
+    from concentration_grabber import SemanticScentEngine as SSE
+
+    norm = SSE._normalize(title or "").lower()
+    if not norm:
+        return None
+    name_tokens = [t for t in re.findall(r"[a-z0-9]+", (name or "").lower()) if len(t) > 1]
+    if not name_tokens or not all(t in norm for t in name_tokens):
+        return None
+    head = re.split(r"\bby\b", norm, maxsplit=1)[0]
+    modifier = SSE._strip_query_brand(SSE._strip_junk(head), f"{brand} {name}", brand)
+    conc = SSE._detect_concentration_in(modifier)
+    if conc not in _PURE_TITLE_CONC_LABELS:
+        return None
+    residual = re.sub(SSE.TAXONOMY[conc], " ", modifier)
+    residual = _TITLE_CONNECTOR_RE.sub(" ", residual)
+    if [t for t in re.findall(r"[a-z]+", residual) if len(t) >= 3]:
+        return None
+    return conc
+
+
+def _basenotes_title_concentration(brand: str, name: str) -> dict | None:
+    """Authoritative concentration off the Basenotes product title (Decodo SERP).
+
+    High-precision tier: fetches Basenotes results for the fragrance and reads the
+    concentration straight off the canonical product title via
+    _concentration_from_product_title. No-ops (returns None) when Decodo is not
+    configured, so an offline/local run simply falls through to the SERP vote."""
+    try:
+        from concentration_grabber import SemanticScentEngine as SSE
+    except Exception:
+        return None
+    try:
+        rows = SSE._decodo_serp_rows(f"{brand} {name}".strip(), "site:basenotes.com")
+    except Exception:
+        return None
+    for row in (rows or [])[:6]:
+        if "basenotes" not in str(row.get("domain", "")).lower():
+            continue
+        conc = _concentration_from_product_title(row.get("title", ""), brand, name)
+        if not conc:
+            continue
+        scentcast = to_scentcast_concentration(conc)
+        if scentcast and scentcast != "Unknown":
+            return {
+                "concentration": scentcast,
+                "concentration_meta": {
+                    "confidence": 92,
+                    "source": "basenotes_product_title",
+                    "resolved_at": _now_iso(),
+                    "engine_label": conc,
+                },
+            }
+    return None
+
+
 def resolve_concentration(brand: str, name: str, use_browser: bool = True) -> dict | None:
     """
     Run Tier-1 (lexical, instant) then optionally Tier-2 (SERP, ~58s).
@@ -144,6 +232,15 @@ def resolve_concentration(brand: str, name: str, use_browser: bool = True) -> di
                     "engine_label": pillar,
                 },
             }
+
+    # Tier 1.5 — authoritative Basenotes product title (high precision, off the
+    # canonical "<name> <concentration> by <brand>" page title via Decodo SERP).
+    # Placed before the noisy multi-source vote so a fragrance whose source page
+    # states the concentration outright (Lattafa Ramz Gold -> "Eau de Parfum") is
+    # resolved directly instead of being out-voted. No-ops without Decodo.
+    bn_title = _basenotes_title_concentration(brand, name)
+    if bn_title:
+        return bn_title
 
     if not use_browser:
         return None

@@ -92,3 +92,39 @@ def test_name_explicit_provenance():
     assert res["concentration_meta"]["source"] == "name_explicit"
     assert res["concentration_meta"]["confidence"] == 100
     assert res["concentration_meta"]["engine_label"] == "Parfum (Profumo)"
+
+
+# --- Basenotes product-title concentration tier (authoritative, off the canonical
+#     "<name> <concentration> by <brand>" page title). Pure helper -- no network.
+@pytest.mark.parametrize(
+    "title,brand,name,expected",
+    [
+        # The Lattafa Ramz Gold case: the SERP vote split, but the Basenotes title
+        # states it outright.
+        ("Ramz Gold Eau de Parfum by Lattafa", "Lattafa", "Ramz Gold", "EDP (Eau de Parfum)"),
+        ("Bleu de Chanel Parfum by Chanel", "Chanel", "Bleu de Chanel", "Parfum (Profumo)"),
+        ("No 22 Eau de Toilette by Chanel", "Chanel", "No 22", "EDT (Eau de Toilette)"),
+        # Size/format noise next to the concentration is tolerated.
+        ("Ramz Gold Eau de Parfum 100ml by Lattafa", "Lattafa", "Ramz Gold", "EDP (Eau de Parfum)"),
+    ],
+)
+def test_basenotes_title_extracts_pure_concentration(title, brand, name, expected):
+    assert ec._concentration_from_product_title(title, brand, name) == expected
+
+
+@pytest.mark.parametrize(
+    "title,brand,name",
+    [
+        # Flanker: a distinctive leftover token ("Elixir") means the title is a
+        # DIFFERENT product, so the title read must refuse to bind.
+        ("Sauvage Elixir Eau de Parfum by Dior", "Dior", "Sauvage"),
+        # Wrong product (a name token is absent from the title).
+        ("Ramz Silver Eau de Parfum by Lattafa", "Lattafa", "Ramz Gold"),
+        # Intense is a flanker-prone label -> excluded from the pure-title set.
+        ("Stronger With You Intense by Armani", "Armani", "Stronger With You"),
+        # No concentration stated at all -> never a guess.
+        ("Sauvage by Dior", "Dior", "Sauvage"),
+    ],
+)
+def test_basenotes_title_rejects_flankers_and_silence(title, brand, name):
+    assert ec._concentration_from_product_title(title, brand, name) is None
