@@ -54,6 +54,38 @@ _DECODO_SEARCH_PAYLOAD = {
 }
 
 
+# Regression fixture for the v2/scrape envelope drift that PR #71 fixed: Decodo
+# began wrapping each results[] item in a dict that carries the SERP *request*
+# URL at the top level (results[].url) alongside the nested content/results
+# container holding the real `organic` array. That top-level `url` is an
+# _ENTRY_FIELD_KEYS member, so the pre-fix _looks_like_entry mistook the wrapper
+# for a leaf result and short-circuited _collect_entries before it ever reached
+# `organic` -- every cold Decodo discovery returned zero Fragrantica URLs and
+# uncached fragrances silently collapsed to Basenotes-only. This drifted shape is
+# only exercised by a network/token-gated live canary; capturing it offline turns
+# the next such drift into a CI failure instead of a silent prod degradation.
+_DECODO_SEARCH_PAYLOAD_WRAPPED = {
+    "results": [
+        {
+            # The wrapper's own SERP request URL -- the field that fooled the walk.
+            "url": "https://www.google.com/search?q=xerjoff+naxos+site:fragrantica.com/perfume",
+            "content": {
+                "results": {
+                    "parse_status_code": 12000,
+                    "results": {
+                        "organic": [
+                            {"url": "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html"},
+                            {"link": "https://example.com/not-fragrance"},
+                            {"link": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html?utm=1"},
+                        ]
+                    },
+                }
+            },
+        }
+    ]
+}
+
+
 _DECODO_IMAGE_PAYLOAD = {
     "results": [
         {
@@ -168,6 +200,38 @@ def test_decodo_scraper_search_payload_and_parsing() -> None:
         "Decodo discovered rows carry Decodo resolver label",
         any(row.resolver_source == "decodo_fragrantica_search" for row in rows),
         str([row.resolver_source for row in rows]),
+    )
+
+
+def test_decodo_envelope_wrapper_does_not_starve_url_discovery() -> None:
+    """Regression gate for PR #71: the v2 envelope wrapper carries a top-level
+    request `url`, but URL discovery must still descend into the nested `organic`
+    array. Pre-fix this returned [] (cold queries -> Basenotes-only)."""
+    print("Decodo envelope-wrapper regression checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    try:
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            del url, json, headers, timeout, kwargs
+            return _FakeDecodoResponse(_DECODO_SEARCH_PAYLOAD_WRAPPED)
+
+        engine.requests.post = fake_post
+        urls = engine.DecodoScraperClient.search_fragrantica_urls("xerjoff naxos")
+    finally:
+        engine.requests.post = old_post
+        _restore_env(saved)
+
+    check(
+        "Wrapper envelope still yields Fragrantica organic URLs (not starved)",
+        urls == [
+            "https://www.fragrantica.com/perfume/Xerjoff/XJ-1861-Naxos-30529.html",
+            "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html",
+        ],
+        str(urls),
     )
 
 
@@ -403,6 +467,7 @@ def test_decodo_designer_and_brand_discovery() -> None:
 
 def main() -> int:
     test_decodo_scraper_search_payload_and_parsing()
+    test_decodo_envelope_wrapper_does_not_starve_url_discovery()
     test_decodo_scraper_image_payload_and_mapping()
     test_decodo_username_password_auth_fallback()
     test_decodo_auth_token_alias_and_casing()
