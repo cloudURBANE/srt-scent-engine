@@ -2726,7 +2726,17 @@ class QueryRepair:
         # abandoned client-side still spends a provider credit.
         provider = structured_search_provider()
         if provider is not None:
-            structured_queries = list(dict.fromkeys([query, *anchor_queries[:1]]))[:2]
+            # One billed SERP call per resolve, not two. The full query already
+            # carries the user's identity and Google spell-corrects typos inside
+            # the site-scoped search, so the extra anchor-variant call was mostly
+            # redundant spend; across a batch that second call was half the
+            # google.com proxy bill. Set DECODO_STRUCTURED_QUERY_FANOUT>1 to
+            # re-widen for a deliberate cold-discovery sweep.
+            try:
+                _fanout = max(1, int((os.environ.get("DECODO_STRUCTURED_QUERY_FANOUT") or "1").strip()))
+            except ValueError:
+                _fanout = 1
+            structured_queries = list(dict.fromkeys([query, *anchor_queries]))[:_fanout]
             for structured_query in structured_queries:
                 if deadline.remaining(QueryRepair.STRUCTURED_MIN_BUDGET) < QueryRepair.STRUCTURED_MIN_BUDGET:
                     break
@@ -3345,6 +3355,79 @@ class SerperClient:
         return urls
 
 
+class _DecodoProxyBudget:
+    """Hard daily ceiling on *billed* Decodo egress -- the kill-switch against a
+    runaway enrichment/heal/drain batch.
+
+    Every billed POST (SERP discovery via ``_post_request`` and the bandwidth-
+    heavy ``universal`` full-page render) is counted here first. Once the day's
+    cap is hit, further calls are refused *before* the network request, so a
+    misbehaving loop cannot keep spending the proxy bill. The counter rolls over
+    at UTC midnight. The cap is configurable via ``DECODO_DAILY_REQUEST_CAP``;
+    set it to ``0`` (or negative) to disable the guard entirely (unlimited).
+
+    Note: this is a coarse single-process daily cap, intended purely as a money
+    backstop, not a precise rate limiter. The interactive search path stays well
+    under the default cap; only background batches approach it.
+    """
+
+    _ENV_CAP = "DECODO_DAILY_REQUEST_CAP"
+    # ~80 billed calls is a normal day; a legitimate heal batch is a few hundred.
+    # 2500 leaves generous headroom for real work while hard-stopping the kind of
+    # 14K-request fan-out that produced the $15/day spike.
+    _DEFAULT_CAP = 2500
+    _lock = threading.Lock()
+    _day: int | None = None  # UTC day index the counts belong to
+    _counts: dict[str, int] = {}
+    _logged_trip = False
+
+    @classmethod
+    def _cap(cls) -> int:
+        raw = (os.environ.get(cls._ENV_CAP) or "").strip()
+        if not raw:
+            return cls._DEFAULT_CAP
+        try:
+            return int(raw)
+        except ValueError:
+            return cls._DEFAULT_CAP
+
+    @classmethod
+    def reserve(cls, kind: str) -> bool:
+        """Count one billed call and report whether it is within the cap.
+
+        Returns ``True`` if the caller may proceed, ``False`` if the daily cap is
+        already reached (in which case the caller must NOT issue the request).
+        """
+        cap = cls._cap()
+        with cls._lock:
+            day = int(time.time() // 86400)
+            if cls._day != day:
+                cls._day = day
+                cls._counts = {}
+                cls._logged_trip = False
+            if cap > 0 and sum(cls._counts.values()) >= cap:
+                if not cls._logged_trip:
+                    cls._logged_trip = True
+                    print(
+                        f"{R}[SYS] Decodo daily request cap reached "
+                        f"({sum(cls._counts.values())}/{cap}); refusing further billed "
+                        f"calls until UTC rollover. Breakdown: {dict(cls._counts)}{Z}"
+                    )
+                return False
+            cls._counts[kind] = cls._counts.get(kind, 0) + 1
+            return True
+
+    @classmethod
+    def snapshot(cls) -> dict[str, Any]:
+        with cls._lock:
+            return {
+                "cap": cls._cap(),
+                "day": cls._day,
+                "counts": dict(cls._counts),
+                "total": sum(cls._counts.values()),
+            }
+
+
 class DecodoScraperClient:
     """Structured Google SERP discovery via Decodo Web Scraping API."""
 
@@ -3592,6 +3675,10 @@ class DecodoScraperClient:
         applied to connect and read separately => up to ~2x the budget)."""
         if not cls.enabled():
             raise RuntimeError("Decodo Scraper API is not enabled")
+        if not _DecodoProxyBudget.reserve("serp"):
+            # Daily kill-switch tripped: refuse the billed call. Callers already
+            # degrade to [] on a RuntimeError, exactly as if the provider failed.
+            raise RuntimeError("Decodo daily request cap reached")
         res = requests.post(
             cls.ENDPOINT,
             json=payload,
@@ -3694,6 +3781,11 @@ class DecodoScraperClient:
             return None
         budget = cls._viable_budget(timeout, deadline, max_timeout=cls.UNIVERSAL_MAX_TIMEOUT)
         if budget <= 0:
+            return None
+        if not _DecodoProxyBudget.reserve("universal"):
+            # Daily kill-switch tripped: the universal render is the bandwidth-
+            # heavy (and most expensive) call, so refusing it is the main money
+            # backstop. Degrade to None exactly as on any fetch failure.
             return None
         payload: dict[str, Any] = {"target": "universal", "url": url}
         headless = cls._universal_headless()
