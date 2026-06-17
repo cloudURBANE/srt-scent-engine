@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
-"""Run the plain-script test suite in parallel subprocesses.
+"""Run the project test suite in parallel subprocesses.
 
-Each test file is a standalone script that manages its own env scrubbing and
-monkeypatch restoration, and all disk writes happen inside per-test temp
-directories -- so the files are process-isolated and safe to run concurrently.
-The wall-clock win comes from overlapping the ~3-4s api/engine import that
-every file pays; sequentially that import tax dominates the suite.
+Test files are **auto-discovered** (every ``test_*.py`` beside this script) so a
+new test file is picked up automatically -- there is no hand-maintained list to
+forget to update, which is how files like ``test_auto_requeue_incomplete.py``
+previously sat unrun for weeks.
+
+Two test styles coexist in this repo and each is invoked the way it expects:
+
+* **script-style** -- a standalone script with an ``if __name__ == "__main__"``
+  block that runs its own checks. Invoked as ``python test_x.py``.
+* **pytest-style** -- bare ``test_*`` functions and no ``__main__`` block.
+  Invoked as ``python -m pytest test_x.py``. Running such a file as a plain
+  script defines the functions and exits 0 *without running anything*, so it
+  would silently "pass" while testing nothing -- routing it through pytest
+  closes that vacuous-pass trap.
+
+Each file is process-isolated (its own env scrubbing, monkeypatch restoration,
+and per-test temp dirs), so the files are safe to run concurrently. The
+wall-clock win comes from overlapping the ~3-4s api/engine import that every
+file pays; sequentially that import tax dominates the suite.
 
 Usage:
     python run_tests.py            # run everything in parallel
@@ -18,24 +32,41 @@ import sys
 import time
 from pathlib import Path
 
-TESTS = (
-    "test_decodo_scraper_api.py",
-    "test_cold_path_decodo_recovery.py",
-    "test_decodo_serp_proxy.py",
-    "test_parfinity.py",
-    "test_search_relevance.py",
-    "test_enrichment.py",
-)
+
+def discover(root: Path) -> list[Path]:
+    """Every ``test_*.py`` beside this script, in a stable order."""
+    return sorted(p for p in root.glob("test_*.py") if p.is_file())
+
+
+def is_script_style(path: Path) -> bool:
+    """True if the file runs its own checks under ``if __name__ == "__main__"``.
+
+    pytest-style files have no such guard; they must be driven by pytest or
+    they no-op into a false pass.
+    """
+    try:
+        return "__main__" in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # Unreadable: fall back to direct invocation so the failure is visible.
+        return True
+
+
+def command_for(path: Path) -> list[str]:
+    """The subprocess argv that actually exercises ``path``'s assertions."""
+    if is_script_style(path):
+        return [sys.executable, str(path)]
+    return [sys.executable, "-m", "pytest", str(path), "-q"]
 
 
 def main(argv: list[str]) -> int:
     serial = "--serial" in argv
     root = Path(__file__).resolve().parent
+    tests = discover(root)
     start = time.perf_counter()
 
-    def spawn(name: str) -> subprocess.Popen:
+    def spawn(cmd: list[str]) -> subprocess.Popen:
         return subprocess.Popen(
-            [sys.executable, str(root / name)],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -55,14 +86,15 @@ def main(argv: list[str]) -> int:
             print(out)
 
     if serial:
-        for name in TESTS:
-            collect(name, spawn(name))
+        for path in tests:
+            collect(path.name, spawn(command_for(path)))
     else:
-        for name, proc in [(name, spawn(name)) for name in TESTS]:
+        running = [(path.name, spawn(command_for(path))) for path in tests]
+        for name, proc in running:
             collect(name, proc)
 
     elapsed = time.perf_counter() - start
-    print(f"\n{len(TESTS) - len(failures)}/{len(TESTS)} test files passed in {elapsed:.1f}s")
+    print(f"\n{len(tests) - len(failures)}/{len(tests)} test files passed in {elapsed:.1f}s")
     if failures:
         print("Failed: " + ", ".join(failures))
         return 1
