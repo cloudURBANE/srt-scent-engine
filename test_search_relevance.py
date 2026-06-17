@@ -663,6 +663,112 @@ def test_api_live_search_saturation_uses_cache_fallback() -> None:
     )
 
 
+def test_api_fact_question_answers_from_stored_record() -> None:
+    print("API fact-question answer checks:")
+    old_strong = api._strong_cache_search
+    old_lookup = api.db.lookup_fragrance_record
+    old_record_search = api.db.search_fragrance_records
+    old_recover = api.db.recover_or_enqueue_job
+    old_search_once = api.engine.search_once
+    item = engine.UnifiedFragrance(
+        name="Aventus",
+        brand="Creed",
+        year="2010",
+        frag_url="https://www.fragrantica.com/perfume/Creed/Aventus-9828.html",
+    )
+    record = {
+        "canonical_fg_url": item.frag_url,
+        "bn_url": "",
+        "name": "Aventus",
+        "house": "Creed",
+        "year": 2010,
+        "gender": "Men",
+        "fg_raw": {"concentration": "Eau de Parfum", "raw_identity": {"concentration": "Eau de Parfum"}},
+        "bn_raw": {},
+        "derived_metrics": None,
+        "source_captured_at": "2099-01-01T00:00:00+00:00",
+    }
+    calls: dict[str, object] = {"recovered": False, "strong_query": ""}
+    try:
+        api._strong_cache_search = lambda query, limit, min_score=api._STRONG_CACHE_MIN_SCORE: (
+            calls.update({"strong_query": query}) or ([item], "unit")
+        )
+        api.db.lookup_fragrance_record = lambda canonical_fg_url=None, bn_url=None: record
+        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.recover_or_enqueue_job = lambda **kwargs: calls.update({"recovered": True}) or None
+        api.engine.search_once = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("live search should not run for strong fact-question hit")
+        )
+        response = api.search(q="what concentration is Creed Aventus?")
+    finally:
+        api._strong_cache_search = old_strong
+        api.db.lookup_fragrance_record = old_lookup
+        api.db.search_fragrance_records = old_record_search
+        api.db.recover_or_enqueue_job = old_recover
+        api.engine.search_once = old_search_once
+
+    fact = response.get("fact_query") or {}
+    result_fact = (response.get("results") or [{}])[0].get("requested_fact") or {}
+    check("fact-question strips shell before search", calls["strong_query"] == "Creed Aventus", str(calls))
+    check("fact-question response keeps original query", response.get("query") == "what concentration is Creed Aventus?", str(response))
+    check("fact-question returns extracted search query", response.get("search_query") == "Creed Aventus", str(response))
+    check("fact-question answers concentration from stored record", fact.get("value") == "Eau de Parfum", str(fact))
+    check("result carries requested fact", result_fact.get("status") == "answered" and result_fact.get("field") == "concentration", str(result_fact))
+    check("answered fact does not enqueue recovery", calls["recovered"] is False, str(calls))
+    check("plain 'Year of ...' title is not treated as a fact query", api._parse_fact_query("Year of the Dragon") is None)
+
+
+def test_api_fact_question_recovers_missing_fact() -> None:
+    print("API fact-question recovery checks:")
+    old_strong = api._strong_cache_search
+    old_lookup = api.db.lookup_fragrance_record
+    old_record_search = api.db.search_fragrance_records
+    old_recover = api.db.recover_or_enqueue_job
+    item = engine.UnifiedFragrance(
+        name="Unmapped Test",
+        brand="Creed",
+        year="",
+        frag_url="https://www.fragrantica.com/perfume/Creed/Unmapped-Test-999.html",
+    )
+    record = {
+        "canonical_fg_url": item.frag_url,
+        "bn_url": "",
+        "name": "Unmapped Test",
+        "house": "Creed",
+        "year": None,
+        "gender": "",
+        "fg_raw": {},
+        "bn_raw": {},
+        "derived_metrics": None,
+        "source_captured_at": "2099-01-01T00:00:00+00:00",
+    }
+    calls: dict[str, object] = {}
+    try:
+        api._strong_cache_search = lambda query, limit, min_score=api._STRONG_CACHE_MIN_SCORE: ([item], "unit")
+        api.db.lookup_fragrance_record = lambda canonical_fg_url=None, bn_url=None: record
+        api.db.search_fragrance_records = lambda query, limit=15: []
+
+        def recover(**kwargs):
+            calls.update(kwargs)
+            return {"status": "pending", "requested_count": 2}
+
+        api.db.recover_or_enqueue_job = recover
+        response = api.search(q="what is the fragrance family for Creed Unmapped Test")
+    finally:
+        api._strong_cache_search = old_strong
+        api.db.lookup_fragrance_record = old_lookup
+        api.db.search_fragrance_records = old_record_search
+        api.db.recover_or_enqueue_job = old_recover
+
+    fact = response.get("fact_query") or {}
+    result_fact = (response.get("results") or [{}])[0].get("requested_fact") or {}
+    check("missing fact reports missing", fact.get("status") == "missing" and fact.get("value") is None, str(fact))
+    check("missing fact queues recovery", fact.get("enrichment", {}).get("status") == "pending", str(fact))
+    check("recovery uses user-question priority", calls.get("priority") == 10, str(calls))
+    check("recovery carries original question for traceability", calls.get("query") == "what is the fragrance family for Creed Unmapped Test", str(calls))
+    check("result carries missing requested fact", result_fact.get("field") == "family" and result_fact.get("status") == "missing", str(result_fact))
+
+
 def test_fragrantica_native_search_bypassed_by_default() -> None:
     print("Native Fragrantica search bypass checks:")
     old_get = engine.Http.get
@@ -1826,6 +1932,8 @@ def main() -> int:
     test_api_bn_only_cache_hit_does_not_skip_live_search()
     test_api_identity_cache_rescues_bn_only_precheck()
     test_api_live_search_saturation_uses_cache_fallback()
+    test_api_fact_question_answers_from_stored_record()
+    test_api_fact_question_recovers_missing_fact()
     test_fragrantica_native_search_bypassed_by_default()
     test_pick_launch_year_ignores_house_founding_year()
     test_casamorati_tempio_catalog_identity_score()

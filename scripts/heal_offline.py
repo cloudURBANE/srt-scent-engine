@@ -181,7 +181,13 @@ from psycopg.types.json import Json  # noqa: E402
 import db  # noqa: E402
 import api  # noqa: E402  (reuse _details_from_fragrance_record -- single source of truth)
 from derived_metrics_adapter import build_derived_metrics  # noqa: E402
-from enrichment_facts import derive_families, is_fact_complete, top_accords_from  # noqa: E402
+from enrichment_facts import (  # noqa: E402
+    derive_families,
+    derive_wear_profile,
+    is_fact_complete,
+    primary_season_from_wear_profile,
+    top_accords_from,
+)
 import enrich_concentration as conc  # noqa: E402
 
 # enrich_database_metrics runs an import-time loader that UNCONDITIONALLY clobbers
@@ -692,18 +698,57 @@ def _build_core_index(
     return core_index
 
 
+def _wear_profile_complete(value: Any) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    return bool(
+        primary_season_from_wear_profile(value)
+        or is_fact_complete(value.get("primary_time"), "season")
+    )
+
+
+def _project_wear_facts(payload: dict[str, Any], derived_metrics: dict[str, Any]) -> bool:
+    """Fill missing wardrobe wear/season context from engine metrics.
+
+    Family projection is intentionally conservative, but wear_profile and season
+    are independent derived facts. A row whose family is already set should not
+    stay stuck with missing/default wear context forever.
+    """
+    wear_profile = derive_wear_profile(derived_metrics)
+    if not wear_profile:
+        return False
+
+    changed = False
+    if not _wear_profile_complete(payload.get("wear_profile")):
+        payload["wear_profile"] = wear_profile
+        changed = True
+
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    if not _wear_profile_complete(context.get("wear_profile")):
+        context["wear_profile"] = wear_profile
+        payload["context"] = context
+        changed = True
+
+    primary_season = primary_season_from_wear_profile(wear_profile)
+    if primary_season and not is_fact_complete(payload.get("season"), "season"):
+        payload["season"] = primary_season
+        changed = True
+
+    return changed
+
+
 def project_engine_facts(
     payload: dict[str, Any], entry: dict[str, Any]
-) -> tuple[bool, bool, bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
     """Project one engine-cache entry's facts onto a wardrobe payload, in place.
 
     Returns ``(family_filled, concentration_filled, accords_refreshed,
-    year_filled, gender_filled, image_filled)``. Pure apart from mutating
+    wear_filled, year_filled, gender_filled, image_filled)``. Pure apart from mutating
     ``payload`` -- no DB, so it is unit-testable. ``entry`` is
     ``{"derived_metrics": <blob|None>, "concentration": <str|None>,
     "year": <str|None>, "gender": <str|None>, "image_url": <str|None>}``.
     """
-    fam_filled = conc_filled = acc_refreshed = year_filled = gender_filled = image_filled = False
+    fam_filled = conc_filled = acc_refreshed = wear_filled = year_filled = gender_filled = image_filled = False
     dm = entry.get("derived_metrics")
     if dm is not None:
         # Always re-project the junk-filtered top accords. The scrape leak
@@ -715,8 +760,9 @@ def project_engine_facts(
         if clean and clean != _str_accords(payload.get("accords")):
             payload["accords"] = clean
             acc_refreshed = True
-        # Family + wear projection only when family is still Unknown
-        # (unchanged behavior -- never downgrades an existing family).
+        wear_filled = _project_wear_facts(payload, dm)
+        # Family projection only when family is still Unknown (unchanged
+        # behavior -- never downgrades an existing family).
         if not is_fact_complete(payload.get("family"), "family"):
             before = payload.get("family")
             _apply_derived_facts(payload, dm)
@@ -742,7 +788,7 @@ def project_engine_facts(
     if not _payload_image_url(payload) and image_url:
         payload["image_url"] = image_url
         image_filled = True
-    return fam_filled, conc_filled, acc_refreshed, year_filled, gender_filled, image_filled
+    return fam_filled, conc_filled, acc_refreshed, wear_filled, year_filled, gender_filled, image_filled
 
 
 def fill_core_scalars(
@@ -785,21 +831,21 @@ def heal_wardrobe(
     dsn = _wardrobe_dsn()
     core_index = _build_core_index(index)
     stats = {
-        "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_year": 0, "uf_gender": 0,
-        "uf_image": 0,
-        "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_year": 0, "gf_gender": 0,
-        "gf_image": 0,
+        "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_wear": 0,
+        "uf_year": 0, "uf_gender": 0, "uf_image": 0,
+        "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_wear": 0,
+        "gf_year": 0, "gf_gender": 0, "gf_image": 0,
         "no_match": 0, "core_match": 0,
     }
 
     def _project(
         payload: dict[str, Any], norm: str, brand: str, name: str
-    ) -> tuple[bool, bool, bool, bool, bool, bool]:
-        """Returns (family, concentration, accords, year, gender, image) flags."""
+    ) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
+        """Returns (family, concentration, accords, wear, year, gender, image) flags."""
         entry = index.get(norm)
-        fam = cc = acc = yr = gen = img = False
+        fam = cc = acc = wear = yr = gen = img = False
         if entry is not None:
-            fam, cc, acc, yr, gen, img = project_engine_facts(payload, entry)
+            fam, cc, acc, wear, yr, gen, img = project_engine_facts(payload, entry)
         # If scalar facts are still missing, resolve the abbreviated wardrobe name
         # to its canonical record via the gender-label-stripped core (the "Dylan
         # Blue" -> "Pour Homme Dylan Blue" heal). The wardrobe's own norm is the
@@ -820,7 +866,7 @@ def heal_wardrobe(
                 cc, yr, gen, img = cc or c2, yr or y2, gen or g2, img or i2
         if entry is None and not (cc or yr or gen or img):
             stats["no_match"] += 1
-        return fam, cc, acc, yr, gen, img
+        return fam, cc, acc, wear, yr, gen, img
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         # user_fragrances
@@ -836,20 +882,22 @@ def heal_wardrobe(
             norm = _norm_key(brand_uf, name_uf)
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
+            fam, cc, acc, wear, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
             if fam:
                 stats["uf_family"] += 1
             if cc:
                 stats["uf_conc"] += 1
             if acc:
                 stats["uf_acc"] += 1
+            if wear:
+                stats["uf_wear"] += 1
             if yr:
                 stats["uf_year"] += 1
             if gen:
                 stats["uf_gender"] += 1
             if img:
                 stats["uf_image"] += 1
-            if (fam or cc or acc or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -869,20 +917,22 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen, img = _project(pdata, norm, str(brand), str(name))
+            fam, cc, acc, wear, yr, gen, img = _project(pdata, norm, str(brand), str(name))
             if fam:
                 stats["gf_family"] += 1
             if cc:
                 stats["gf_conc"] += 1
             if acc:
                 stats["gf_acc"] += 1
+            if wear:
+                stats["gf_wear"] += 1
             if yr:
                 stats["gf_year"] += 1
             if gen:
                 stats["gf_gender"] += 1
             if img:
                 stats["gf_image"] += 1
-            if (fam or cc or acc or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -892,10 +942,12 @@ def heal_wardrobe(
             conn.commit()
     print(
         f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
-        f"accords~{stats['uf_acc']} year+{stats['uf_year']} gender+{stats['uf_gender']} "
+        f"accords~{stats['uf_acc']} wear+{stats['uf_wear']} "
+        f"year+{stats['uf_year']} gender+{stats['uf_gender']} "
         f"image+{stats['uf_image']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
-        f"accords~{stats['gf_acc']} year+{stats['gf_year']} gender+{stats['gf_gender']} "
+        f"accords~{stats['gf_acc']} wear+{stats['gf_wear']} "
+        f"year+{stats['gf_year']} gender+{stats['gf_gender']} "
         f"image+{stats['gf_image']}] "
         f"core_match={stats['core_match']} no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
@@ -989,15 +1041,26 @@ def seed_missing_wardrobe(
     # Drop rows whose IDENTITY JOB already reached a terminal state (see
     # _drop_terminal_jobs): a `completed`/`ignored` job is a guaranteed
     # enqueue_job_state no-op, so re-seeding them is the churn that reports them
-    # "missing" forever. Only genuinely unscraped rows reach the queue.
-    terminal_skipped = 0
+    # "missing" forever. Keep the status split visible because "completed"
+    # usually means "scraped under a canonical name", while "ignored" means the
+    # worker deliberately retired it and projection may still have no engine row.
+    terminal_counts = {"completed": 0, "ignored": 0}
     if candidates:
         states = db.get_jobs_by_keys(list(candidates))
-        terminal_skipped = _drop_terminal_jobs(candidates, states)
-    if terminal_skipped:
+        for key, st in states.items():
+            status = st.get("status") or ""
+            if key in candidates and status in terminal_counts:
+                terminal_counts[status] += 1
+        _drop_terminal_jobs(candidates, states)
+    if terminal_counts["completed"]:
         print(
-            f"seed: {terminal_skipped} wardrobe row(s) already scraped (identity job "
-            "completed/ignored under a canonical name) -- not re-enqueued"
+            f"seed: {terminal_counts['completed']} wardrobe row(s) already have "
+            "completed identity jobs (likely scraped under a canonical name) -- not re-enqueued"
+        )
+    if terminal_counts["ignored"]:
+        print(
+            f"seed: {terminal_counts['ignored']} wardrobe row(s) have ignored identity jobs "
+            "(retired/unresolvable; inspect before forcing a retry) -- not re-enqueued"
         )
     print(f"seed: {len(candidates)} wardrobe fragrances missing from engine cache")
     for job_key, (brand, name) in list(candidates.items())[:8]:
