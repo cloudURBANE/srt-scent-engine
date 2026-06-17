@@ -2842,6 +2842,40 @@ def test_heal_offline_exact_match_contract() -> None:
         "heal_offline: flanker not equal to base (Sauvage vs Sauvage Elixir)",
         heal._norm_key("Dior", "Sauvage") != heal._norm_key("Dior", "Sauvage Elixir"),
     )
+    # Some source names embed the house in the fragrance name ("Ramz Lattafa
+    # Gold"), while the wardrobe row keeps the house only in the brand column
+    # ("Lattafa | Ramz Gold"). The offline projector must index that conservative
+    # alias or the scraped engine facts can never reach the wardrobe row.
+    ramz_index: dict[str, dict] = {}
+    heal._fold_record(
+        ramz_index,
+        {
+            "house": "Lattafa",
+            "name": "Ramz Lattafa Gold",
+            "year": "2019",
+            "gender": "Unisex",
+            "fg_raw": {"raw_identity": {"concentration": "Eau de Parfum"}},
+            "derived_metrics": None,
+            "image_url": "https://cdn.example.test/ramz-gold.jpg",
+        },
+    )
+    ramz_entry = ramz_index.get(heal._norm_key("Lattafa", "Ramz Gold"))
+    ramz_payload = {"brand": "Lattafa", "name": "Ramz Gold", "year": "", "concentration": ""}
+    _f0, c0, _a0, y0, _g0, i0 = heal.project_engine_facts(ramz_payload, ramz_entry or {})
+    check(
+        "heal_offline: duplicated house token alias projects Ramz facts",
+        ramz_entry is not None
+        and c0 is True
+        and y0 is True
+        and i0 is True
+        and ramz_payload["year"] == "2019"
+        and ramz_payload["concentration"] == "Eau de Parfum",
+        detail=str(ramz_payload),
+    )
+    check(
+        "heal_offline: brand-token alias is not a broad brand-only key",
+        heal._strip_brand_tokens_from_name("Lattafa", "Lattafa") == "",
+    )
     # Concentration: a stored "Unknown"/empty is treated as ABSENT (so a real
     # value can fill it), while a real value is returned verbatim.
     check(
