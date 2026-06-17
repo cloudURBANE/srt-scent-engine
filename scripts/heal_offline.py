@@ -211,6 +211,52 @@ def _norm_key(brand: str, name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
 
 
+_GENERIC_BRAND_TOKENS = {
+    "perfume", "perfumes", "parfum", "parfums", "fragrance", "fragrances",
+    "beauty", "cosmetics", "industries", "industry", "llc", "ltd", "inc",
+}
+
+
+def _distinctive_brand_tokens(brand: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(brand or "").lower())
+        if len(token) > 1 and token not in _GENERIC_BRAND_TOKENS
+    }
+
+
+def _strip_brand_tokens_from_name(brand: str, name: str) -> str:
+    """Remove duplicated house tokens from a source name.
+
+    Some fallback sources embed the house inside the perfume name, e.g.
+    Parfumo's ``Ramz Lattafa (Gold)`` becomes ``Ramz Lattafa Gold`` while the
+    wardrobe row is ``Lattafa | Ramz Gold``. This strips only distinctive whole
+    brand tokens and refuses to return an empty/unchanged alias, keeping the
+    projection match much narrower than fuzzy search scoring.
+    """
+    kill = _distinctive_brand_tokens(brand)
+    if not kill:
+        return ""
+    kept = [
+        token
+        for token in re.findall(r"[a-z0-9]+", str(name or "").lower())
+        if token not in kill
+    ]
+    if not kept:
+        return ""
+    alias = " ".join(kept)
+    original = " ".join(re.findall(r"[a-z0-9]+", str(name or "").lower()))
+    return alias if alias and alias != original else ""
+
+
+def _identity_keys(brand: str, name: str) -> list[str]:
+    keys = [_norm_key(brand, name)]
+    alias = _strip_brand_tokens_from_name(brand, name)
+    if alias:
+        keys.append(_norm_key(brand, alias))
+    return [key for key in dict.fromkeys(keys) if key]
+
+
 # Gender-label phrases that some Fragrantica pages GLUE onto a name as a LEADING
 # token: the men's "Versace Dylan Blue" is cached as "Pour Homme Dylan Blue".
 # Only a *leading* occurrence is a label artifact -- a TRAILING one ("Eros Pour
@@ -500,10 +546,13 @@ def _fold_record(index: dict[str, dict[str, Any]], record: dict[str, Any]) -> No
     Only fills slots still None, so the *first* source for a given identity wins
     -- callers fold the highest-trust source (the local engine cache) first."""
     brand, name = str(record.get("house") or ""), str(record.get("name") or "")
-    key = _norm_key(brand, name)
-    if not key:
+    keys = _identity_keys(brand, name)
+    if not keys:
         return
+    key = keys[0]
     entry = index.setdefault(key, _new_entry())
+    for alias_key in keys[1:]:
+        index.setdefault(alias_key, entry)
     if entry["derived_metrics"] is None and record.get("derived_metrics") is not None:
         entry["derived_metrics"] = record["derived_metrics"]
     if entry["concentration"] is None:
@@ -540,11 +589,14 @@ def _fold_global_fragrances(index: dict[str, dict[str, Any]]) -> int:
         return 0
     for row in rows:
         brand, name = str(row.get("b") or ""), str(row.get("n") or "")
-        key = _norm_key(brand, name)
-        if not key:
+        keys = _identity_keys(brand, name)
+        if not keys:
             continue
+        key = keys[0]
         pdata = row.get("p") if isinstance(row.get("p"), dict) else {}
         entry = index.setdefault(key, _new_entry())
+        for alias_key in keys[1:]:
+            index.setdefault(alias_key, entry)
         if entry["year"] is None and is_fact_complete(str(pdata.get("year") or ""), "year"):
             entry["year"] = str(pdata.get("year")).strip()
             folded += 1
@@ -907,8 +959,9 @@ def seed_missing_wardrobe(
     # via DATABASE_URL); only the wardrobe enumeration moves to the app DB.
     dsn = _wardrobe_dsn()
     scraped_keys = {
-        _norm_key(str(r.get("house") or ""), str(r.get("name") or ""))
+        key
         for r in _all_records()
+        for key in _identity_keys(str(r.get("house") or ""), str(r.get("name") or ""))
     }
     candidates: dict[str, tuple[str, str]] = {}
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
