@@ -3009,6 +3009,108 @@ def test_heal_offline_core_match_contract() -> None:
     )
 
 
+def test_heal_offline_wardrobe_dsn_dual_db_guard() -> None:
+    """The dual-DB self-correction: when DATABASE_URL is the ENGINE cache (has a
+    fragrance_records table) and a distinct app DSN is configured, wardrobe writes
+    must route to the APP db -- not the engine's stale user_fragrances copy. This
+    is the trap that made every `railway run` drain silently no-op for the phone.
+    No real DB: the engine-cache probe and the .env reader are stubbed."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import heal_offline as heal
+
+    ENGINE = "postgresql://u:p@viaduct.proxy.rlwy.net:1234/railway"
+    APP = "postgresql://u:p@aws-1-x.pooler.supabase.com:5432/postgres"
+
+    def run(*, database_url, env_app, is_engine, wardrobe_override=None):
+        # Reset the per-process caches the resolver memoizes.
+        heal._WARDROBE_DSN_CACHE = None
+        heal._ENGINE_DSN_PROBE.clear()
+        orig_env = dict(os.environ)
+        orig_probe = heal._dsn_is_engine_cache
+        orig_envfile = heal._env_file_database_url
+        try:
+            os.environ["DATABASE_URL"] = database_url
+            os.environ.pop("WARDROBE_DATABASE_URL", None)
+            if wardrobe_override:
+                os.environ["WARDROBE_DATABASE_URL"] = wardrobe_override
+            heal._dsn_is_engine_cache = lambda dsn: is_engine
+            heal._env_file_database_url = lambda: env_app
+            return heal._wardrobe_dsn()
+        finally:
+            heal._dsn_is_engine_cache = orig_probe
+            heal._env_file_database_url = orig_envfile
+            os.environ.clear()
+            os.environ.update(orig_env)
+            heal._WARDROBE_DSN_CACHE = None
+            heal._ENGINE_DSN_PROBE.clear()
+
+    # THE TRAP: railway-injected engine DSN + a distinct app DSN -> route to app.
+    check(
+        "heal_offline dual-db: engine DATABASE_URL routes wardrobe writes to the app DB",
+        run(database_url=ENGINE, env_app=APP, is_engine=True) == APP,
+    )
+    # heal_app_wardrobe / local: DATABASE_URL already IS the app DB -> unchanged,
+    # and the resolver must NOT probe (no redirect when current == app dsn).
+    check(
+        "heal_offline dual-db: app DATABASE_URL is used as-is (no redirect)",
+        run(database_url=APP, env_app=APP, is_engine=False) == APP,
+    )
+    # SAFETY: DATABASE_URL differs from .env but is NOT provably the engine ->
+    # keep DATABASE_URL (never redirect on uncertainty / a probe failure).
+    check(
+        "heal_offline dual-db: non-engine unknown DSN is left untouched",
+        run(database_url="postgresql://u:p@somewhere/other", env_app=APP, is_engine=False)
+        == "postgresql://u:p@somewhere/other",
+    )
+    # Explicit override always wins, even over an engine DATABASE_URL.
+    check(
+        "heal_offline dual-db: WARDROBE_DATABASE_URL override wins",
+        run(database_url=ENGINE, env_app=APP, is_engine=True, wardrobe_override=APP) == APP,
+    )
+
+
+def test_heal_offline_seed_terminal_skip() -> None:
+    """Seed must NOT re-enqueue wardrobe rows whose identity job already reached a
+    terminal state. A `completed` job means the worker scraped it (the engine has
+    the fragrance under a canonical name the exact coverage check misses); an
+    `ignored` job was retired. enqueue_job_state is a no-op on both, so re-seeding
+    them every run is pure churn -- the bug that reported 59 'missing' forever.
+    Rows with no job, or a failed/pending one the queue can still act on, stay."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import heal_offline as heal
+
+    candidates = {
+        "id:versace|dylan blue": ("Versace", "Dylan Blue"),        # completed -> drop
+        "id:lattafa|ramz gold": ("Lattafa", "Ramz Gold"),          # ignored   -> drop
+        "id:creed|irish tweed": ("Creed", "Irish Tweed"),          # failed    -> keep
+        "id:initio|new release": ("Initio", "New Release"),        # pending   -> keep
+        "id:niche|brand new": ("Niche", "Brand New"),              # no job    -> keep
+    }
+    states = {
+        "id:versace|dylan blue": {"status": "completed"},
+        "id:lattafa|ramz gold": {"status": "ignored"},
+        "id:creed|irish tweed": {"status": "failed"},
+        "id:initio|new release": {"status": "pending"},
+        # "id:niche|brand new" absent: never enqueued
+    }
+    dropped = heal._drop_terminal_jobs(candidates, states)
+    check("heal_offline seed: drops exactly the 2 terminal-state jobs", dropped == 2)
+    check(
+        "heal_offline seed: keeps only the queue-actionable rows",
+        set(candidates) == {
+            "id:creed|irish tweed",
+            "id:initio|new release",
+            "id:niche|brand new",
+        },
+    )
+    # No states at all (fresh queue) -> nothing dropped, all rows survive.
+    fresh = {"id:a|b": ("A", "B")}
+    check(
+        "heal_offline seed: empty states drops nothing",
+        heal._drop_terminal_jobs(fresh, {}) == 0 and set(fresh) == {"id:a|b"},
+    )
+
+
 def test_non_perfume_signal() -> None:
     """The non-perfume ingest gate is HIGH-PRECISION: it flags body-care
     products and test junk but must never flag a genuine perfume -- a false
@@ -3080,6 +3182,8 @@ def main() -> int:
     test_non_perfume_signal()
     test_heal_offline_exact_match_contract()
     test_heal_offline_core_match_contract()
+    test_heal_offline_wardrobe_dsn_dual_db_guard()
+    test_heal_offline_seed_terminal_skip()
     test_fragrantica_challenge_and_static_parse()
     test_fragrantica_clearance_session_lifecycle()
     test_mobile_new_device_session_binding()
