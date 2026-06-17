@@ -59,6 +59,7 @@ from enrichment_facts import (
     derive_families,
     derive_wear_profile,
     expand_raw_accords,
+    is_fact_complete,
     missing_facts,
     non_perfume_signal,
     record_source,
@@ -580,6 +581,228 @@ def _search_result_to_dict(item: engine.UnifiedFragrance) -> dict[str, Any]:
         "bn_positive_pct": getattr(item, "bn_positive_pct", -1),
         "bn_vote_count": getattr(item, "bn_vote_count", 0),
     }
+
+
+_FACT_QUERY_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("concentration", ("concentration", "strength")),
+    ("year", ("release year", "launch year", "released", "year")),
+    ("family", ("fragrance family", "scent family", "olfactive family", "family")),
+    ("gender", ("gender", "marketed gender", "target gender")),
+)
+
+
+def _parse_fact_query(query: str) -> dict[str, str] | None:
+    """Extract fact intent from natural questions without broad fuzzy guessing."""
+    raw = (query or "").strip()
+    if not raw:
+        return None
+    text = re.sub(r"\s+", " ", raw).strip(" ?!.")
+    if not text:
+        return None
+
+    aliases: list[tuple[str, str]] = []
+    for field, names in _FACT_QUERY_ALIASES:
+        aliases.extend((field, alias) for alias in names)
+    aliases.sort(key=lambda item: len(item[1]), reverse=True)
+    alias_pattern = "|".join(re.escape(alias) for _, alias in aliases)
+    field_by_alias = {alias.casefold(): field for field, alias in aliases}
+
+    patterns = (
+        rf"^(?:what(?:'s| is)?|whats|tell me|show me|find|grab|get|give me)?\s*"
+        rf"(?:the\s+)?(?P<alias>{alias_pattern})\s+(?:for|of|on|in)\s+(?P<target>.+)$",
+        rf"^(?:what(?:'s| is)?|whats)\s+(?:the\s+)?(?P<alias>{alias_pattern})\s+"
+        rf"(?:for|of|on|in)?\s*(?P<target>.+)$",
+        rf"^(?P<target>.+?)\s+(?P<alias>{alias_pattern})$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        alias = match.group("alias").casefold()
+        target = re.sub(r"\s+", " ", match.group("target")).strip(" ?!.")
+        target = re.sub(r"^(?:is|are|the|a|an)\s+", "", target, flags=re.IGNORECASE).strip()
+        if not target:
+            continue
+        # A bare "year" query should not hijack titles like "Year of the Dragon".
+        question_like = bool(
+            re.match(r"^(?:what|whats|what's|tell|show|find|grab|get|give)\b", text, re.IGNORECASE)
+        )
+        field = field_by_alias[alias]
+        if field == "year" and not question_like and re.match(
+            r"^(?:release\s+|launch\s+)?year\s+(?:of|for|in)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            continue
+        if engine.QueryRepair._identity(target) == engine.QueryRepair._identity(raw):
+            continue
+        return {
+            "field": field,
+            "label": match.group("alias"),
+            "target_query": target,
+            "original_query": raw,
+        }
+    return None
+
+
+def _record_for_fact_candidate(item: engine.UnifiedFragrance) -> dict[str, Any] | None:
+    record = db.lookup_fragrance_record(
+        canonical_fg_url=_canonical_fg_url(item.frag_url),
+        bn_url=item.bn_url or None,
+    )
+    if record:
+        return record
+    # BN-only and live-only candidates can still have an aggregate row discoverable
+    # by identity. Keep this narrow: only accept the top exact DB candidate.
+    identity_query = f"{item.brand or ''} {item.name or ''}".strip()
+    if not identity_query:
+        return None
+    rows = db.search_fragrance_records(identity_query, limit=3)
+    for row in rows:
+        cand = _candidate_from_fragrance_record(row)
+        if cand and engine.IdentityTools.relevance_score(identity_query, cand) >= 0.98:
+            return db.lookup_fragrance_record(
+                canonical_fg_url=row.get("canonical_fg_url"),
+                bn_url=row.get("bn_url"),
+            ) or row
+    return None
+
+
+def _fact_value_from_record(
+    record: dict[str, Any] | None,
+    item: engine.UnifiedFragrance,
+    field: str,
+) -> tuple[Any, str | None]:
+    if field == "year":
+        value = _coerce_year(item.year)
+        if value is not None:
+            return value, "search_result"
+    if not record:
+        return None, None
+
+    fg_raw = record.get("fg_raw") if isinstance(record.get("fg_raw"), dict) else {}
+    raw_identity = fg_raw.get("raw_identity") if isinstance(fg_raw.get("raw_identity"), dict) else {}
+
+    if field == "year":
+        for value in (record.get("year"), raw_identity.get("year")):
+            coerced = _coerce_year(value)
+            if coerced is not None:
+                return coerced, "fragrance_records"
+    if field == "gender":
+        for value in (record.get("gender"), raw_identity.get("gender")):
+            if is_fact_complete(value, "gender"):
+                return str(value).strip(), "fragrance_records"
+    if field == "concentration":
+        for value in (fg_raw.get("concentration"), raw_identity.get("concentration")):
+            if is_fact_complete(value, "concentration"):
+                return str(value).strip(), "fragrance_records"
+    if field == "family":
+        family = derive_families(
+            {"derived_metrics": record.get("derived_metrics")},
+            existing_family=None,
+        ).get("primary_family")
+        if is_fact_complete(family, "family"):
+            return family, "fragrance_records"
+    return None, None
+
+
+def _recover_missing_fact_job(
+    selected: engine.UnifiedFragrance,
+    *,
+    query: str,
+) -> dict[str, Any] | None:
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        return None
+    is_non_perfume, _why = non_perfume_signal(
+        selected.name,
+        selected.brand,
+        fg_url=selected.frag_url,
+        bn_url=selected.bn_url,
+    )
+    if is_non_perfume:
+        return None
+    try:
+        job_key = (
+            _canonical_fg_url(selected.frag_url)
+            or _canonical_fg_url(selected.bn_url)
+            or _identity_job_key(selected)
+        )
+        if not job_key:
+            return None
+        return db.recover_or_enqueue_job(
+            job_key=job_key,
+            query=query,
+            name=selected.name or None,
+            house=selected.brand or None,
+            year=_coerce_year(selected.year),
+            bn_url=selected.bn_url or None,
+            fg_url=selected.frag_url or None,
+            priority=10,
+        )
+    except Exception:
+        logger.exception(
+            "recover_missing_fact_job failed name=%s house=%s",
+            selected.name,
+            selected.brand,
+        )
+        return None
+
+
+def _requested_fact_for_candidate(
+    item: engine.UnifiedFragrance,
+    fact_query: dict[str, str],
+    *,
+    allow_recovery: bool,
+) -> dict[str, Any]:
+    field = fact_query["field"]
+    record = _record_for_fact_candidate(item)
+    value, source = _fact_value_from_record(record, item, field)
+    if is_fact_complete(value, field):
+        return {"field": field, "status": "answered", "value": value, "source": source}
+
+    payload: dict[str, Any] = {"field": field, "status": "missing", "value": None}
+    if allow_recovery:
+        job = _recover_missing_fact_job(item, query=fact_query["original_query"])
+        if job:
+            status, requested_count = _enrichment_status_from_job_state(job)
+            payload["enrichment"] = {
+                "status": status,
+                "requires_worker": status in {"pending", "processing"},
+                "requested_count": requested_count,
+            }
+    return payload
+
+
+def _apply_fact_query_response(
+    rows: list[dict[str, Any]],
+    items: list[engine.UnifiedFragrance],
+    fact_query: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    if not fact_query:
+        return None
+    summary: dict[str, Any] = {
+        "field": fact_query["field"],
+        "target_query": fact_query["target_query"],
+        "original_query": fact_query["original_query"],
+        "status": "not_found",
+        "value": None,
+    }
+    for idx, (row, item) in enumerate(zip(rows, items)):
+        requested = _requested_fact_for_candidate(
+            item,
+            fact_query,
+            allow_recovery=(idx == 0),
+        )
+        row["requested_fact"] = requested
+        if idx == 0:
+            summary.update(requested)
+            summary["match"] = {
+                "name": row.get("name"),
+                "house": row.get("house"),
+                "id": row.get("id"),
+                "source_url": row.get("source_url"),
+            }
+    return summary
 
 
 def _candidate_from_fragrance_record(
@@ -2185,6 +2408,8 @@ def search(
     query = q.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
+    fact_query = _parse_fact_query(query)
+    resolver_query = fact_query["target_query"] if fact_query else query
 
     # Strong cache precheck. Before constructing a scraper or running the live
     # resolver, see if any warmed cache holds a near-exact hit for this query.
@@ -2192,7 +2417,7 @@ def search(
     # match here is high-confidence enough to skip live search entirely -- this
     # is the fast path that answers common cached queries in tens of ms instead
     # of waiting behind the engine's first-pass timeout budget.
-    strong_results, strong_source = _strong_cache_search(query, _ARGS.max_results)
+    strong_results, strong_source = _strong_cache_search(resolver_query, _ARGS.max_results)
     strong_results = [
         item for item in strong_results if _candidate_has_display_identity(item)
     ]
@@ -2203,9 +2428,18 @@ def search(
         diagnostics["cache_mode"] = "precheck"
         diagnostics["live_search_skipped"] = True
         _maybe_spawn_brand_sweep(strong_results)
+        rows = [_search_result_to_dict(item) for item in strong_results]
+        fact_summary = _apply_fact_query_response(rows, strong_results, fact_query)
+        if fact_summary:
+            diagnostics["fact_query"] = {
+                "field": fact_summary["field"],
+                "target_query": fact_summary["target_query"],
+            }
         return {
             "query": query,
-            "results": [_search_result_to_dict(item) for item in strong_results],
+            "search_query": resolver_query,
+            "fact_query": fact_summary,
+            "results": rows,
             "diagnostics": diagnostics,
         }
     if strong_results:
@@ -2217,13 +2451,13 @@ def search(
     # the strong fast path above. This is the stale-while-revalidate bridge
     # between a tens-of-ms precheck hit and a full multi-second live search.
     warm_results, warm_source = _strong_cache_search(
-        query, _ARGS.max_results, min_score=_WARM_CACHE_MIN_SCORE
+        resolver_query, _ARGS.max_results, min_score=_WARM_CACHE_MIN_SCORE
     )
     warm_results = [
         item for item in warm_results if _candidate_has_display_identity(item)
     ]
     if warm_results and _can_skip_live_search_with_cache(warm_results):
-        refreshing = _spawn_warm_refresh(query)
+        refreshing = _spawn_warm_refresh(resolver_query)
         diagnostics = _search_diagnostics(warm_results)
         diagnostics["cache_source"] = warm_source
         diagnostics["cache_mode"] = "warm"
@@ -2232,9 +2466,18 @@ def search(
         # re-query shortly to pick up fresher breadth. Never blocks this response.
         diagnostics["background_refresh"] = refreshing
         _maybe_spawn_brand_sweep(warm_results)
+        rows = [_search_result_to_dict(item) for item in warm_results]
+        fact_summary = _apply_fact_query_response(rows, warm_results, fact_query)
+        if fact_summary:
+            diagnostics["fact_query"] = {
+                "field": fact_summary["field"],
+                "target_query": fact_summary["target_query"],
+            }
         return {
             "query": query,
-            "results": [_search_result_to_dict(item) for item in warm_results],
+            "search_query": resolver_query,
+            "fact_query": fact_summary,
+            "results": rows,
             "diagnostics": diagnostics,
         }
     if warm_results:
@@ -2254,20 +2497,20 @@ def search(
     else:
         try:
             scraper = engine.get_scraper()
-            results = engine.search_once(scraper, query, _ARGS, timing=timing)
+            results = engine.search_once(scraper, resolver_query, _ARGS, timing=timing)
         except Exception:
             # A live-engine crash (transient provider fault, encoding error, etc.)
             # must not rob the client of the DB-backed fallback below. Log loudly
             # and degrade to the cache path instead of surfacing a bare 502 -- a
             # crash here previously masked perfectly good DB results (e.g. the
             # "Royal Sapphire" spell-repair UnicodeEncodeError).
-            logger.exception("engine.search_once failed for query %r; falling back to cache", query)
+            logger.exception("engine.search_once failed for query %r; falling back to cache", resolver_query)
             results = []
         finally:
             _release_gate(_LIVE_SEARCH_SEMAPHORE)
 
     if not results:
-        results, fallback_source = _cache_search_fallback(query, _ARGS.max_results)
+        results, fallback_source = _cache_search_fallback(resolver_query, _ARGS.max_results)
         if live_search_saturated and not results:
             raise HTTPException(
                 status_code=503,
@@ -2280,7 +2523,7 @@ def search(
     # "House unavailable" row to the client.
     results = [item for item in results if _candidate_has_display_identity(item)]
     if fallback_source != "aggregate_db":
-        _persist_search_results(query, results)
+        _persist_search_results(resolver_query, results)
 
     diagnostics = _search_diagnostics(results)
     if cache_disqualified_reasons:
@@ -2311,9 +2554,18 @@ def search(
             )
 
     _maybe_spawn_brand_sweep(results)
+    rows = [_search_result_to_dict(item) for item in results]
+    fact_summary = _apply_fact_query_response(rows, results, fact_query)
+    if fact_summary:
+        diagnostics["fact_query"] = {
+            "field": fact_summary["field"],
+            "target_query": fact_summary["target_query"],
+        }
     return {
         "query": query,
-        "results": [_search_result_to_dict(item) for item in results],
+        "search_query": resolver_query,
+        "fact_query": fact_summary,
+        "results": rows,
         "diagnostics": diagnostics,
     }
 

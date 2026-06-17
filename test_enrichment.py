@@ -2861,7 +2861,7 @@ def test_heal_offline_exact_match_contract() -> None:
     )
     ramz_entry = ramz_index.get(heal._norm_key("Lattafa", "Ramz Gold"))
     ramz_payload = {"brand": "Lattafa", "name": "Ramz Gold", "year": "", "concentration": ""}
-    _f0, c0, _a0, y0, _g0, i0 = heal.project_engine_facts(ramz_payload, ramz_entry or {})
+    _f0, c0, _a0, _w0, y0, _g0, i0 = heal.project_engine_facts(ramz_payload, ramz_entry or {})
     check(
         "heal_offline: duplicated house token alias projects Ramz facts",
         ramz_entry is not None
@@ -2903,7 +2903,10 @@ def test_heal_offline_exact_match_contract() -> None:
     # family is ALREADY set -- those never enter the family branch, so without an
     # unconditional accords refresh the SPA card keeps the stale junk accords
     # even after the engine DB is repaired (the "Dylan Blue shows two" bug).
-    dm = {"main_accords": {"top_accords": ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"]}}
+    dm = {
+        "main_accords": {"top_accords": ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"]},
+        "wear_profile": {"primary_seasons": ["Spring", "Summer"], "primary_time": "Day"},
+    }
     entry = {
         "derived_metrics": dm,
         "concentration": None,
@@ -2912,27 +2915,40 @@ def test_heal_offline_exact_match_contract() -> None:
         "image_url": None,
     }
 
-    familied_junk = {"family": "Amber", "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"]}
-    fam, _cc, acc, _yr, _gen, _img = heal.project_engine_facts(familied_junk, entry)
+    familied_junk = {
+        "family": "Amber",
+        "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"],
+        "season": "Universal",
+    }
+    fam, _cc, acc, wear, _yr, _gen, _img = heal.project_engine_facts(familied_junk, entry)
     check(
-        "heal_offline: already-familied row gets junk accords refreshed (not the family)",
+        "heal_offline: already-familied row gets junk accords and wear refreshed (not the family)",
         acc is True
+        and wear is True
         and fam is False
         and familied_junk["family"] == "Amber"
         and familied_junk["accords"] == ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"],
         detail=str(familied_junk),
     )
+    check(
+        "heal_offline: already-familied row fills missing/default wear context",
+        familied_junk["season"] == "Spring"
+        and familied_junk["wear_profile"]["primary_time"] == "Day"
+        and familied_junk["context"]["wear_profile"]["primary_seasons"] == ["Spring", "Summer"],
+        detail=str(familied_junk),
+    )
     # Re-running over the now-clean row writes nothing (idempotent / no churn).
     check(
-        "heal_offline: accords projection is idempotent once clean",
-        heal.project_engine_facts(dict(familied_junk), entry)[2] is False,
+        "heal_offline: accords/wear projection is idempotent once clean",
+        heal.project_engine_facts(dict(familied_junk), entry)[2:4] == (False, False),
     )
     # Unknown-family rows still get BOTH family and accords filled (unchanged).
     unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
-    fam_u, _c, acc_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
+    fam_u, _c, acc_u, wear_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
     check(
-        "heal_offline: unknown-family row fills family AND clean accords",
+        "heal_offline: unknown-family row fills family, clean accords, and wear",
         fam_u is True
+        and wear_u is True
         and unknown["family"] == "Amber"
         and unknown["accords"] == ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"],
         detail=str(unknown),
@@ -2945,7 +2961,7 @@ def test_heal_offline_exact_match_contract() -> None:
             untouched,
             {"derived_metrics": None, "concentration": None, "year": None, "gender": None, "image_url": None},
         )
-        == (False, False, False, False, False, False)
+        == (False, False, False, False, False, False, False)
         and untouched["accords"] == ["Woody"],
     )
     # Year/gender are projected from the engine record (not derived_metrics) when
@@ -2958,7 +2974,7 @@ def test_heal_offline_exact_match_contract() -> None:
         "gender": "Men",
         "image_url": "https://cdn.example.test/dylan-blue.jpg",
     }
-    _f, _c2, _a2, y_filled, g_filled, image_filled = heal.project_engine_facts(yearless, y_entry)
+    _f, _c2, _a2, _w2, y_filled, g_filled, image_filled = heal.project_engine_facts(yearless, y_entry)
     check(
         "heal_offline: missing wardrobe year+gender+image filled from engine record",
         y_filled is True
@@ -2972,7 +2988,7 @@ def test_heal_offline_exact_match_contract() -> None:
     has_year = {"year": "1999", "gender": "Women", "image_url": "https://cdn.example.test/existing.jpg"}
     check(
         "heal_offline: existing wardrobe year/gender/image left untouched",
-        heal.project_engine_facts(has_year, y_entry)[3:] == (False, False, False)
+        heal.project_engine_facts(has_year, y_entry)[4:] == (False, False, False)
         and has_year["year"] == "1999"
         and has_year["image_url"] == "https://cdn.example.test/existing.jpg",
     )
