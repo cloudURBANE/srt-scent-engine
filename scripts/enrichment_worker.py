@@ -55,6 +55,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import fragrance_parser_full_rewrite_fixed as engine  # noqa: E402
+from year_resolver import resolve_year_decodo  # noqa: E402
 from enrichment_facts import (  # noqa: E402
     FACT_FIELDS,
     PAGE_DETERMINED_FACTS,
@@ -1558,6 +1559,30 @@ def _apply_concentration(
     )
 
 
+def _resolve_missing_year(candidate: engine.UnifiedFragrance) -> dict[str, Any] | None:
+    """Use explicit Decodo SERP evidence only after page extraction failed."""
+    if _coerce_year(candidate.year).strip() not in ("", "0"):
+        return None
+    if not _env_bool("ENRICHMENT_YEAR_SERP", True):
+        return None
+    try:
+        resolved = resolve_year_decodo(candidate.brand, candidate.name)
+    except Exception as exc:
+        print(f"  [year] resolution failed for {candidate.brand} {candidate.name!r}: {exc}")
+        return None
+    if resolved and resolved.get("year"):
+        candidate.year = resolved["year"]
+        meta = resolved["year_meta"]
+        print(f"  [year] {candidate.year} (conf={meta['confidence']}, src={meta['source']})")
+    elif resolved and resolved.get("unresolvable"):
+        meta = resolved["year_meta"]
+        print(
+            f"  [year] no published launch year — authoritative sources report it "
+            f"unknown (src={meta['source']}, domains={','.join(meta.get('domains', []))})"
+        )
+    return resolved
+
+
 def _build_worker_derived_metrics(details: Any) -> dict[str, Any] | None:
     """The derived metrics the API will recompute from this payload, or None."""
     try:
@@ -1703,11 +1728,14 @@ def fetch_payload(
         raise WorkerError("parser_empty_frag_cards", "; ".join(parts), retryable=retryable)
 
     engine.heal_missing_gender_and_year(candidate, details)
+    year_resolution = _resolve_missing_year(candidate)
     identity = _specific_identity(candidate)
     image_url = _extract_image_url(scraper, candidate.frag_url, debug=debug)
     raw_identity = _raw_identity(candidate, job)
     if image_url:
         raw_identity["image_url"] = image_url
+    if year_resolution:
+        raw_identity["year_meta"] = year_resolution["year_meta"]
 
     dm = _build_worker_derived_metrics(details)
     payload = {
@@ -1761,6 +1789,8 @@ def _build_parfumo_payload(
     if rec is None:
         raise WorkerError("parfumo_record_missing", retryable=False)
 
+    year_resolution = _resolve_missing_year(candidate)
+
     notes = {
         "has_pyramid": bool(rec.notes_top or rec.notes_heart or rec.notes_base),
         "top": list(rec.notes_top or []),
@@ -1783,6 +1813,8 @@ def _build_parfumo_payload(
         "job_key": job.get("job_key") if job else None,
         "query": job.get("query") if job else None,
     }
+    if year_resolution:
+        raw_identity["year_meta"] = year_resolution["year_meta"]
     raw_identity = {k: v for k, v in raw_identity.items() if v not in ("", None, [])}
 
     payload = {
@@ -1833,10 +1865,21 @@ def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]
     if source == "local_enrichment_worker" and payload.get("quality_status") == "complete":
         return []
     unsuppliable = SOURCE_UNSUPPLIABLE_FACTS.get(source) or frozenset()
+    # A year that authoritative DBs (Parfumo/Fragrantica) explicitly mark
+    # "unknown" cannot be filled by re-scraping; requeueing for it just re-bills
+    # Decodo until the churn guard trips. Treat it as page-determined for THIS row.
+    raw_identity = payload.get("raw_identity")
+    year_meta = raw_identity.get("year_meta") if isinstance(raw_identity, dict) else None
+    year_unknown = (
+        isinstance(year_meta, dict)
+        and year_meta.get("source") == "decodo_serp_authoritative_unknown"
+    )
     return [
         field
         for field in facts_missing
-        if field not in unsuppliable and field not in PAGE_DETERMINED_FACTS
+        if field not in unsuppliable
+        and field not in PAGE_DETERMINED_FACTS
+        and not (field == "year" and year_unknown)
     ]
 
 

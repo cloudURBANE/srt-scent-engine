@@ -255,11 +255,43 @@ def _strip_brand_tokens_from_name(brand: str, name: str) -> str:
     return alias if alias and alias != original else ""
 
 
+# Numbered fragrances ("Chanel No 5", "Les Exclusifs de Chanel No 22") are spelled
+# inconsistently across sources: the engine canonicalises "No 22" while a wardrobe
+# row may store "N22" or "N°22". Those normalise to different exact keys
+# ("...chaneln22" vs "...chanelno22") so the row never inherits the engine year.
+# This collapses every "no/n/n°/nº/number <digits>" spelling to a single "no<digits>"
+# token, on BOTH sides, so the variants resolve to one identity. Leading-only on the
+# number word (a bare trailing digit like "212" is untouched), and the brand is still
+# part of the key, so it can never merge two genuinely different fragrances.
+_NUMBER_TOKEN_RE = re.compile(r"\bn(?:o|[°º]|umber)?\.?\s*(\d+)\b", re.IGNORECASE)
+
+
+def _number_canonical(text: str) -> str:
+    return _NUMBER_TOKEN_RE.sub(lambda m: f"no{m.group(1)}", str(text or ""))
+
+
+def _number_norm_key(brand: str, name: str) -> str:
+    """``_norm_key`` after collapsing number-word spellings (see _NUMBER_TOKEN_RE).
+
+    Returns "" when it is identical to the plain ``_norm_key`` (no number token in
+    the identity), so callers only ever register/look up a *distinct* bridging key."""
+    plain = _norm_key(brand, name)
+    bridged = _norm_key(_number_canonical(brand), _number_canonical(name))
+    return bridged if bridged != plain else ""
+
+
 def _identity_keys(brand: str, name: str) -> list[str]:
     keys = [_norm_key(brand, name)]
     alias = _strip_brand_tokens_from_name(brand, name)
     if alias:
         keys.append(_norm_key(brand, alias))
+    number_key = _number_norm_key(brand, name)
+    if number_key:
+        keys.append(number_key)
+        if alias:
+            alias_number = _number_norm_key(brand, alias)
+            if alias_number:
+                keys.append(alias_number)
     return [key for key in dict.fromkeys(keys) if key]
 
 
@@ -843,9 +875,25 @@ def heal_wardrobe(
     ) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
         """Returns (family, concentration, accords, wear, year, gender, image) flags."""
         entry = index.get(norm)
+        # Bridge inconsistent number spellings ("N22" <-> "No 22") to the canonical
+        # engine identity (see _NUMBER_TOKEN_RE). This is a *secondary* gap-fill
+        # source, not just a miss-fallback: a numbered wardrobe row often already
+        # "matches" its own (equally yearless) global_fragrances self-copy under the
+        # exact norm, so the real engine record -- indexed under the number key --
+        # must still be consulted to fill what that empty entry can't.
+        number_key = _number_norm_key(brand, name)
+        number_entry = index.get(number_key) if number_key else None
         fam = cc = acc = wear = yr = gen = img = False
-        if entry is not None:
-            fam, cc, acc, wear, yr, gen, img = project_engine_facts(payload, entry)
+        sources: list[dict[str, Any]] = []
+        for src in (entry, number_entry):
+            if src is not None and not any(src is s for s in sources):
+                sources.append(src)
+        for src in sources:
+            f2, c2, a2, w2, y2, g2, i2 = project_engine_facts(payload, src)
+            fam, cc, acc, wear, yr, gen, img = (
+                fam or f2, cc or c2, acc or a2, wear or w2,
+                yr or y2, gen or g2, img or i2,
+            )
         # If scalar facts are still missing, resolve the abbreviated wardrobe name
         # to its canonical record via the gender-label-stripped core (the "Dylan
         # Blue" -> "Pour Homme Dylan Blue" heal). The wardrobe's own norm is the
@@ -859,12 +907,12 @@ def heal_wardrobe(
             stripped = _strip_leading_gender(name)
             lookup = _norm_key(brand, stripped[0]) if stripped else norm
             core_entry = _core_match(core_index, lookup)
-            if core_entry is not None and core_entry is not entry:
+            if core_entry is not None and not any(core_entry is s for s in sources):
                 c2, y2, g2, i2 = fill_core_scalars(payload, core_entry)
                 if c2 or y2 or g2 or i2:
                     stats["core_match"] += 1
                 cc, yr, gen, img = cc or c2, yr or y2, gen or g2, img or i2
-        if entry is None and not (cc or yr or gen or img):
+        if not sources and not (cc or yr or gen or img):
             stats["no_match"] += 1
         return fam, cc, acc, wear, yr, gen, img
 
