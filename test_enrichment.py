@@ -1516,7 +1516,7 @@ def test_junk_accord_filtering() -> None:
         "14.9K", "11.2K", "6.5K", "9.4K", "2.2K", "1.6K", "1,204", "100",
         "Hate", "Like", "OK",
         "Summer", "Winter", "Spring", "Fall", "Day", "Night",
-        "Many Items For Sale On",
+        "Many Items For Sale On", "Sponsored",
     ]:
         check(f"is_junk_accord_label flags {junk!r}", enrichment_facts.is_junk_accord_label(junk), junk)
     for real in ["Amber", "Citrus", "Fresh Spicy", "Warm Spicy", "Woody", "Aquatic", "Musky", "Green", "Fresh"]:
@@ -2870,10 +2870,16 @@ def test_heal_offline_exact_match_contract() -> None:
     # unconditional accords refresh the SPA card keeps the stale junk accords
     # even after the engine DB is repaired (the "Dylan Blue shows two" bug).
     dm = {"main_accords": {"top_accords": ["Amber", "Citrus", "Fresh Spicy", "Musky", "Aquatic"]}}
-    entry = {"derived_metrics": dm, "concentration": None}
+    entry = {
+        "derived_metrics": dm,
+        "concentration": None,
+        "year": None,
+        "gender": None,
+        "image_url": None,
+    }
 
     familied_junk = {"family": "Amber", "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"]}
-    fam, _cc, acc, _yr, _gen = heal.project_engine_facts(familied_junk, entry)
+    fam, _cc, acc, _yr, _gen, _img = heal.project_engine_facts(familied_junk, entry)
     check(
         "heal_offline: already-familied row gets junk accords refreshed (not the family)",
         acc is True
@@ -2889,7 +2895,7 @@ def test_heal_offline_exact_match_contract() -> None:
     )
     # Unknown-family rows still get BOTH family and accords filled (unchanged).
     unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
-    fam_u, _c, acc_u, _yu, _gu = heal.project_engine_facts(unknown, entry)
+    fam_u, _c, acc_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
     check(
         "heal_offline: unknown-family row fills family AND clean accords",
         fam_u is True
@@ -2902,30 +2908,39 @@ def test_heal_offline_exact_match_contract() -> None:
     check(
         "heal_offline: no engine metrics leaves the wardrobe row untouched",
         heal.project_engine_facts(
-            untouched, {"derived_metrics": None, "concentration": None, "year": None, "gender": None}
+            untouched,
+            {"derived_metrics": None, "concentration": None, "year": None, "gender": None, "image_url": None},
         )
-        == (False, False, False, False, False)
+        == (False, False, False, False, False, False)
         and untouched["accords"] == ["Woody"],
     )
     # Year/gender are projected from the engine record (not derived_metrics) when
     # the wardrobe row is missing them -- the bug where draining never healed years.
     yearless = {"family": "Amber", "year": "", "gender": ""}
-    y_entry = {"derived_metrics": None, "concentration": None, "year": "2018", "gender": "Men"}
-    _f, _c2, _a2, y_filled, g_filled = heal.project_engine_facts(yearless, y_entry)
+    y_entry = {
+        "derived_metrics": None,
+        "concentration": None,
+        "year": "2018",
+        "gender": "Men",
+        "image_url": "https://cdn.example.test/dylan-blue.jpg",
+    }
+    _f, _c2, _a2, y_filled, g_filled, image_filled = heal.project_engine_facts(yearless, y_entry)
     check(
-        "heal_offline: missing wardrobe year+gender filled from engine record",
+        "heal_offline: missing wardrobe year+gender+image filled from engine record",
         y_filled is True
         and g_filled is True
+        and image_filled is True
         and yearless["year"] == "2018"
         and yearless["gender"] == "Men",
         detail=str(yearless),
     )
-    # An existing wardrobe year is never downgraded by the engine value.
-    has_year = {"year": "1999", "gender": "Women"}
+    # Existing wardrobe values are never downgraded by engine values.
+    has_year = {"year": "1999", "gender": "Women", "image_url": "https://cdn.example.test/existing.jpg"}
     check(
-        "heal_offline: existing wardrobe year/gender left untouched",
-        heal.project_engine_facts(has_year, y_entry)[3:] == (False, False)
-        and has_year["year"] == "1999",
+        "heal_offline: existing wardrobe year/gender/image left untouched",
+        heal.project_engine_facts(has_year, y_entry)[3:] == (False, False, False)
+        and has_year["year"] == "1999"
+        and has_year["image_url"] == "https://cdn.example.test/existing.jpg",
     )
 
 
@@ -2942,6 +2957,7 @@ def test_heal_offline_core_match_contract() -> None:
     def entry(brand: str, name: str, year: str, gender: str = "") -> dict:
         e = heal._new_entry()
         e["year"], e["gender"] = year, (gender or None)
+        e["image_url"] = "https://cdn.example.test/core.jpg"
         heal._register_core(e, brand, name)
         return e
 
@@ -2972,10 +2988,13 @@ def test_heal_offline_core_match_contract() -> None:
     )
     # And the scalar projection fills year + the implied gender (gap-fill only).
     payload = {"year": "", "gender": ""}
-    c2, y2, g2 = heal.fill_core_scalars(payload, dylan)
+    c2, y2, g2, i2 = heal.fill_core_scalars(payload, dylan)
     check(
-        "heal_offline core: year+gender projected from canonical record",
-        (y2, g2) == (True, True) and payload["year"] == "2016" and payload["gender"] == "Men",
+        "heal_offline core: year+gender+image projected from canonical record",
+        (y2, g2, i2) == (True, True, True)
+        and payload["year"] == "2016"
+        and payload["gender"] == "Men"
+        and payload["image_url"] == "https://cdn.example.test/core.jpg",
         detail=str(payload),
     )
 
@@ -3002,10 +3021,12 @@ def test_heal_offline_core_match_contract() -> None:
     )
 
     # Never downgrade an existing wardrobe value.
-    has = {"year": "1999", "gender": "Women"}
+    has = {"year": "1999", "gender": "Women", "image_url": "https://cdn.example.test/existing.jpg"}
     check(
-        "heal_offline core: existing year/gender left untouched",
-        heal.fill_core_scalars(has, dylan) == (False, False, False) and has["year"] == "1999",
+        "heal_offline core: existing year/gender/image left untouched",
+        heal.fill_core_scalars(has, dylan) == (False, False, False, False)
+        and has["year"] == "1999"
+        and has["image_url"] == "https://cdn.example.test/existing.jpg",
     )
 
 

@@ -133,6 +133,7 @@ _SEASON_TIME_LABELS = {
 # Shopping/ad copy that the scraper occasionally swept up ("Many Items For Sale
 # On ..."). No accord ever contains these phrases.
 _AD_TEXT_MARKERS = ("for sale", "items for sale", "in stock", "shop ", " ad")
+_AD_TEXT_LABELS = {"sponsored"}
 
 
 def is_junk_accord_label(label: Any) -> bool:
@@ -150,7 +151,7 @@ def is_junk_accord_label(label: Any) -> bool:
     if _VOTE_COUNT_RE.match(s):
         return True
     low = s.lower()
-    if low in _RATING_WORD_LABELS or low in _SEASON_TIME_LABELS:
+    if low in _RATING_WORD_LABELS or low in _SEASON_TIME_LABELS or low in _AD_TEXT_LABELS:
         return True
     if any(marker in low for marker in _AD_TEXT_MARKERS):
         return True

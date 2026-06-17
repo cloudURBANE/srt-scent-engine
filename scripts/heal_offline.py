@@ -317,6 +317,40 @@ def _record_gender(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _clean_image_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text if text.startswith(("http://", "https://")) else None
+
+
+def _payload_image_url(payload: dict[str, Any]) -> str | None:
+    product = payload.get("product") if isinstance(payload.get("product"), dict) else {}
+    for value in (
+        payload.get("image_url"),
+        payload.get("imageUrl"),
+        product.get("image_url"),
+        product.get("imageUrl"),
+    ):
+        if cleaned := _clean_image_url(value):
+            return cleaned
+    return None
+
+
+def _record_image_url(record: dict[str, Any]) -> str | None:
+    """First usable bottle image for a fragrance_records-shaped row."""
+    fg_raw = record.get("fg_raw") or {}
+    raw_identity = fg_raw.get("raw_identity") or {}
+    for value in (
+        record.get("image_url"),
+        raw_identity.get("image_url"),
+        raw_identity.get("imageUrl"),
+        fg_raw.get("image_url"),
+        fg_raw.get("imageUrl"),
+    ):
+        if cleaned := _clean_image_url(value):
+            return cleaned
+    return None
+
+
 def _all_records() -> list[dict[str, Any]]:
     """Every fragrance_records row, paged through list_fragrance_records."""
     out: list[dict[str, Any]] = []
@@ -438,6 +472,7 @@ def _new_entry() -> dict[str, Any]:
         "concentration": None,
         "year": None,
         "gender": None,
+        "image_url": None,
         "core": None,           # gender-label-stripped norm key (or None)
         "implied_gender": None,  # gender read off a stripped leading label
     }
@@ -477,6 +512,8 @@ def _fold_record(index: dict[str, dict[str, Any]], record: dict[str, Any]) -> No
         entry["year"] = _record_year(record)
     if entry["gender"] is None:
         entry["gender"] = _record_gender(record)
+    if entry["image_url"] is None:
+        entry["image_url"] = _record_image_url(record)
     _register_core(entry, brand, name)
 
 
@@ -519,6 +556,10 @@ def _fold_global_fragrances(index: dict[str, dict[str, Any]]) -> int:
         ):
             entry["concentration"] = str(pdata.get("concentration")).strip()
             folded += 1
+        if entry["image_url"] is None:
+            entry["image_url"] = _payload_image_url(pdata)
+            if entry["image_url"]:
+                folded += 1
         _register_core(entry, brand, name)
     return folded
 
@@ -536,7 +577,7 @@ def _fold_engine_database(index: dict[str, dict[str, Any]]) -> int:
         with psycopg.connect(engine_dsn, row_factory=dict_row) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT house, name, year, gender, derived_metrics_json,"
+                    "SELECT house, name, year, gender, image_url, derived_metrics_json,"
                     " fg_raw_json FROM fragrance_records"
                 )
                 rows = cur.fetchall()
@@ -552,6 +593,7 @@ def _fold_engine_database(index: dict[str, dict[str, Any]]) -> int:
                 "name": row.get("name"),
                 "year": row.get("year"),
                 "gender": row.get("gender"),
+                "image_url": row.get("image_url"),
                 "derived_metrics": row.get("derived_metrics_json"),
                 "fg_raw": row.get("fg_raw_json") or {},
             },
@@ -600,15 +642,16 @@ def _build_core_index(
 
 def project_engine_facts(
     payload: dict[str, Any], entry: dict[str, Any]
-) -> tuple[bool, bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool, bool]:
     """Project one engine-cache entry's facts onto a wardrobe payload, in place.
 
     Returns ``(family_filled, concentration_filled, accords_refreshed,
-    year_filled, gender_filled)``. Pure apart from mutating ``payload`` -- no DB,
-    so it is unit-testable. ``entry`` is ``{"derived_metrics": <blob|None>,
-    "concentration": <str|None>, "year": <str|None>, "gender": <str|None>}``.
+    year_filled, gender_filled, image_filled)``. Pure apart from mutating
+    ``payload`` -- no DB, so it is unit-testable. ``entry`` is
+    ``{"derived_metrics": <blob|None>, "concentration": <str|None>,
+    "year": <str|None>, "gender": <str|None>, "image_url": <str|None>}``.
     """
-    fam_filled = conc_filled = acc_refreshed = year_filled = gender_filled = False
+    fam_filled = conc_filled = acc_refreshed = year_filled = gender_filled = image_filled = False
     dm = entry.get("derived_metrics")
     if dm is not None:
         # Always re-project the junk-filtered top accords. The scrape leak
@@ -643,19 +686,24 @@ def project_engine_facts(
     if not is_fact_complete(payload.get("gender"), "gender") and is_fact_complete(entry.get("gender"), "gender"):
         payload["gender"] = entry["gender"]
         gender_filled = True
-    return fam_filled, conc_filled, acc_refreshed, year_filled, gender_filled
+    image_url = _clean_image_url(entry.get("image_url"))
+    if not _payload_image_url(payload) and image_url:
+        payload["image_url"] = image_url
+        image_filled = True
+    return fam_filled, conc_filled, acc_refreshed, year_filled, gender_filled, image_filled
 
 
 def fill_core_scalars(
     payload: dict[str, Any], entry: dict[str, Any]
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool]:
     """Fill ONLY the scalar identity facts (concentration, year, gender) from a
     gender-label-stripped core match -- the conservative subset that is safe to
     inherit across the "Dylan Blue" <-> "Pour Homme Dylan Blue" name gap. Returns
-    ``(conc_filled, year_filled, gender_filled)``. Gap-fill only; never downgrades
-    an existing value. Derived metrics / accords are deliberately NOT projected
-    here (those come only from an exact identity match)."""
-    conc_filled = year_filled = gender_filled = False
+    ``(conc_filled, year_filled, gender_filled, image_filled)``. Gap-fill only;
+    never downgrades an existing value. Derived metrics / accords are
+    deliberately NOT projected here (those come only from an exact identity
+    match)."""
+    conc_filled = year_filled = gender_filled = image_filled = False
     if not is_fact_complete(payload.get("concentration"), "concentration") and is_fact_complete(
         entry.get("concentration"), "concentration"
     ):
@@ -669,7 +717,11 @@ def fill_core_scalars(
     if not is_fact_complete(payload.get("gender"), "gender") and is_fact_complete(gender_val, "gender"):
         payload["gender"] = gender_val
         gender_filled = True
-    return conc_filled, year_filled, gender_filled
+    image_url = _clean_image_url(entry.get("image_url"))
+    if not _payload_image_url(payload) and image_url:
+        payload["image_url"] = image_url
+        image_filled = True
+    return conc_filled, year_filled, gender_filled, image_filled
 
 
 def heal_wardrobe(
@@ -682,18 +734,20 @@ def heal_wardrobe(
     core_index = _build_core_index(index)
     stats = {
         "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_year": 0, "uf_gender": 0,
+        "uf_image": 0,
         "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_year": 0, "gf_gender": 0,
+        "gf_image": 0,
         "no_match": 0, "core_match": 0,
     }
 
     def _project(
         payload: dict[str, Any], norm: str, brand: str, name: str
-    ) -> tuple[bool, bool, bool, bool, bool]:
-        """Returns (family, concentration, accords, year, gender) filled flags."""
+    ) -> tuple[bool, bool, bool, bool, bool, bool]:
+        """Returns (family, concentration, accords, year, gender, image) flags."""
         entry = index.get(norm)
-        fam = cc = acc = yr = gen = False
+        fam = cc = acc = yr = gen = img = False
         if entry is not None:
-            fam, cc, acc, yr, gen = project_engine_facts(payload, entry)
+            fam, cc, acc, yr, gen, img = project_engine_facts(payload, entry)
         # If scalar facts are still missing, resolve the abbreviated wardrobe name
         # to its canonical record via the gender-label-stripped core (the "Dylan
         # Blue" -> "Pour Homme Dylan Blue" heal). The wardrobe's own norm is the
@@ -708,13 +762,13 @@ def heal_wardrobe(
             lookup = _norm_key(brand, stripped[0]) if stripped else norm
             core_entry = _core_match(core_index, lookup)
             if core_entry is not None and core_entry is not entry:
-                c2, y2, g2 = fill_core_scalars(payload, core_entry)
-                if c2 or y2 or g2:
+                c2, y2, g2, i2 = fill_core_scalars(payload, core_entry)
+                if c2 or y2 or g2 or i2:
                     stats["core_match"] += 1
-                cc, yr, gen = cc or c2, yr or y2, gen or g2
-        if entry is None and not (cc or yr or gen):
+                cc, yr, gen, img = cc or c2, yr or y2, gen or g2, img or i2
+        if entry is None and not (cc or yr or gen or img):
             stats["no_match"] += 1
-        return fam, cc, acc, yr, gen
+        return fam, cc, acc, yr, gen, img
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         # user_fragrances
@@ -730,7 +784,7 @@ def heal_wardrobe(
             norm = _norm_key(brand_uf, name_uf)
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen = _project(fdata, norm, brand_uf, name_uf)
+            fam, cc, acc, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
             if fam:
                 stats["uf_family"] += 1
             if cc:
@@ -741,7 +795,9 @@ def heal_wardrobe(
                 stats["uf_year"] += 1
             if gen:
                 stats["uf_gender"] += 1
-            if (fam or cc or acc or yr or gen) and not dry_run:
+            if img:
+                stats["uf_image"] += 1
+            if (fam or cc or acc or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -761,7 +817,7 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, yr, gen = _project(pdata, norm, str(brand), str(name))
+            fam, cc, acc, yr, gen, img = _project(pdata, norm, str(brand), str(name))
             if fam:
                 stats["gf_family"] += 1
             if cc:
@@ -772,7 +828,9 @@ def heal_wardrobe(
                 stats["gf_year"] += 1
             if gen:
                 stats["gf_gender"] += 1
-            if (fam or cc or acc or yr or gen) and not dry_run:
+            if img:
+                stats["gf_image"] += 1
+            if (fam or cc or acc or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -782,9 +840,11 @@ def heal_wardrobe(
             conn.commit()
     print(
         f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
-        f"accords~{stats['uf_acc']} year+{stats['uf_year']} gender+{stats['uf_gender']}] "
+        f"accords~{stats['uf_acc']} year+{stats['uf_year']} gender+{stats['uf_gender']} "
+        f"image+{stats['uf_image']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
-        f"accords~{stats['gf_acc']} year+{stats['gf_year']} gender+{stats['gf_gender']}] "
+        f"accords~{stats['gf_acc']} year+{stats['gf_year']} gender+{stats['gf_gender']} "
+        f"image+{stats['gf_image']}] "
         f"core_match={stats['core_match']} no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
     return stats
