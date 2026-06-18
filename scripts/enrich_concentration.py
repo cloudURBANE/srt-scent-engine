@@ -55,6 +55,10 @@ if __name__ == "__main__":
 
 import db
 from concentration_grabber import SemanticScentEngine, to_scentcast_concentration
+from enrichment_facts import (
+    CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,
+    concentration_meta_marks_ambiguous,
+)
 from psycopg.types.json import Json
 import psycopg
 from psycopg.rows import dict_row
@@ -208,6 +212,63 @@ def _tier2_serp(query: str, require_literal_support: bool = False) -> dict | Non
                 "engine_label": profile.primary_concentration,
             },
         }
+    return None
+
+
+def _engine_tier2(query: str) -> dict | None:
+    """Engine-cache Tier-2: resolve, mark variant-ambiguous, or give up.
+
+    Three outcomes off one analyze() pass (so the SERP vote is fetched once):
+      * a normal resolved dict when a single concentration clears the floor AND a
+        real source row stated it (the ground-truth gate);
+      * a *variant-ambiguous marker* (``concentration`` None, ``variant_ambiguous``
+        True) when no winner clears the floor but >=2 distinct concentrations were
+        each literally stated -- the bare name genuinely spans concentrations, so
+        there is no single value to store but the row is page-determined, not a gap;
+      * None when the vote is merely weak/prior-carried (a future page-scrape could
+        still resolve it, so it stays an ordinary gap -- we do NOT mark it).
+    """
+    try:
+        profile = SemanticScentEngine.analyze(query)
+    except Exception as exc:
+        print(f"  [WARN] Tier-2 analyze failed: {exc}")
+        return None
+    if not profile:
+        return None
+
+    literal = list(getattr(profile, "literal_concentrations", []) or [])
+    if (
+        profile.primary_confidence >= 50
+        and getattr(profile, "primary_has_literal_support", True)
+    ):
+        return {
+            "concentration": to_scentcast_concentration(profile.primary_concentration),
+            "concentration_meta": {
+                "confidence": profile.primary_confidence,
+                "source": "semantic_engine_v6",
+                "resolved_at": _now_iso(),
+                "engine_label": profile.primary_concentration,
+            },
+        }
+
+    if len(literal) >= 2:
+        attested = sorted({to_scentcast_concentration(c) for c in literal})
+        if len(attested) >= 2:
+            print(
+                f"  [AMBIGUOUS] '{query}' is stated in {len(attested)} concentrations "
+                f"({', '.join(attested)}); marking variant-ambiguous, leaving blank."
+            )
+            return {
+                "concentration": None,
+                "variant_ambiguous": True,
+                "concentration_meta": {
+                    "confidence": profile.primary_confidence,
+                    "source": CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,
+                    "resolved_at": _now_iso(),
+                    "attested_concentrations": attested,
+                    "engine_labels": sorted(set(literal)),
+                },
+            }
     return None
 
 
@@ -402,8 +463,9 @@ def resolve_concentration_online(
     if not use_browser:
         return None
     # Engine cache must stay ground-truth: accept the Tier-2 vote only when a real
-    # source row stated the winning concentration, never a prior-carried win.
-    return _tier2_serp(f"{brand} {name}".strip(), require_literal_support=True)
+    # source row stated the winning concentration; otherwise either mark the row
+    # variant-ambiguous (>=2 concentrations stated) or leave it an ordinary gap.
+    return _engine_tier2(f"{brand} {name}".strip())
 
 
 def fetch_engine_gap_rows(cur, limit: int | None) -> list[dict]:
@@ -425,8 +487,18 @@ def fetch_engine_gap_rows(cur, limit: int | None) -> list[dict]:
     # SQL pre-filters cheaply; confirm with the same predicate the audit uses.
     rows = []
     for row in cur.fetchall():
-        if _is_unknown(_engine_concentration_from_fg_raw(dict(row["fg_raw_json"] or {}))):
-            rows.append(row)
+        fg_raw = dict(row["fg_raw_json"] or {})
+        if not _is_unknown(_engine_concentration_from_fg_raw(fg_raw)):
+            continue
+        # A row already marked variant-ambiguous is page-determined, not a gap:
+        # the name has no single concentration. Re-resolving it would just re-bill
+        # Decodo to reach the same verdict, so drop it from the sweep.
+        raw_identity = fg_raw.get("raw_identity") if isinstance(fg_raw.get("raw_identity"), dict) else {}
+        if concentration_meta_marks_ambiguous(
+            fg_raw.get("concentration_meta")
+        ) or concentration_meta_marks_ambiguous(raw_identity.get("concentration_meta")):
+            continue
+        rows.append(row)
     return rows
 
 
@@ -466,7 +538,7 @@ def run_engine_gap(args: argparse.Namespace) -> None:
             rows = fetch_engine_gap_rows(cur, args.limit)
 
     print(f"engine-gap: {len(rows)} fragrance_records missing concentration")
-    resolved = skipped = cache_rows = 0
+    resolved = skipped = ambiguous = cache_rows = 0
     seen: set[tuple[str, str]] = set()
     for row in rows:
         house = str(row["house"] or "").strip()
@@ -480,9 +552,24 @@ def run_engine_gap(args: argparse.Namespace) -> None:
         if not res:
             skipped += 1
             continue
+        meta = res["concentration_meta"]
+
+        # Variant-ambiguous: no single value, but stamp the marker so the row
+        # leaves the gap and the API can surface it. Counted separately, not as
+        # a resolve (nothing was filled).
+        if res.get("variant_ambiguous"):
+            ambiguous += 1
+            if dry_run:
+                continue
+            with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    d, r = mark_engine_concentration_ambiguous(cur, house, name, meta)
+                conn.commit()
+            cache_rows += d + r
+            continue
+
         resolved += 1
         conc = res["concentration"]
-        meta = res["concentration_meta"]
         print(f"  {house} | {name}  ->  {conc}  (src={meta['source']}, label={meta['engine_label']})")
         if dry_run:
             continue
@@ -493,7 +580,7 @@ def run_engine_gap(args: argparse.Namespace) -> None:
         cache_rows += d + r
 
     print(
-        f"\nengine-gap done. resolved={resolved} skipped={skipped} "
+        f"\nengine-gap done. resolved={resolved} ambiguous={ambiguous} skipped={skipped} "
         f"cache_rows_written={cache_rows} dry_run={dry_run}"
     )
 
@@ -604,6 +691,69 @@ def update_engine_cache_rows(
         raw_identity["concentration_meta"] = concentration_meta
         fg_raw["raw_identity"] = raw_identity
         fg_raw["concentration"] = concentration
+        fg_raw["concentration_meta"] = concentration_meta
+        cur.execute(
+            "UPDATE fragrance_records SET fg_raw_json = %s, updated_at = now() WHERE record_key = %s",
+            (Json(fg_raw), record_row["record_key"]),
+        )
+        record_updates += 1
+
+    return detail_updates, record_updates
+
+
+def mark_engine_concentration_ambiguous(
+    cur, brand: str, name: str, concentration_meta: dict
+) -> tuple[int, int]:
+    """Record a variant-ambiguous marker without filling concentration.
+
+    Mirrors the year-unknown marker: the value stays blank (there is no single
+    ground-truth concentration), but ``concentration_meta`` is stamped so the
+    engine-gap sweep stops re-listing the row, the worker stops requeueing it, and
+    the API can surface "varies". Only stamps rows whose concentration is still
+    unknown and not already marked, so it is idempotent and never clobbers a value.
+    """
+    detail_updates = 0
+    record_updates = 0
+
+    cur.execute(
+        """
+        SELECT canonical_fg_url, raw_identity_json
+        FROM fg_detail_cache
+        WHERE LOWER(house) = LOWER(%s) AND LOWER(name) = LOWER(%s)
+        """,
+        (brand, name),
+    )
+    for cache_row in cur.fetchall():
+        raw_identity = dict(cache_row["raw_identity_json"] or {})
+        if not _is_unknown(raw_identity.get("concentration")):
+            continue
+        if concentration_meta_marks_ambiguous(raw_identity.get("concentration_meta")):
+            continue
+        raw_identity["concentration_meta"] = concentration_meta
+        cur.execute(
+            "UPDATE fg_detail_cache SET raw_identity_json = %s, updated_at = now() WHERE canonical_fg_url = %s",
+            (Json(raw_identity), cache_row["canonical_fg_url"]),
+        )
+        detail_updates += 1
+
+    cur.execute(
+        """
+        SELECT record_key, fg_raw_json
+        FROM fragrance_records
+        WHERE LOWER(house) = LOWER(%s) AND LOWER(name) = LOWER(%s)
+        """,
+        (brand, name),
+    )
+    for record_row in cur.fetchall():
+        fg_raw = dict(record_row["fg_raw_json"] or {})
+        if not _is_unknown(_engine_concentration_from_fg_raw(fg_raw)):
+            continue
+        if concentration_meta_marks_ambiguous(fg_raw.get("concentration_meta")):
+            continue
+        raw_identity = fg_raw.get("raw_identity")
+        raw_identity = dict(raw_identity) if isinstance(raw_identity, dict) else {}
+        raw_identity["concentration_meta"] = concentration_meta
+        fg_raw["raw_identity"] = raw_identity
         fg_raw["concentration_meta"] = concentration_meta
         cur.execute(
             "UPDATE fragrance_records SET fg_raw_json = %s, updated_at = now() WHERE record_key = %s",

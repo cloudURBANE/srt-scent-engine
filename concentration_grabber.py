@@ -75,6 +75,11 @@ class ScentProfile:
     # ignore it. Defaults True so the explicit short-circuit and any pre-field
     # cached payload are treated as attested.
     primary_has_literal_support: bool = True
+    # The distinct concentrations a real source row STATED (url slug / title
+    # modifier), regardless of which one won. >=2 here with no winner over the
+    # confidence floor is the signature of a genuinely variant-ambiguous bare name
+    # (the same name sold as EDT and EDP). Empty list = no literal attestation.
+    literal_concentrations: list = field(default_factory=list)
 
 
 class SemanticScentEngine:
@@ -799,17 +804,19 @@ class SemanticScentEngine:
         else:
             primary_key, primary_score = ranked[0]
 
-            # Source-stated vs prior-carried: the winning concentration is attested
-            # only if a real SERP row stated it (url slug / title modifier). Ballots
-            # classified via _pillar_default (source_kind "pillar") are the brand/
-            # pillar prior, not a stated fact; a winner carried solely by those (or
-            # by the structural-fallback prior, which never touches breakdown) has no
-            # literal support. breakdown rows: (label, i, domain, source_kind, conc, w).
+            # Source-stated vs prior-carried: a concentration is attested only if a
+            # real SERP row stated it (url slug / title modifier). Ballots classified
+            # via _pillar_default (source_kind "pillar") are the brand/pillar prior,
+            # not a stated fact. breakdown rows: (label, i, domain, source_kind, conc, w).
             _LITERAL_KINDS = ("url", "title-modifier")
-            primary_has_literal_support = any(
-                b_conc == primary_key and b_kind in _LITERAL_KINDS
+            literal_concentrations = sorted({
+                b_conc
                 for (_lbl, _i, _dom, b_kind, b_conc, _w) in breakdown
-            )
+                if b_kind in _LITERAL_KINDS and b_conc
+            })
+            # The winner has literal support iff a real row stated *it* specifically;
+            # >=2 entries overall is the variant-ambiguous signal (multiple stated).
+            primary_has_literal_support = primary_key in literal_concentrations
             total = sum(v for _, v in ranked)
             primary_conf = int((primary_score / total) * 100) if total > 0 else 0
 
@@ -837,6 +844,7 @@ class SemanticScentEngine:
                 brand_prior=brand_prior or "", pillar_votes=pillar_vote_count,
                 total_votes=total_vote_count, elapsed_seconds=round(dt, 2),
                 primary_has_literal_support=primary_has_literal_support,
+                literal_concentrations=literal_concentrations,
             )
 
         if use_cache:

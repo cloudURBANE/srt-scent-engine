@@ -226,3 +226,20 @@ def test_heal_worthy_drops_year_when_authoritatively_unknown():
     # Without the unknown marker, year stays heal-worthy.
     plain = {"source": "parfumo", "quality_status": "partial", "raw_identity": {}}
     assert "year" in worker._heal_worthy_missing_facts(plain, ["year"])
+
+
+def test_heal_worthy_drops_concentration_when_variant_ambiguous():
+    from scripts import enrichment_worker as worker
+
+    payload = {
+        "source": "parfumo",
+        "quality_status": "partial",
+        "raw_identity": {"concentration_meta": {"source": "serp_variant_ambiguous"}},
+    }
+    out = worker._heal_worthy_missing_facts(payload, ["year", "concentration"])
+    assert "concentration" not in out  # name spans concentrations: stop re-billing
+    assert "year" in out  # unrelated fact stays heal-worthy
+
+    # Without the ambiguous marker, concentration stays heal-worthy.
+    plain = {"source": "parfumo", "quality_status": "partial", "raw_identity": {}}
+    assert "concentration" in worker._heal_worthy_missing_facts(plain, ["concentration"])

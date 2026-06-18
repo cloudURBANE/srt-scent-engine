@@ -318,6 +318,27 @@ def year_meta_marks_unknown(year_meta: Any) -> bool:
     )
 
 
+# A ``concentration_meta`` blob carrying this source marker means the SERP vote
+# found the bare name attested in *two or more distinct concentrations* (each
+# stated literally on a source page) with no single one reaching the confidence
+# floor -- i.e. the name genuinely spans multiple concentrations (J'Adore EDT /
+# EDP / Parfum d'Eau), so there is no one ground-truth value to store. Like the
+# year-unknown marker this is a page-determined fact, not a not-yet-resolved gap:
+# the engine-gap sweep stops re-listing the row, the worker stops requeueing
+# concentration for it, and the API surfaces it so the SPA can say "varies" rather
+# than render a blank card. Minted in scripts/enrich_concentration.py (_engine_tier2).
+CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE = "serp_variant_ambiguous"
+
+
+def concentration_meta_marks_ambiguous(concentration_meta: Any) -> bool:
+    """True when ``concentration_meta`` authoritatively states the bare name spans
+    multiple concentrations (no single ground-truth value exists)."""
+    return (
+        isinstance(concentration_meta, dict)
+        and concentration_meta.get("source") == CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE
+    )
+
+
 SOURCE_UNSUPPLIABLE_FACTS: dict[str, frozenset[str]] = {
     # Parfumo pages have no FG status pyramid (wear votes, performance/value/
     # community-interest distributions) and review text is never ingested.

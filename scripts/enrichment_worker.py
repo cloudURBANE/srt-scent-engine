@@ -60,6 +60,7 @@ from enrichment_facts import (  # noqa: E402
     FACT_FIELDS,
     PAGE_DETERMINED_FACTS,
     SOURCE_UNSUPPLIABLE_FACTS,
+    concentration_meta_marks_ambiguous,
     expand_raw_accords,
     record_fact_status,
     year_meta_marks_unknown,
@@ -1872,12 +1873,20 @@ def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]
     raw_identity = payload.get("raw_identity")
     year_meta = raw_identity.get("year_meta") if isinstance(raw_identity, dict) else None
     year_unknown = year_meta_marks_unknown(year_meta)
+    # A bare name authoritatively stated in >=2 concentrations has no single value
+    # to fill; requeueing for it just re-bills Decodo to reach the same verdict.
+    # Marker may sit on raw_identity or the top-level payload.
+    conc_meta = raw_identity.get("concentration_meta") if isinstance(raw_identity, dict) else None
+    concentration_ambiguous = concentration_meta_marks_ambiguous(
+        conc_meta
+    ) or concentration_meta_marks_ambiguous(payload.get("concentration_meta"))
     return [
         field
         for field in facts_missing
         if field not in unsuppliable
         and field not in PAGE_DETERMINED_FACTS
         and not (field == "year" and year_unknown)
+        and not (field == "concentration" and concentration_ambiguous)
     ]
 
 
