@@ -64,6 +64,7 @@ from enrichment_facts import (
     non_perfume_signal,
     record_source,
     sanitize_derived_metrics,
+    year_meta_marks_unknown,
 )
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
@@ -1663,6 +1664,10 @@ def _details_to_dict(
         "name": selected.name,
         "house": selected.brand,
         "year": _coerce_year(selected.year),
+        # True only when an authoritative DB explicitly states the year is unknown
+        # (a durable fact). The SPA renders this as "Unknown" rather than hiding the
+        # year row, so a known-unknown reads differently from a not-yet-fetched gap.
+        "year_unknown": bool(getattr(details, "year_unknown", False)),
         "image_url": getattr(selected, "image_url", None),
         "gender": details.gender,
         "concentration": concentration,
@@ -4287,6 +4292,10 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
     ).strip()
     if concentration:
         setattr(details, "concentration", concentration)
+    # Surface the authoritative "release year is unknown" signal the resolver
+    # already recorded, so the SPA can render an explicit "Unknown" rather than a
+    # blank-looking year card (a genuinely-unknown year is a fact, not a gap).
+    setattr(details, "year_unknown", year_meta_marks_unknown(raw_identity.get("year_meta")))
     setattr(details, "_had_stored_derived_metrics", stored_derived_metrics is not None)
     for raw_review in list(bn_raw.get("reviews") or []) + list(fg_raw.get("reviews") or []):
         if isinstance(raw_review, dict) and raw_review.get("text"):

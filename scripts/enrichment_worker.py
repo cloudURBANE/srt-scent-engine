@@ -62,6 +62,7 @@ from enrichment_facts import (  # noqa: E402
     SOURCE_UNSUPPLIABLE_FACTS,
     expand_raw_accords,
     record_fact_status,
+    year_meta_marks_unknown,
 )
 
 DEFAULT_API_BASE_URL = "https://srt-scent-engine-production.up.railway.app"
@@ -1870,10 +1871,7 @@ def _heal_worthy_missing_facts(payload: dict[str, Any], facts_missing: list[str]
     # Decodo until the churn guard trips. Treat it as page-determined for THIS row.
     raw_identity = payload.get("raw_identity")
     year_meta = raw_identity.get("year_meta") if isinstance(raw_identity, dict) else None
-    year_unknown = (
-        isinstance(year_meta, dict)
-        and year_meta.get("source") == "decodo_serp_authoritative_unknown"
-    )
+    year_unknown = year_meta_marks_unknown(year_meta)
     return [
         field
         for field in facts_missing

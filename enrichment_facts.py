@@ -301,6 +301,23 @@ _COVERAGE_FACTS = ("performance_score", "value_score", "community_interest_score
 # a row, it only burns resolver budget until the requested_count churn guard
 # trips. Facts NOT listed (e.g. concentration, year, gender, notes, family,
 # main_accords) stay heal-worthy for that source.
+# A ``year_meta`` blob carrying this source marker means an authoritative
+# fragrance DB (Parfumo/Fragrantica) *explicitly* states the release year is
+# unknown -- a durable, page-determined fact rather than a not-yet-fetched gap.
+# The worker stops requeueing for such a year, and the API surfaces it so the SPA
+# can render an explicit "Unknown" instead of a blank-looking metric. The marker
+# string itself is minted in year_resolver.extract_year_unknown_signal.
+YEAR_AUTHORITATIVE_UNKNOWN_SOURCE = "decodo_serp_authoritative_unknown"
+
+
+def year_meta_marks_unknown(year_meta: Any) -> bool:
+    """True when ``year_meta`` authoritatively states the release year is unknown."""
+    return (
+        isinstance(year_meta, dict)
+        and year_meta.get("source") == YEAR_AUTHORITATIVE_UNKNOWN_SOURCE
+    )
+
+
 SOURCE_UNSUPPLIABLE_FACTS: dict[str, frozenset[str]] = {
     # Parfumo pages have no FG status pyramid (wear votes, performance/value/
     # community-interest distributions) and review text is never ingested.

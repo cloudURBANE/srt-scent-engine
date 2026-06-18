@@ -858,6 +858,55 @@ def test_concentration_pipeline() -> None:
         getattr(stored_details, "concentration", None) == "Extrait",
     )
 
+    # year_unknown plumbing: a year the resolver authoritatively marked unknown is
+    # a durable fact, so the detail response must expose a boolean the SPA can
+    # render as an explicit "Unknown" instead of hiding the row.
+    import enrichment_facts as _ef
+
+    check(
+        "year_meta_marks_unknown flags the authoritative-unknown source",
+        _ef.year_meta_marks_unknown({"source": "decodo_serp_authoritative_unknown"}),
+    )
+    check(
+        "year_meta_marks_unknown ignores a real release year_meta",
+        not _ef.year_meta_marks_unknown({"source": "decodo_serp_explicit_release", "year": 2019}),
+    )
+    check(
+        "year_meta_marks_unknown tolerates non-dict input",
+        not _ef.year_meta_marks_unknown(None),
+    )
+
+    unknown_record = {
+        **record,
+        "fg_raw": {
+            **record["fg_raw"],
+            "raw_identity": {"year_meta": {"source": "decodo_serp_authoritative_unknown"}},
+        },
+    }
+    unknown_details = api._details_from_fragrance_record(unknown_record)
+    check(
+        "authoritative-unknown year surfaces year_unknown on details",
+        getattr(unknown_details, "year_unknown", False) is True,
+    )
+    selected_unknown = api.engine.UnifiedFragrance(
+        name="Test", brand="Test House", year="", frag_url=record["canonical_fg_url"]
+    )
+    payload_unknown = api._details_to_dict(selected_unknown, unknown_details)
+    check(
+        "details payload exposes year_unknown=True for an authoritative unknown",
+        payload_unknown.get("year_unknown") is True,
+    )
+
+    known_details = api._details_from_fragrance_record(record)
+    selected_known = api.engine.UnifiedFragrance(
+        name="Test", brand="Test House", year="2026", frag_url=record["canonical_fg_url"]
+    )
+    payload_known = api._details_to_dict(selected_known, known_details)
+    check(
+        "details payload defaults year_unknown=False without the signal",
+        payload_known.get("year_unknown") is False,
+    )
+
     captured_upsert: dict[str, object] = {}
     saved_enabled = api.db.ENABLED
     saved_upsert_details = api.db.upsert_fragrance_details
