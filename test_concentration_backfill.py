@@ -128,3 +128,77 @@ def test_basenotes_title_extracts_pure_concentration(title, brand, name, expecte
 )
 def test_basenotes_title_rejects_flankers_and_silence(title, brand, name):
     assert ec._concentration_from_product_title(title, brand, name) is None
+
+
+# --- Online engine-gap resolver: strict -> Decodo Basenotes-title -> Tier-2 SERP.
+#     The contract that keeps `--engine-gap --online` safe to point at the
+#     production fragrance_records table: it layers only SOURCE-STATED tiers on
+#     top of strict and never falls through to a brand/pillar-prior guess.
+def _strict_hit(label="EDP (Eau de Parfum)"):
+    return {"concentration": label, "concentration_meta": {"source": "name_explicit"}}
+
+
+def test_online_short_circuits_on_strict(monkeypatch):
+    """A strict ground-truth hit returns immediately; no Decodo or SERP call."""
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: _strict_hit())
+    monkeypatch.setattr(
+        ec, "_basenotes_title_concentration",
+        lambda b, n: pytest.fail("Decodo tier must not run when strict resolves"),
+    )
+    monkeypatch.setattr(
+        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run when strict resolves")
+    )
+    res = ec.resolve_concentration_online("Chanel", "Bleu de Chanel Parfum")
+    assert res["concentration_meta"]["source"] == "name_explicit"
+
+
+def test_online_falls_back_to_basenotes_title(monkeypatch):
+    """When strict can't parse, the Decodo Basenotes-title tier fills it."""
+    bn = {"concentration": "EDP (Eau de Parfum)", "concentration_meta": {"source": "basenotes_title"}}
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
+    monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: bn)
+    monkeypatch.setattr(
+        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run when Basenotes resolves")
+    )
+    res = ec.resolve_concentration_online("Lattafa", "Ramz Gold")
+    assert res["concentration_meta"]["source"] == "basenotes_title"
+
+
+def test_online_falls_through_to_serp_when_browser_enabled(monkeypatch):
+    serp = {"concentration": "EDT (Eau de Toilette)", "concentration_meta": {"source": "semantic_engine_v6"}}
+    captured = {}
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
+    monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
+    def _fake_serp(q):
+        captured["q"] = q
+        return serp
+
+    monkeypatch.setattr(ec, "_tier2_serp", _fake_serp)
+    res = ec.resolve_concentration_online("Dior", "Sauvage", use_browser=True)
+    assert res["concentration_meta"]["source"] == "semantic_engine_v6"
+    assert captured["q"] == "Dior Sauvage"
+
+
+def test_online_tier1_only_never_touches_serp(monkeypatch):
+    """use_browser=False (--tier1-only) stops at the offline+Decodo tiers."""
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
+    monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
+    monkeypatch.setattr(
+        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run under --tier1-only")
+    )
+    assert ec.resolve_concentration_online("Dior", "Sauvage", use_browser=False) is None
+
+
+def test_online_never_returns_a_prior_guess(monkeypatch):
+    """Ground-truth contract: when every source-stated tier is silent the online
+    resolver returns None -- it must NOT fall through to the brand/pillar priors
+    that the wardrobe path (resolve_concentration) uses, which would write a guess
+    into the engine cache."""
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
+    monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
+    monkeypatch.setattr(ec, "_tier2_serp", lambda q: None)
+    monkeypatch.setattr(
+        ec, "resolve_concentration",
+        lambda *a, **k: pytest.fail("online must not reach the prior-bearing wardrobe resolver"),
+    )
+    assert ec.resolve_concentration_online("Creed", "Aventus", use_browser=True) is None
