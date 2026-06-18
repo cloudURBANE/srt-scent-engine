@@ -58,6 +58,12 @@
 .EXAMPLE
     # Heal the leftover no_engine_match wardrobe rows end-to-end:
     railway run -s lively-adaptation -- pwsh -File scripts\drain_fast.ps1 -Seed -Workers 6
+
+.EXAMPLE
+    # Also close the engine-cache concentration gap during the drain (fast Decodo
+    # Basenotes-title tier only). Without -OnlineConcentration the heal's
+    # concentration step is strict-offline and resolves 0 on those rows.
+    railway run -s lively-adaptation -- pwsh -File scripts\drain_fast.ps1 -OnlineConcentration -Tier1Only -Workers 6
 #>
 [CmdletBinding()]
 param(
@@ -78,6 +84,16 @@ param(
     # scrapes them, and the final heal projects year/gender/family into the
     # wardrobe. Idempotent (dedupes on the same identity job key the SPA writes).
     [switch]$Seed,
+    # Run the heal's concentration step with the online Decodo Basenotes-title
+    # tier (heal_offline.py --online) instead of strict-offline. Without this the
+    # heal's engine-gap sweep is zero-network and resolves 0 on rows whose source
+    # states a concentration that offline can't parse -- so a plain drain no-ops
+    # on the engine-cache concentration gap forever. Requires Decodo creds in env
+    # (you get them under `railway run`); no-ops back to strict without them.
+    [switch]$OnlineConcentration,
+    # With -OnlineConcentration, stop before the slow Tier-2 SERP/browser tier
+    # (Decodo Basenotes-title only -- fast). Recommended for routine drains.
+    [switch]$Tier1Only,
     # Verbose per-job engine output: resolution path, concentration source,
     # fetch diagnostics (passes --debug to the worker).
     [switch]$WorkerDebug,
@@ -131,10 +147,20 @@ if ($decodoOn -ne "1") {
     Write-Host "Decodo egress path: ON (parallel workers active)." -ForegroundColor Green
 }
 
+# Extra heal flags shared by both passes. -OnlineConcentration turns the
+# concentration step's engine-gap sweep from strict-offline (resolves 0 on
+# source-stated-but-unparsed rows) into the Decodo Basenotes-title tier so a
+# routine drain actually closes the engine-cache concentration gap.
+$HealArgs = @()
+if ($OnlineConcentration) {
+    $HealArgs += "--online"
+    if ($Tier1Only) { $HealArgs += "--tier1-only" }
+}
+
 # --- 1. Cheap offline heal up front (no scraping) ----------------------------
 if (-not $SkipHeal) {
-    Write-Step "Up-front heal (offline projection, no scrape)"
-    & $Python $Heal
+    Write-Step "Up-front heal (offline projection$(if ($OnlineConcentration) { ' + online concentration' }))"
+    & $Python $Heal @HealArgs
     if ($LASTEXITCODE -ne 0) { Write-Warning "heal_offline.py exited $LASTEXITCODE (continuing)" }
 }
 
@@ -189,7 +215,7 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
 # --- 3. ONE final heal: project everything just scraped into the wardrobe ----
 if (-not $SkipHeal) {
     Write-Step "Final heal (project scraped facts into wardrobe)"
-    & $Python $Heal
+    & $Python $Heal @HealArgs
     if ($LASTEXITCODE -ne 0) { Write-Warning "heal_offline.py exited $LASTEXITCODE" }
 }
 
