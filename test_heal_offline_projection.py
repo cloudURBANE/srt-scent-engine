@@ -219,6 +219,36 @@ def main() -> int:
         heal._sanitize_wardrobe_blob(no_match_row) is False,
     )
 
+    # Taxonomy normalization backstop (dirty_data.normalize_row wired into the
+    # sweep): lowercase accords/family -> Title Case, the Chypere typo, and a
+    # numeric-string year -> int, all on a row with no derived_metrics junk at all.
+    taxo_row = {
+        "accords": ["citrus", "warm spicy", "musk"],
+        "family": "fruity chypere",
+        "year": "2007",
+        "derived_metrics": {},
+    }
+    taxo_changed = heal._sanitize_wardrobe_blob(taxo_row)
+    ok &= _check(
+        "taxonomy backstop normalizes casing/typo/year with no engine match or DM junk",
+        taxo_changed is True
+        and taxo_row["accords"] == ["Citrus", "Warm Spicy", "Musk"]
+        and taxo_row["family"] == "Fruity Chypre"
+        and taxo_row["year"] == 2007,
+    )
+    ok &= _check(
+        "taxonomy backstop is idempotent (already-clean row reports no change)",
+        heal._sanitize_wardrobe_blob(taxo_row) is False,
+    )
+    # Deprecated 'Oriental' is a SEMANTIC remap -> flagged in the audit, never
+    # auto-rewritten by the sweep (would silently move the family bucket).
+    oriental_row = {"family": "Oriental", "accords": ["Amber"], "derived_metrics": {}}
+    ok &= _check(
+        "deprecated Oriental family is left untouched by the safe sweep",
+        heal._sanitize_wardrobe_blob(oriental_row) is False
+        and oriental_row["family"] == "Oriental",
+    )
+
     print("ALL CHECKS PASSED" if ok else "CHECKS FAILED")
     return 0 if ok else 1
 

@@ -190,6 +190,7 @@ from enrichment_facts import (  # noqa: E402
     top_accords_from,
 )
 import enrich_concentration as conc  # noqa: E402
+from dirty_data import normalize_row  # noqa: E402  (taxonomy casing/typo/year-type backstop)
 
 # enrich_database_metrics runs an import-time loader that UNCONDITIONALLY clobbers
 # os.environ from huge_monorepo/.env -- intentional for its OWN standalone run
@@ -1035,13 +1036,20 @@ def _sanitize_wardrobe_blob(payload: dict[str, Any]) -> bool:
     every row regardless of match, mutating ``payload`` in place. Returns whether
     it removed any junk.
     """
+    changed = False
     dm = payload.get("derived_metrics")
-    if not sanitize_derived_metrics(dm):
-        return False
-    clean = top_accords_from(dm)
-    if clean and clean != _str_accords(payload.get("accords")):
-        payload["accords"] = clean
-    return True
+    if sanitize_derived_metrics(dm):
+        clean = top_accords_from(dm)
+        if clean and clean != _str_accords(payload.get("accords")):
+            payload["accords"] = clean
+        changed = True
+    # Taxonomy normalization (accord/family casing, the Chypere typo, numeric-year
+    # type, junk-accord drop) runs on EVERY row regardless of engine match or DM
+    # junk -- the forward-focused backstop so casing dirt can't accumulate again.
+    # Idempotent: a second pass is a no-op. See scripts/dirty_data.py.
+    if normalize_row(payload):
+        changed = True
+    return changed
 
 
 def heal_wardrobe(
