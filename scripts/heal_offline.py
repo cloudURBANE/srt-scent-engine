@@ -499,15 +499,27 @@ def heal_metrics(records: list[dict[str, Any]], *, dry_run: bool) -> dict[str, i
 # Step 2 -- concentration (engine cache)
 # --------------------------------------------------------------------------
 def heal_concentration(
-    records: list[dict[str, Any]] | None, *, dry_run: bool
+    records: list[dict[str, Any]] | None,
+    *,
+    dry_run: bool,
+    online: bool = False,
+    tier1_only: bool = False,
 ) -> dict[str, int]:
     """Strict-offline concentration backfill on fragrance_records / fg_detail_cache.
 
     When ``records`` is None this delegates to the existing --engine-gap sweep
     (full table). When a scoped record subset is given (the 5-fragrance test) it
-    resolves just those identities so the test stays cheap and targeted."""
+    resolves just those identities so the test stays cheap and targeted.
+
+    With ``online`` the full-table sweep uses the Decodo Basenotes-title tier
+    (and Tier-2 SERP unless ``tier1_only``) on top of the strict resolver, so a
+    routine drain can close the engine-cache concentration gap instead of
+    no-op'ing on it. No-ops back to strict when no Decodo creds are set. The
+    scoped subset path stays strict-offline (it's the cheap test path)."""
     if records is None:
-        ns = argparse.Namespace(dry_run=dry_run, limit=None)
+        ns = argparse.Namespace(
+            dry_run=dry_run, limit=None, online=online, tier1_only=tier1_only
+        )
         conc.run_engine_gap(ns)
         return {}
 
@@ -1323,6 +1335,20 @@ def main() -> int:
         help="scope the engine-cache steps to these fragrance_records keys (repeatable). "
         "Wardrobe projection is restricted to rows matching these records' identities.",
     )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="run the concentration step's full-table engine-gap sweep with the "
+        "Decodo Basenotes-title tier (and Tier-2 SERP unless --tier1-only) on top "
+        "of the strict resolver. No-ops without Decodo creds. Default stays "
+        "strict-offline so a plain heal makes no network calls.",
+    )
+    parser.add_argument(
+        "--tier1-only",
+        action="store_true",
+        help="with --online, stop before the slow Tier-2 SERP/browser tier "
+        "(Decodo Basenotes-title only).",
+    )
     args = parser.parse_args()
 
     db.init_db()
@@ -1351,7 +1377,12 @@ def main() -> int:
     if "metrics" in steps:
         heal_metrics(subset, dry_run=args.dry_run)
     if "concentration" in steps:
-        heal_concentration(subset if scoped else None, dry_run=args.dry_run)
+        heal_concentration(
+            subset if scoped else None,
+            dry_run=args.dry_run,
+            online=args.online,
+            tier1_only=args.tier1_only,
+        )
     if "wardrobe" in steps:
         index = _build_engine_index(subset if scoped else all_records)
         only_keys = (
