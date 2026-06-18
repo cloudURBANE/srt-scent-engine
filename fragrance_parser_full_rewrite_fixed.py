@@ -663,9 +663,23 @@ class IdentityTools:
             if token in IdentityTools.GENDER_TOKEN_GROUPS
         }
 
+    # "Eau de Parfum / Toilette / Cologne" is a concentration descriptor, not a
+    # distinguishing part of the name. Its "eau" must not be counted as a
+    # required name marker, or a base title ("No 5") can never match its own
+    # concentration variant ("No 5 Eau de Parfum") -- even though "No 5 Parfum"
+    # matches fine. Only the full concentration phrase is stripped, so a genuine
+    # "Eau ..." name word ("Eau Sauvage", "Eau de Cartier") keeps its marker.
+    _CONCENTRATION_MARKER_PHRASE_RE = re.compile(
+        r"\beau\s+de\s+(?:parfum|toilette|cologne)\b"
+    )
+
     @staticmethod
     def required_name_markers(name: str, brand: str = "") -> set[str]:
-        tokens = IdentityTools.name_tokens_keep_stopwords(name, brand)
+        normalized = TextSanitizer.normalize_identity(name)
+        normalized = IdentityTools._CONCENTRATION_MARKER_PHRASE_RE.sub(" ", normalized)
+        tokens = {tok for tok in normalized.split() if tok}
+        if brand:
+            tokens -= IdentityTools.brand_tokens_keep_stopwords(brand)
         return tokens & IdentityTools.REQUIRED_NAME_MARKER_TOKENS
         
     @staticmethod

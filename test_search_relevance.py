@@ -266,6 +266,44 @@ def test_typed_concentration_keeps_exact_match() -> None:
           str([item.name for item in sauvage]))
 
 
+def test_concentration_phrase_is_not_a_required_name_marker() -> None:
+    # Regression: required_name_markers() treated the "eau" inside the
+    # concentration descriptor "Eau de Parfum/Toilette/Cologne" as a required
+    # name marker. A bare base title ("No 5") therefore scored 0.00 against its
+    # own EDP catalog entry ("No 5 Eau de Parfum") -- even though "No 5 Parfum"
+    # scored 0.96 -- so the worker resolver rejected the correct Chanel No 5 page
+    # and completed the job with fg_url=None, leaving the wardrobe row stuck on
+    # junk (citrus/Comete) data. Stripping the concentration phrase before marker
+    # extraction fixes the asymmetry while keeping genuine "Eau ..." name words
+    # ("Eau Sauvage", "Eau de Cartier") distinct from their non-"eau" siblings.
+    O = engine.Orchestrator
+    print("Concentration-phrase marker checks:")
+
+    def score(an: str, ab: str, bn: str, bb: str) -> float:
+        a = engine.UnifiedFragrance(name=an, brand=ab, year="")
+        b = engine.CatalogItem(name=bn, brand=bb, year="", url="x")
+        return O.identity_score(a, b)
+
+    # The bug: bare base title must now match its own concentration variant.
+    for variant in ("No 5 Eau de Parfum", "Chanel No 5 Eau de Parfum",
+                    "No 5 Eau de Toilette", "No 5 Eau de Cologne"):
+        s = score("No 5", "Chanel", variant, "Chanel")
+        check(f"'No 5' matches {variant!r}", s >= O.CATALOG_ACCEPT, f"score={s:.3f}")
+
+    # A genuinely different flanker is NOT a concentration variant: stays low.
+    s = score("No 5", "Chanel", "No 5 Eau Premiere", "Chanel")
+    check("'No 5' still rejects 'No 5 Eau Premiere' flanker", s == 0.0, f"score={s:.3f}")
+
+    # Regressions: a real "Eau ..." NAME word must stay distinct from its sibling.
+    s = score("Sauvage", "Dior", "Eau Sauvage", "Dior")
+    check("'Sauvage' stays distinct from 'Eau Sauvage'", s == 0.0, f"score={s:.3f}")
+    s = score("Cartier", "Cartier", "Eau de Cartier", "Cartier")
+    check("'Cartier' stays distinct from 'Eau de Cartier'", s == 0.0, f"score={s:.3f}")
+    # ...but each of those still matches its OWN concentration variant.
+    s = score("Eau Sauvage", "Dior", "Eau Sauvage Eau de Parfum", "Dior")
+    check("'Eau Sauvage' matches its EDP variant", s >= O.CATALOG_ACCEPT, f"score={s:.3f}")
+
+
 def test_normalize_notes_flattens_to_independent_layers() -> None:
     print("Note normalization aliasing checks:")
     notes = engine.NotesList(
@@ -1921,6 +1959,7 @@ def main() -> int:
     test_stopword_names_are_not_rejected()
     test_multi_token_brand_only_query_keeps_whole_house()
     test_typed_concentration_keeps_exact_match()
+    test_concentration_phrase_is_not_a_required_name_marker()
     test_normalize_notes_flattens_to_independent_layers()
     test_cache_search_rejects_same_house_sibling()
     test_aggregate_cache_search_does_not_expose_unproven_image()
