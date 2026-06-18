@@ -32,15 +32,25 @@ $Token   = $env:ENRICHMENT_WORKER_TOKEN
 if (-not $Token) { throw "No ENRICHMENT_WORKER_TOKEN in env. Launch under ``railway run -s lively-adaptation -- ...``." }
 $headers = @{ Authorization = "Bearer $Token" }
 
-# Page through every record (API clamps limit to 500/page).
+# Page through every record (API clamps limit to 500/page). The per-page
+# *_field_counts are scoped to that page only, so accumulate them across pages
+# -- reading just the first page's counts (the old bug) under-reported every
+# fact on a >500-record DB.
 $all = @()
 $totals = $null
 $offset = 0
+$rawCounts = [ordered]@{}
+$actCounts = [ordered]@{}
 do {
     $uri = "$ApiBase/api/enrichment/completeness?limit=500&offset=$offset&include_complete=false"
     $r = Invoke-RestMethod -Headers $headers -Uri $uri -TimeoutSec 60
     if (-not $totals) { $totals = $r }
     if ($r.items) { $all += $r.items }
+    foreach ($f in $r.fields) {
+        if (-not $rawCounts.Contains($f)) { $rawCounts[$f] = 0; $actCounts[$f] = 0 }
+        if ($r.missing_field_counts.$f) { $rawCounts[$f] += [int]$r.missing_field_counts.$f }
+        if ($r.actionable_missing_field_counts.$f) { $actCounts[$f] += [int]$r.actionable_missing_field_counts.$f }
+    }
     $offset += 500
 } while ($offset -lt [int]$totals.total_records)
 
@@ -58,10 +68,10 @@ Write-Host "`n=== Completeness audit ($ApiBase) ===" -ForegroundColor Cyan
     non_actionable        = $all.Count - $actionable.Count
 } | Format-List
 
-Write-Host "Missing-fact counts (raw, across all records):" -ForegroundColor Cyan
-$totals.missing_field_counts | ConvertTo-Json -Compress | Write-Host
+Write-Host "Missing-fact counts (raw, across ALL records):" -ForegroundColor Cyan
+($rawCounts | ConvertTo-Json -Compress) | Write-Host
 Write-Host "Missing-fact counts (ACTIONABLE -- what a drain can target):" -ForegroundColor Cyan
-$totals.actionable_missing_field_counts | ConvertTo-Json -Compress | Write-Host
+($actCounts | ConvertTo-Json -Compress) | Write-Host
 
 # Which single fact is most often the lone gap? (the "passes as complete but
 # missing one thing" bucket)
