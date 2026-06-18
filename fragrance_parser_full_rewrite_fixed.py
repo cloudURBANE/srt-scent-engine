@@ -655,6 +655,17 @@ class IdentityTools:
         return {t for t in tokens if t not in brand_tokens}
 
     @staticmethod
+    def name_tokens_keep_stopwords_without_concentration(
+        name: str,
+        brand: str = "",
+    ) -> set[str]:
+        normalized = TextSanitizer.normalize_identity(name)
+        normalized = IdentityTools._CONCENTRATION_MARKER_PHRASE_RE.sub(" ", normalized)
+        tokens = {token for token in normalized.split() if token}
+        brand_tokens = IdentityTools.brand_tokens_keep_stopwords(brand) if brand else set()
+        return tokens - brand_tokens
+
+    @staticmethod
     def gender_marker_groups(name: str, brand: str = "") -> set[str]:
         tokens = IdentityTools.name_tokens_keep_stopwords(name, brand)
         return {
@@ -675,11 +686,7 @@ class IdentityTools:
 
     @staticmethod
     def required_name_markers(name: str, brand: str = "") -> set[str]:
-        normalized = TextSanitizer.normalize_identity(name)
-        normalized = IdentityTools._CONCENTRATION_MARKER_PHRASE_RE.sub(" ", normalized)
-        tokens = {tok for tok in normalized.split() if tok}
-        if brand:
-            tokens -= IdentityTools.brand_tokens_keep_stopwords(brand)
+        tokens = IdentityTools.name_tokens_keep_stopwords_without_concentration(name, brand)
         return tokens & IdentityTools.REQUIRED_NAME_MARKER_TOKENS
         
     @staticmethod
@@ -9838,8 +9845,14 @@ class Orchestrator:
         
         score = 0.0
         if not a_name or not b_name:
-            keep_a_name = IdentityTools.name_tokens_keep_stopwords(a_name_raw, getattr(a, "brand", ""))
-            keep_b_name = IdentityTools.name_tokens_keep_stopwords(b_name_raw, getattr(b, "brand", ""))
+            keep_a_name = IdentityTools.name_tokens_keep_stopwords_without_concentration(
+                a_name_raw,
+                getattr(a, "brand", ""),
+            )
+            keep_b_name = IdentityTools.name_tokens_keep_stopwords_without_concentration(
+                b_name_raw,
+                getattr(b, "brand", ""),
+            )
             score = Orchestrator._name_token_score(keep_a_name, keep_b_name)
             if score == 0.0:
                 ratio = IdentityTools.seq_ratio(a_name_raw, b_name_raw)

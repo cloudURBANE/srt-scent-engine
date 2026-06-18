@@ -303,6 +303,21 @@ def test_concentration_phrase_is_not_a_required_name_marker() -> None:
     s = score("Eau Sauvage", "Dior", "Eau Sauvage Eau de Parfum", "Dior")
     check("'Eau Sauvage' matches its EDP variant", s >= O.CATALOG_ACCEPT, f"score={s:.3f}")
 
+    # When removing the house leaves only stopwords, the fallback scorer must
+    # strip the concentration phrase too. Otherwise these valid pairs score
+    # 0.68, below CATALOG_ACCEPT, despite retaining their genuine leading "Eau".
+    for base, brand, variant in (
+        ("Eau de Cartier", "Cartier", "Eau de Cartier Eau de Parfum"),
+        ("Eau de Rochas", "Rochas", "Eau de Rochas Eau de Toilette"),
+    ):
+        for left, right in ((base, variant), (variant, base)):
+            s = score(left, brand, right, brand)
+            check(
+                f"{left!r} matches {right!r}",
+                s >= O.CATALOG_ACCEPT,
+                f"score={s:.3f}",
+            )
+
 
 def test_normalize_notes_flattens_to_independent_layers() -> None:
     print("Note normalization aliasing checks:")

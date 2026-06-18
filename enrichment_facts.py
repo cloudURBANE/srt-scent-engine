@@ -158,6 +158,56 @@ def is_junk_accord_label(label: Any) -> bool:
     return False
 
 
+def sanitize_derived_metrics(derived_metrics: Any) -> bool:
+    """Strip scraped-junk accord labels from a stored derived_metrics blob, in place.
+
+    ``build_derived_metrics`` drops junk (vote counts like 14.9K, the Hate/Like
+    rating buckets, season/time buckets, and "sponsored" ad copy) at *compute*
+    time, but any blob that was stored before a given junk label entered
+    :func:`is_junk_accord_label` keeps it baked into ``main_accords``.
+    :func:`top_accords_from` re-filters the plain ``top_accords`` *list* on every
+    read -- yet nothing ever re-filtered the scored ``scent_vector``, and the SPA
+    accord card renders its percentages from ``scent_vector``. That is how
+    "sponsored 100%" kept showing on the card long after the filter learned the
+    label: the clean list was served alongside a dirty vector.
+
+    This is the read/projection-time backstop that converges any stored blob onto
+    the clean accord set without a network recompute. It mutates ``main_accords``
+    in place (the blob is always a freshly deserialized copy at the call sites)
+    and returns ``True`` when it removed at least one junk entry.
+    """
+    if not isinstance(derived_metrics, dict):
+        return False
+    main = derived_metrics.get("main_accords")
+    if not isinstance(main, dict):
+        return False
+    changed = False
+    vector = main.get("scent_vector")
+    if isinstance(vector, list):
+        cleaned = [
+            item
+            for item in vector
+            if isinstance(item, dict) and not is_junk_accord_label(item.get("accord"))
+        ]
+        if len(cleaned) != len(vector):
+            # Re-sort so the highest-scoring real accord leads the card now that
+            # a junk entry (which sorted to the top on its inflated %) is gone.
+            cleaned.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+            main["scent_vector"] = cleaned
+            changed = True
+    top = main.get("top_accords")
+    if isinstance(top, list):
+        cleaned_top = [
+            s
+            for item in top
+            if (s := str(item).strip()) and not is_junk_accord_label(s)
+        ]
+        if cleaned_top != [str(item).strip() for item in top]:
+            main["top_accords"] = cleaned_top
+            changed = True
+    return changed
+
+
 def top_accords_from(source: Any) -> list[str]:
     dm = _derived_metrics_from(source)
     main = dm.get("main_accords") if isinstance(dm, dict) else None

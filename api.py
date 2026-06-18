@@ -63,6 +63,7 @@ from enrichment_facts import (
     missing_facts,
     non_perfume_signal,
     record_source,
+    sanitize_derived_metrics,
 )
 import fragrance_parser_full_rewrite_fixed as engine
 import mobile
@@ -1647,6 +1648,12 @@ def _details_to_dict(
     was hydrated from fg_detail_cache_v1.json. See `_source_coverage`.
     """
     engine.heal_missing_gender_and_year(selected, details)
+    # Backstop: drop scraped-junk accords (e.g. a stale "sponsored 100%") from a
+    # stored derived_metrics blob before it reaches the SPA accord card. Fresh
+    # builds are already clean; this converges blobs persisted before the junk
+    # label entered the filter, without a network recompute. See
+    # enrichment_facts.sanitize_derived_metrics.
+    sanitize_derived_metrics(getattr(details, "derived_metrics", None))
     notes = details.notes
     concentration = getattr(details, "concentration", None)
     family_facts = derive_families(details)
@@ -4391,6 +4398,7 @@ def _persist_detail_record(
             and not _review_source_is(r, "fragrantica")
         ]
         notes_blob = _notes_to_dict(details.notes)
+        concentration = str(getattr(details, "concentration", "") or "").strip()
         db.upsert_fragrance_details(
             {
                 "canonical_fg_url": _canonical_fg_url(selected.frag_url),
@@ -4412,6 +4420,7 @@ def _persist_detail_record(
                     {
                         "frag_cards": details.frag_cards or {},
                         "notes": notes_blob,
+                        "concentration": concentration or None,
                         "pros_cons": details.pros_cons or [],
                         "reviews": fg_reviews,
                     }
