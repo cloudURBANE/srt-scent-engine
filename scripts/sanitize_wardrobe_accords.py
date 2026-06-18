@@ -53,8 +53,12 @@ def _sweep(cur, table: str, col: str, commit: bool) -> int:
             name = blob.get("name")
             print(f"  [{table}] {rid} {brand} {name} -> sanitized")
             if commit:
+                # Bump updated_at so the GET /api/wardrobe weak ETag
+                # (W/"wardrobe-{count}-{maxUpdatedMs}") changes; otherwise the
+                # SPA gets a 304 and keeps rendering its cached junk blob.
                 cur.execute(
-                    f"UPDATE {table} SET {col} = %s WHERE id = %s", (Json(blob), rid)
+                    f"UPDATE {table} SET {col} = %s, updated_at = now() WHERE id = %s",
+                    (Json(blob), rid),
                 )
     print(f"{table}.{col}: scanned={len(rows)} cleaned={cleaned} committed={commit}")
     return cleaned

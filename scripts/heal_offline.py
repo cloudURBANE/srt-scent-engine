@@ -1146,7 +1146,8 @@ def heal_wardrobe(
             if (fam or cc or acc or wear or dm or notes or yr or gen or img or san) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
+                        "UPDATE user_fragrances SET fragrance_data = %s, "
+                        "updated_at = now() WHERE id = %s",
                         (Json(fdata), row["id"]),
                     )
 
@@ -1188,7 +1189,8 @@ def heal_wardrobe(
             if (fam or cc or acc or wear or dm or notes or yr or gen or img or san) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
+                        "UPDATE global_fragrances SET profile_data = %s, "
+                        "updated_at = now() WHERE id = %s",
                         (Json(pdata), row["id"]),
                     )
         if not dry_run:
