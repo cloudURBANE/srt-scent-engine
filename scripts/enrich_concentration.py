@@ -163,6 +163,35 @@ def _basenotes_title_concentration(brand: str, name: str) -> dict | None:
     return None
 
 
+def _tier2_serp(query: str) -> dict | None:
+    """Tier-2 SERP semantic engine (~58s, DrissionPage + DuckDuckGo).
+
+    Returns a resolved concentration dict only when the engine clears its
+    confidence floor (>=50); None on a low-confidence read or any analyze error.
+    Extracted so both the wardrobe resolver (``resolve_concentration``) and the
+    engine-gap online resolver (``resolve_concentration_online``) share one
+    implementation instead of duplicating the analyze + threshold logic.
+    """
+    try:
+        profile = SemanticScentEngine.analyze(query)
+    except Exception as exc:
+        print(f"  [WARN] Tier-2 analyze failed: {exc}")
+        return None
+
+    if profile and profile.primary_confidence >= 50:
+        scentcast = to_scentcast_concentration(profile.primary_concentration)
+        return {
+            "concentration": scentcast,
+            "concentration_meta": {
+                "confidence": profile.primary_confidence,
+                "source": "semantic_engine_v6",
+                "resolved_at": _now_iso(),
+                "engine_label": profile.primary_concentration,
+            },
+        }
+    return None
+
+
 def resolve_concentration(brand: str, name: str, use_browser: bool = True) -> dict | None:
     """
     Run Tier-1 (lexical, instant) then optionally Tier-2 (SERP, ~58s).
@@ -245,26 +274,7 @@ def resolve_concentration(brand: str, name: str, use_browser: bool = True) -> di
     if not use_browser:
         return None
 
-    # Tier 2 — SERP engine (~58s, uses DrissionPage + DuckDuckGo)
-    try:
-        profile = SemanticScentEngine.analyze(query)
-    except Exception as exc:
-        print(f"  [WARN] Tier-2 analyze failed: {exc}")
-        return None
-
-    if profile and profile.primary_confidence >= 50:
-        scentcast = to_scentcast_concentration(profile.primary_concentration)
-        return {
-            "concentration": scentcast,
-            "concentration_meta": {
-                "confidence": profile.primary_confidence,
-                "source": "semantic_engine_v6",
-                "resolved_at": _now_iso(),
-                "engine_label": profile.primary_concentration,
-            },
-        }
-
-    return None
+    return _tier2_serp(query)
 
 
 # Engine labels whose token is short and common enough to also appear inside a
@@ -341,6 +351,37 @@ def resolve_concentration_strict(brand: str, name: str) -> dict | None:
     }
 
 
+def resolve_concentration_online(
+    brand: str, name: str, use_browser: bool = True
+) -> dict | None:
+    """Engine-gap resolver that adds the Decodo/SERP tiers to the strict path.
+
+    The engine cache must stay ground-truth (``run_engine_gap`` writes straight
+    into ``fragrance_records``), so this deliberately layers only *source-stated*
+    signals on top of ``resolve_concentration_strict`` and SKIPS the brand- and
+    pillar-prior guesses that ``resolve_concentration`` (the wardrobe path) uses:
+
+      1. strict offline (Parfinity catalog + explicit house-stripped name token),
+      2. the authoritative Basenotes product-title tier via Decodo (no-ops without
+         Decodo creds), and
+      3. optionally the Tier-2 SERP semantic engine (browser, ~58s) when
+         ``use_browser`` is set and its confidence floor is cleared.
+
+    Returns a resolved dict or None. This is what lets ``--engine-gap --online``
+    fill the rows that strict-offline cannot, without ever writing an inference
+    into the engine cache.
+    """
+    res = resolve_concentration_strict(brand, name)
+    if res:
+        return res
+    bn_title = _basenotes_title_concentration(brand, name)
+    if bn_title:
+        return bn_title
+    if not use_browser:
+        return None
+    return _tier2_serp(f"{brand} {name}".strip())
+
+
 def fetch_engine_gap_rows(cur, limit: int | None) -> list[dict]:
     """fragrance_records identities whose concentration is null/empty/Unknown."""
     cur.execute(
@@ -369,16 +410,32 @@ def run_engine_gap(args: argparse.Namespace) -> None:
     """Backfill concentration straight off the engine's own completeness gap.
 
     Sweeps fragrance_records (the table the /api/enrichment/completeness audit
-    reads) for rows missing concentration, resolves each with the strict offline
-    resolver, and merge-writes via update_engine_cache_rows -- which preserves
-    notes/reviews/frag_cards and refuses to overwrite an existing value. Idempotent
-    and safe to re-run; dry-run prints every proposed change without writing.
+    reads) for rows missing concentration, resolves each row, and merge-writes via
+    update_engine_cache_rows -- which preserves notes/reviews/frag_cards and
+    refuses to overwrite an existing value. Idempotent and safe to re-run; dry-run
+    prints every proposed change without writing.
+
+    By default each row is resolved with the strict OFFLINE resolver (ground-truth
+    only, zero network). With ``--online`` it uses ``resolve_concentration_online``,
+    which adds the Decodo Basenotes-title tier (and, unless ``--tier1-only``, the
+    Tier-2 SERP engine) so rows the source page states but the offline tier can't
+    parse get filled -- still without writing a brand/pillar-prior guess into the
+    engine cache. ``--online`` no-ops back to strict when no Decodo creds are set.
     """
     db.init_db()
     if not db.ENABLED:
         raise RuntimeError("DATABASE_URL not configured.")
     DATABASE_URL = os.environ.get("DATABASE_URL")
     dry_run = args.dry_run
+    online = getattr(args, "online", False)
+    use_browser = not getattr(args, "tier1_only", False)
+    if online:
+        resolver = lambda h, n: resolve_concentration_online(h, n, use_browser=use_browser)
+    else:
+        resolver = resolve_concentration_strict
+    print(
+        f"engine-gap resolver: {'online (strict+Decodo' + ('' if use_browser else ', tier1-only') + ')' if online else 'strict-offline'}"
+    )
 
     with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
@@ -395,7 +452,7 @@ def run_engine_gap(args: argparse.Namespace) -> None:
             continue
         seen.add(key)
 
-        res = resolve_concentration_strict(house, name)
+        res = resolver(house, name)
         if not res:
             skipped += 1
             continue
@@ -650,6 +707,14 @@ def main() -> None:
         action="store_true",
         help="Backfill concentration on the engine's own fragrance_records "
         "completeness gap (strict offline resolver, merge-safe, idempotent).",
+    )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="With --engine-gap, add the Decodo Basenotes-title tier (and Tier-2 "
+        "SERP unless --tier1-only) on top of the strict resolver, so rows the "
+        "source states but offline can't parse get filled. No-ops without Decodo "
+        "creds. Never writes a brand/pillar-prior guess into the engine cache.",
     )
     args = parser.parse_args()
 
