@@ -61,6 +61,7 @@ from enrichment_facts import (
     expand_raw_accords,
     is_fact_complete,
     missing_facts,
+    concentration_meta_marks_ambiguous,
     non_perfume_signal,
     record_source,
     sanitize_derived_metrics,
@@ -1671,6 +1672,13 @@ def _details_to_dict(
         "image_url": getattr(selected, "image_url", None),
         "gender": details.gender,
         "concentration": concentration,
+        # True only when an authoritative source states the bare name in >=2
+        # concentrations (no single ground-truth value). The SPA renders "varies"
+        # rather than hiding the concentration row, distinguishing a known-ambiguous
+        # name from a not-yet-resolved gap.
+        "concentration_variant_ambiguous": bool(
+            getattr(details, "concentration_variant_ambiguous", False)
+        ),
         "family": family_facts.get("primary_family"),
         "families": family_facts.get("families") or [],
         "wear_profile": wear_profile,
@@ -4296,6 +4304,15 @@ def _details_from_fragrance_record(record: dict[str, Any]) -> engine.UnifiedDeta
     # already recorded, so the SPA can render an explicit "Unknown" rather than a
     # blank-looking year card (a genuinely-unknown year is a fact, not a gap).
     setattr(details, "year_unknown", year_meta_marks_unknown(raw_identity.get("year_meta")))
+    # Same idea on the concentration axis: the bare name is stated in >=2
+    # concentrations, so there is no single value. The SPA can render "varies"
+    # instead of a blank concentration card. Marker may sit on either blob.
+    setattr(
+        details,
+        "concentration_variant_ambiguous",
+        concentration_meta_marks_ambiguous(raw_identity.get("concentration_meta"))
+        or concentration_meta_marks_ambiguous(fg_raw.get("concentration_meta")),
+    )
     setattr(details, "_had_stored_derived_metrics", stored_derived_metrics is not None)
     for raw_review in list(bn_raw.get("reviews") or []) + list(fg_raw.get("reviews") or []):
         if isinstance(raw_review, dict) and raw_review.get("text"):

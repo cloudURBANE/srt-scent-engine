@@ -146,7 +146,7 @@ def test_online_short_circuits_on_strict(monkeypatch):
         lambda b, n: pytest.fail("Decodo tier must not run when strict resolves"),
     )
     monkeypatch.setattr(
-        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run when strict resolves")
+        ec, "_engine_tier2", lambda q: pytest.fail("SERP must not run when strict resolves")
     )
     res = ec.resolve_concentration_online("Chanel", "Bleu de Chanel Parfum")
     assert res["concentration_meta"]["source"] == "name_explicit"
@@ -158,7 +158,7 @@ def test_online_falls_back_to_basenotes_title(monkeypatch):
     monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
     monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: bn)
     monkeypatch.setattr(
-        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run when Basenotes resolves")
+        ec, "_engine_tier2", lambda q: pytest.fail("SERP must not run when Basenotes resolves")
     )
     res = ec.resolve_concentration_online("Lattafa", "Ramz Gold")
     assert res["concentration_meta"]["source"] == "basenotes_title"
@@ -169,11 +169,11 @@ def test_online_falls_through_to_serp_when_browser_enabled(monkeypatch):
     captured = {}
     monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
     monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
-    def _fake_serp(q):
+    def _fake_engine_tier2(q):
         captured["q"] = q
         return serp
 
-    monkeypatch.setattr(ec, "_tier2_serp", _fake_serp)
+    monkeypatch.setattr(ec, "_engine_tier2", _fake_engine_tier2)
     res = ec.resolve_concentration_online("Dior", "Sauvage", use_browser=True)
     assert res["concentration_meta"]["source"] == "semantic_engine_v6"
     assert captured["q"] == "Dior Sauvage"
@@ -184,9 +184,26 @@ def test_online_tier1_only_never_touches_serp(monkeypatch):
     monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
     monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
     monkeypatch.setattr(
-        ec, "_tier2_serp", lambda q: pytest.fail("SERP must not run under --tier1-only")
+        ec, "_engine_tier2", lambda q: pytest.fail("SERP must not run under --tier1-only")
     )
     assert ec.resolve_concentration_online("Dior", "Sauvage", use_browser=False) is None
+
+
+def test_online_surfaces_variant_ambiguous_marker(monkeypatch):
+    """When the engine Tier-2 reports variant-ambiguity, the online resolver passes
+    the marker through unchanged so run_engine_gap can stamp it (value stays blank)."""
+    marker = {
+        "concentration": None,
+        "variant_ambiguous": True,
+        "concentration_meta": {"source": ec.CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,
+                               "attested_concentrations": ["Eau de Parfum", "Eau de Toilette"]},
+    }
+    monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
+    monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
+    monkeypatch.setattr(ec, "_engine_tier2", lambda q: marker)
+    res = ec.resolve_concentration_online("Christian Dior", "J Adore", use_browser=True)
+    assert res["variant_ambiguous"] is True
+    assert res["concentration"] is None
 
 
 def test_online_never_returns_a_prior_guess(monkeypatch):
@@ -196,9 +213,201 @@ def test_online_never_returns_a_prior_guess(monkeypatch):
     into the engine cache."""
     monkeypatch.setattr(ec, "resolve_concentration_strict", lambda b, n: None)
     monkeypatch.setattr(ec, "_basenotes_title_concentration", lambda b, n: None)
-    monkeypatch.setattr(ec, "_tier2_serp", lambda q: None)
+    monkeypatch.setattr(ec, "_engine_tier2", lambda q: None)
     monkeypatch.setattr(
         ec, "resolve_concentration",
         lambda *a, **k: pytest.fail("online must not reach the prior-bearing wardrobe resolver"),
     )
     assert ec.resolve_concentration_online("Creed", "Aventus", use_browser=True) is None
+
+
+# --- Literal-support gate: the Tier-2 vote can be carried by the brand/pillar
+#     prior (an inference), but the engine ground-truth cache must only ever store
+#     a concentration a real source row STATED. resolve_concentration_online runs
+#     _tier2_serp with require_literal_support=True; the wardrobe path keeps the
+#     default (False) and is byte-for-byte unchanged.
+from concentration_grabber import ScentProfile  # noqa: E402
+
+
+def _profile(conc, *, conf=80, literal, literal_concs=None):
+    """A minimal Tier-2 ScentProfile carrying just the fields the gate reads."""
+    return ScentProfile(
+        query="q", is_explicit=False,
+        primary_concentration=conc, primary_confidence=conf,
+        second_concentration="EDT (Eau de Toilette)", second_confidence=0,
+        second_source="none", flankers_detected=[], scoring_matrix={},
+        primary_has_literal_support=literal,
+        literal_concentrations=literal_concs if literal_concs is not None else ([conc] if literal else []),
+    )
+
+
+def test_scentprofile_defaults_literal_support_true():
+    """Backward-compat: a profile built without the field (old cache payload, or
+    the explicit short-circuit) is treated as source-attested so the gate keeps
+    accepting it."""
+    p = ScentProfile(
+        query="q", is_explicit=True, primary_concentration="EDP (Eau de Parfum)",
+        primary_confidence=100, second_concentration="EDT (Eau de Toilette)",
+        second_confidence=0, second_source="none", flankers_detected=[], scoring_matrix={},
+    )
+    assert p.primary_has_literal_support is True
+
+
+def test_tier2_gate_rejects_prior_carried_win_for_engine_cache(monkeypatch):
+    """require_literal_support=True drops a confident win that no source row stated."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile("Parfum (Profumo)", literal=False)),
+    )
+    assert ec._tier2_serp("Roja Dove Scandal", require_literal_support=True) is None
+
+
+def test_tier2_gate_accepts_source_stated_win_for_engine_cache(monkeypatch):
+    """A win a real source row stated clears the gate and is written."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile("EDT (Eau de Toilette)", literal=True)),
+    )
+    res = ec._tier2_serp("Acqua Di Parma Colonia", require_literal_support=True)
+    assert res is not None
+    assert res["concentration_meta"]["source"] == "semantic_engine_v6"
+
+
+def test_tier2_wardrobe_path_keeps_prior_carried_win(monkeypatch):
+    """No-regression: the wardrobe resolver leans on priors, so the default
+    (require_literal_support=False) still returns a prior-carried win unchanged."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile("Parfum (Profumo)", literal=False)),
+    )
+    res = ec._tier2_serp("Roja Dove Scandal")  # default: no gate
+    assert res is not None
+    assert res["concentration_meta"]["source"] == "semantic_engine_v6"
+
+
+def test_analyze_marks_prior_carried_winner_unsupported(monkeypatch):
+    """analyze() itself sets primary_has_literal_support=False when the winning
+    concentration came only from `_pillar_default` ballots (source_kind 'pillar')
+    -- the brand/pillar prior, not a stated fact."""
+    SSE = ec.SemanticScentEngine
+    monkeypatch.setattr(ec, "_decodo_concentration_enabled", lambda: False, raising=False)
+    monkeypatch.setattr(SSE, "_explicit_intent", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_query_pillar_prior", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_brand_prior", staticmethod(lambda q: ("roja dove", "Parfum (Profumo)")))
+    monkeypatch.setattr(SSE, "_retry_fetch", staticmethod(
+        lambda page, q, sf, deadline=None: [{"title": "t", "url": "u", "domain": "d"}] if "fragrantica" in sf else []
+    ))
+    # Every classified row resolves to the prior via the pillar default.
+    monkeypatch.setattr(SSE, "_classify_result", staticmethod(
+        lambda row, q, brand, brand_prior: ("Parfum (Profumo)", "pillar", 30.0)
+    ))
+    prof = SSE.analyze("Roja Dove Scandal", use_cache=False, page=object())
+    assert prof.primary_concentration == "Parfum (Profumo)"
+    assert prof.primary_has_literal_support is False
+
+
+def test_analyze_marks_source_stated_winner_supported(monkeypatch):
+    """analyze() sets primary_has_literal_support=True when the winner came from a
+    url/title-modifier ballot (a source row that literally stated it)."""
+    SSE = ec.SemanticScentEngine
+    monkeypatch.setattr(ec, "_decodo_concentration_enabled", lambda: False, raising=False)
+    monkeypatch.setattr(SSE, "_explicit_intent", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_query_pillar_prior", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_brand_prior", staticmethod(lambda q: ("", "")))
+    monkeypatch.setattr(SSE, "_retry_fetch", staticmethod(
+        lambda page, q, sf, deadline=None: [{"title": "t", "url": "u", "domain": "d"}] if "fragrantica" in sf else []
+    ))
+    monkeypatch.setattr(SSE, "_classify_result", staticmethod(
+        lambda row, q, brand, brand_prior: ("EDT (Eau de Toilette)", "title-modifier", 50.0)
+    ))
+    prof = SSE.analyze("Acqua Di Parma Colonia", use_cache=False, page=object())
+    assert prof.primary_concentration == "EDT (Eau de Toilette)"
+    assert prof.primary_has_literal_support is True
+
+
+def test_analyze_collects_distinct_literal_concentrations(monkeypatch):
+    """analyze() records every concentration a real source row stated, so a bare
+    name attested as both EDT and EDP carries both -- the variant-ambiguity signal."""
+    SSE = ec.SemanticScentEngine
+    monkeypatch.setattr(ec, "_decodo_concentration_enabled", lambda: False, raising=False)
+    monkeypatch.setattr(SSE, "_explicit_intent", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_query_pillar_prior", staticmethod(lambda q: None))
+    monkeypatch.setattr(SSE, "_brand_prior", staticmethod(lambda q: ("", "")))
+    rows = [{"title": "a", "url": "u1", "domain": "d"}, {"title": "b", "url": "u2", "domain": "d"}]
+    monkeypatch.setattr(SSE, "_retry_fetch", staticmethod(
+        lambda page, q, sf, deadline=None: rows if "fragrantica" in sf else []
+    ))
+    monkeypatch.setattr(SSE, "_classify_result", staticmethod(
+        lambda row, q, brand, brand_prior: (
+            ("EDT (Eau de Toilette)" if row["title"] == "a" else "EDP (Eau de Parfum)"),
+            "title-modifier", 40.0,
+        )
+    ))
+    prof = SSE.analyze("Christian Dior J Adore", use_cache=False, page=object())
+    assert set(prof.literal_concentrations) == {"EDP (Eau de Parfum)", "EDT (Eau de Toilette)"}
+
+
+# --- _engine_tier2: the three engine-cache outcomes (resolve / variant-ambiguous
+#     marker / give up). Built on one analyze() pass.
+def test_engine_tier2_resolves_confident_source_stated(monkeypatch):
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile("EDT (Eau de Toilette)", conf=72, literal=True)),
+    )
+    res = ec._engine_tier2("Acqua Di Parma Colonia")
+    assert res["concentration"] == "Eau de Toilette"
+    assert res["concentration_meta"]["source"] == "semantic_engine_v6"
+    assert not res.get("variant_ambiguous")
+
+
+def test_engine_tier2_marks_variant_ambiguous_when_two_concentrations_stated(monkeypatch):
+    """Sub-floor winner but >=2 concentrations literally stated -> ambiguous marker,
+    concentration left blank."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile(
+            "EDT (Eau de Toilette)", conf=47, literal=False,
+            literal_concs=["EDP (Eau de Parfum)", "EDT (Eau de Toilette)"],
+        )),
+    )
+    res = ec._engine_tier2("Christian Dior J Adore")
+    assert res["variant_ambiguous"] is True
+    assert res["concentration"] is None
+    assert res["concentration_meta"]["source"] == ec.CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE
+    assert res["concentration_meta"]["attested_concentrations"] == ["Eau de Parfum", "Eau de Toilette"]
+
+
+def test_engine_tier2_gives_up_on_weak_single_signal(monkeypatch):
+    """Sub-floor with only one concentration stated is NOT ambiguous -- it stays an
+    ordinary gap (a future page-scrape could still resolve it). No marker."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile(
+            "EDP (Eau de Parfum)", conf=47, literal=False,
+            literal_concs=["EDP (Eau de Parfum)"],
+        )),
+    )
+    assert ec._engine_tier2("Versace Rose Flamboyante") is None
+
+
+def test_engine_tier2_rejects_confident_prior_carried_win(monkeypatch):
+    """Confident but no source row stated the winner, and <2 stated -> None (the
+    ground-truth gate still holds; nothing is marked ambiguous)."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile("Parfum (Profumo)", conf=80, literal=False, literal_concs=[])),
+    )
+    assert ec._engine_tier2("Roja Dove Scandal") is None
+
+
+def test_concentration_meta_marks_ambiguous_helper():
+    from enrichment_facts import (
+        CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,
+        concentration_meta_marks_ambiguous,
+    )
+    assert concentration_meta_marks_ambiguous(
+        {"source": CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE}
+    )
+    assert not concentration_meta_marks_ambiguous({"source": "semantic_engine_v6"})
+    assert not concentration_meta_marks_ambiguous(None)
+    assert not concentration_meta_marks_ambiguous("nope")
