@@ -571,6 +571,8 @@ def _new_entry() -> dict[str, Any]:
         "concentration": None,
         "year": None,
         "gender": None,
+        "family": None,         # scalar family (owner-confirmed fold only; engine
+                                # family is derived from derived_metrics, not this)
         "image_url": None,
         "core": None,           # gender-label-stripped norm key (or None)
         "implied_gender": None,  # gender read off a stripped leading label
@@ -669,6 +671,66 @@ def _fold_global_fragrances(index: dict[str, dict[str, Any]]) -> int:
     return folded
 
 
+def _fold_user_fragrances(index: dict[str, dict[str, Any]]) -> int:
+    """Fold the owner's ``user_fragrances`` confirmed scalar facts into the index
+    as the LOWEST-trust gap-fill source (folded last, after engine + global), so a
+    matching ``global_fragrances`` catalog row can INHERIT a fact the owner already
+    has but the engine cache lacks.
+
+    The forward-focused fix for the Bucket-1 gap: when the engine record is missing
+    gender / concentration / family / year but the matching wardrobe row already
+    carries it (owner-entered, or healed earlier from a since-evicted source),
+    nothing previously fed those facts back into the projection index -- so the
+    catalog row (and the search index) stayed blank forever. Reads from the wardrobe
+    DSN. Gap-fill ONLY: ``_new_entry`` slots are filled left-to-right and the first
+    (highest-trust) source for an identity wins, so this never overrides an engine
+    or catalog value already folded -- owner facts only fill BLANKS. ``family`` is a
+    scalar slot here because the engine derives family from derived_metrics; an
+    owner-confirmed family has no derived_metrics to ride along, so it is projected
+    as a scalar (see project_engine_facts)."""
+    folded = 0
+    try:
+        with psycopg.connect(_wardrobe_dsn(), row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT fragrance_data FROM user_fragrances")
+                rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [index] user_fragrances fold skipped: {exc}")
+        return 0
+    for row in rows:
+        fdata = row.get("fragrance_data")
+        if not isinstance(fdata, dict):
+            continue
+        brand, name = str(fdata.get("brand") or ""), str(fdata.get("name") or "")
+        keys = _identity_keys(brand, name)
+        if not keys:
+            continue
+        key = keys[0]
+        entry = index.setdefault(key, _new_entry())
+        for alias_key in keys[1:]:
+            index.setdefault(alias_key, entry)
+        if entry["year"] is None and is_fact_complete(str(fdata.get("year") or ""), "year"):
+            entry["year"] = str(fdata.get("year")).strip()
+            folded += 1
+        if entry["gender"] is None and is_fact_complete(str(fdata.get("gender") or ""), "gender"):
+            entry["gender"] = str(fdata.get("gender")).strip()
+            folded += 1
+        if entry["concentration"] is None and is_fact_complete(
+            str(fdata.get("concentration") or ""), "concentration"
+        ):
+            entry["concentration"] = str(fdata.get("concentration")).strip()
+            folded += 1
+        if entry["family"] is None and is_fact_complete(str(fdata.get("family") or ""), "family"):
+            entry["family"] = str(fdata.get("family")).strip()
+            folded += 1
+        if entry["image_url"] is None:
+            entry["image_url"] = _payload_image_url(fdata)
+            if entry["image_url"]:
+                folded += 1
+        _register_core(entry, brand, name)
+    return folded
+
+
 def _fold_engine_database(index: dict[str, dict[str, Any]]) -> int:
     """Fold a dedicated engine DB (ENGINE_DATABASE_URL, e.g. the viaduct cache)
     into the index when configured and distinct from the wardrobe DSN. This is
@@ -725,8 +787,15 @@ def _build_engine_index(records: list[dict[str, Any]]) -> dict[str, dict[str, An
         _fold_record(index, record)
     eng = _fold_engine_database(index)
     gf = _fold_global_fragrances(index)
-    if eng or gf:
-        print(f"  [index] supplementary facts folded: engine_db+{eng} global_fragrances+{gf}")
+    # user_fragrances LAST: lowest-trust gap-fill so engine + catalog facts win;
+    # owner-confirmed scalars only fill identities still blank after the folds
+    # above (this is what lets a catalog row inherit an owner-only fact).
+    uf = _fold_user_fragrances(index)
+    if eng or gf or uf:
+        print(
+            f"  [index] supplementary facts folded: engine_db+{eng} "
+            f"global_fragrances+{gf} user_fragrances+{uf}"
+        )
     return index
 
 
@@ -943,7 +1012,8 @@ def project_engine_facts(
     image_filled)``. Pure apart from mutating ``payload`` -- no DB, so it is
     unit-testable. ``entry`` is
     ``{"derived_metrics": <blob|None>, "concentration": <str|None>,
-    "year": <str|None>, "gender": <str|None>, "image_url": <str|None>}``.
+    "year": <str|None>, "gender": <str|None>, "family": <str|None>,
+    "image_url": <str|None>}`` (``family`` is the owner-confirmed scalar fold).
     """
     fam_filled = conc_filled = acc_refreshed = wear_filled = dm_filled = notes_filled = year_filled = gender_filled = image_filled = False
     dm = entry.get("derived_metrics")
@@ -971,6 +1041,15 @@ def project_engine_facts(
             fam_filled = payload.get("family") != before and is_fact_complete(
                 payload.get("family"), "family"
             )
+    # Scalar family fold (owner-confirmed via _fold_user_fragrances): the engine
+    # derives family from derived_metrics, but an owner-entered family has no
+    # derived_metrics to ride along, so it is carried as a scalar. Fill ONLY when
+    # the derived path above left family still blank -- never downgrade.
+    if not is_fact_complete(payload.get("family"), "family") and is_fact_complete(
+        entry.get("family"), "family"
+    ):
+        payload["family"] = entry["family"]
+        fam_filled = True
     if not is_fact_complete(payload.get("concentration"), "concentration") and entry.get("concentration"):
         payload["concentration"] = entry["concentration"]
         payload.setdefault("concentration_meta", {"source": "engine_cache_projection"})
