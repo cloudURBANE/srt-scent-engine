@@ -163,7 +163,7 @@ def _basenotes_title_concentration(brand: str, name: str) -> dict | None:
     return None
 
 
-def _tier2_serp(query: str) -> dict | None:
+def _tier2_serp(query: str, require_literal_support: bool = False) -> dict | None:
     """Tier-2 SERP semantic engine (~58s, DrissionPage + DuckDuckGo).
 
     Returns a resolved concentration dict only when the engine clears its
@@ -171,11 +171,30 @@ def _tier2_serp(query: str) -> dict | None:
     Extracted so both the wardrobe resolver (``resolve_concentration``) and the
     engine-gap online resolver (``resolve_concentration_online``) share one
     implementation instead of duplicating the analyze + threshold logic.
+
+    ``require_literal_support`` is the engine-cache ground-truth gate: when set,
+    a win that cleared the confidence floor is still rejected unless a real SERP
+    row *stated* the winning concentration (``primary_has_literal_support``), so
+    a result carried only by the brand/pillar prior never reaches the engine
+    cache. Default False keeps the wardrobe path -- which is allowed to lean on
+    priors -- byte-for-byte unchanged.
     """
     try:
         profile = SemanticScentEngine.analyze(query)
     except Exception as exc:
         print(f"  [WARN] Tier-2 analyze failed: {exc}")
+        return None
+
+    if (
+        profile
+        and require_literal_support
+        and profile.primary_confidence >= 50
+        and not getattr(profile, "primary_has_literal_support", True)
+    ):
+        print(
+            f"  [SKIP] Tier-2 win '{profile.primary_concentration}' is prior-carried "
+            f"(no source row stated it); not writing to the engine cache."
+        )
         return None
 
     if profile and profile.primary_confidence >= 50:
@@ -365,7 +384,10 @@ def resolve_concentration_online(
       2. the authoritative Basenotes product-title tier via Decodo (no-ops without
          Decodo creds), and
       3. optionally the Tier-2 SERP semantic engine (browser, ~58s) when
-         ``use_browser`` is set and its confidence floor is cleared.
+         ``use_browser`` is set, its confidence floor is cleared, AND a real
+         source row stated the winning concentration (``require_literal_support``)
+         -- a vote carried only by the brand/pillar prior is rejected here so the
+         cache never gets an inference even though the wardrobe path would keep it.
 
     Returns a resolved dict or None. This is what lets ``--engine-gap --online``
     fill the rows that strict-offline cannot, without ever writing an inference
@@ -379,7 +401,9 @@ def resolve_concentration_online(
         return bn_title
     if not use_browser:
         return None
-    return _tier2_serp(f"{brand} {name}".strip())
+    # Engine cache must stay ground-truth: accept the Tier-2 vote only when a real
+    # source row stated the winning concentration, never a prior-carried win.
+    return _tier2_serp(f"{brand} {name}".strip(), require_literal_support=True)
 
 
 def fetch_engine_gap_rows(cur, limit: int | None) -> list[dict]:

@@ -66,6 +66,15 @@ class ScentProfile:
     pillar_votes: int = 0
     total_votes: int = 0
     elapsed_seconds: float = 0.0
+    # True when the winning concentration is backed by at least one *source-stated*
+    # ballot (a concentration parsed from a SERP url slug or title modifier), as
+    # opposed to being carried only by inference ballots (the brand/pillar prior
+    # default in _classify_result, or the structural-fallback prior). Lets a
+    # ground-truth consumer (the engine-cache backfill) accept only source-attested
+    # wins while the wardrobe/search consumers, which are allowed to use priors,
+    # ignore it. Defaults True so the explicit short-circuit and any pre-field
+    # cached payload are treated as attested.
+    primary_has_literal_support: bool = True
 
 
 class SemanticScentEngine:
@@ -785,9 +794,22 @@ class SemanticScentEngine:
                 sources_consulted=sources_consulted, brand_prior=brand_prior or "",
                 pillar_votes=pillar_vote_count, total_votes=total_vote_count,
                 elapsed_seconds=round(dt, 2),
+                primary_has_literal_support=False,  # no source rows resolved at all
             )
         else:
             primary_key, primary_score = ranked[0]
+
+            # Source-stated vs prior-carried: the winning concentration is attested
+            # only if a real SERP row stated it (url slug / title modifier). Ballots
+            # classified via _pillar_default (source_kind "pillar") are the brand/
+            # pillar prior, not a stated fact; a winner carried solely by those (or
+            # by the structural-fallback prior, which never touches breakdown) has no
+            # literal support. breakdown rows: (label, i, domain, source_kind, conc, w).
+            _LITERAL_KINDS = ("url", "title-modifier")
+            primary_has_literal_support = any(
+                b_conc == primary_key and b_kind in _LITERAL_KINDS
+                for (_lbl, _i, _dom, b_kind, b_conc, _w) in breakdown
+            )
             total = sum(v for _, v in ranked)
             primary_conf = int((primary_score / total) * 100) if total > 0 else 0
 
@@ -814,6 +836,7 @@ class SemanticScentEngine:
                 scoring_matrix=active, sources_consulted=sources_consulted,
                 brand_prior=brand_prior or "", pillar_votes=pillar_vote_count,
                 total_votes=total_vote_count, elapsed_seconds=round(dt, 2),
+                primary_has_literal_support=primary_has_literal_support,
             )
 
         if use_cache:
