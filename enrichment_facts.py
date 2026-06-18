@@ -158,6 +158,19 @@ def is_junk_accord_label(label: Any) -> bool:
     return False
 
 
+def _accord_summary_from_top(top: list[str]) -> str:
+    if not top:
+        return ""
+    if len(top) == 1:
+        return f"A predominantly {top[0].lower()} fragrance."
+    rest = top[1:]
+    if len(rest) == 1:
+        tail = rest[0].lower()
+    else:
+        tail = ", ".join(a.lower() for a in rest[:-1]) + f" and {rest[-1].lower()}"
+    return f"A {top[0].lower()} fragrance with {tail} facets."
+
+
 def sanitize_derived_metrics(derived_metrics: Any) -> bool:
     """Strip scraped-junk accord labels from a stored derived_metrics blob, in place.
 
@@ -204,6 +217,42 @@ def sanitize_derived_metrics(derived_metrics: Any) -> bool:
         ]
         if cleaned_top != [str(item).strip() for item in top]:
             main["top_accords"] = cleaned_top
+            changed = True
+    summary = main.get("accord_summary")
+    if isinstance(summary, str) and any(
+        is_junk_accord_label(part)
+        for part in re.split(r"[^A-Za-z]+", summary)
+        if part.strip()
+    ):
+        clean_top = top_accords_from({"derived_metrics": {"main_accords": main}})
+        rebuilt = _accord_summary_from_top(clean_top)
+        if rebuilt != summary:
+            main["accord_summary"] = rebuilt
+            changed = True
+    return changed
+
+
+def sanitize_frag_cards(frag_cards: Any) -> bool:
+    """Strip junk rows from raw Fragrantica Main accords frag_cards in place."""
+    if not isinstance(frag_cards, dict):
+        return False
+    changed = False
+    for card_name, rows in list(frag_cards.items()):
+        if not isinstance(card_name, str) or "main accord" not in card_name.lower():
+            continue
+        if not isinstance(rows, list):
+            continue
+        cleaned = []
+        for row in rows:
+            if not isinstance(row, dict):
+                cleaned.append(row)
+                continue
+            label = row.get("label") or row.get("accord") or row.get("name") or row.get("display")
+            if is_junk_accord_label(label):
+                continue
+            cleaned.append(row)
+        if len(cleaned) != len(rows):
+            frag_cards[card_name] = cleaned
             changed = True
     return changed
 

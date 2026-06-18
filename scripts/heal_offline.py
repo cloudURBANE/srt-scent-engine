@@ -186,6 +186,7 @@ from enrichment_facts import (  # noqa: E402
     derive_wear_profile,
     is_fact_complete,
     primary_season_from_wear_profile,
+    sanitize_frag_cards,
     sanitize_derived_metrics,
     top_accords_from,
 )
@@ -1042,6 +1043,18 @@ def _sanitize_wardrobe_blob(payload: dict[str, Any]) -> bool:
         clean = top_accords_from(dm)
         if clean and clean != _str_accords(payload.get("accords")):
             payload["accords"] = clean
+        changed = True
+    raw_dm = payload.get("raw_engine_detail", {}).get("derived_metrics")
+    if sanitize_derived_metrics(raw_dm):
+        clean = top_accords_from(raw_dm)
+        if clean and clean != _str_accords(payload.get("accords")):
+            payload["accords"] = clean
+        changed = True
+    raw = payload.get("raw_engine_detail", {}).get("raw")
+    if isinstance(raw, dict) and sanitize_frag_cards(raw.get("frag_cards")):
+        changed = True
+    direct_raw = payload.get("raw")
+    if isinstance(direct_raw, dict) and sanitize_frag_cards(direct_raw.get("frag_cards")):
         changed = True
     # Taxonomy normalization (accord/family casing, the Chypere typo, numeric-year
     # type, junk-accord drop) runs on EVERY row regardless of engine match or DM
