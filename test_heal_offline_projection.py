@@ -290,6 +290,144 @@ def main() -> int:
         and oriental_row["family"] == "Oriental",
     )
 
+    # ------------------------------------------------------------------ #
+    # Bucket-1: global_fragrances inherits owner-confirmed scalar facts
+    # (gender / concentration / family / year) that the ENGINE lacks. The
+    # owner-confirmed fold supplies these as entry scalars; project_engine_facts
+    # must fill a blank global row from them. (a)
+    # ------------------------------------------------------------------ #
+    owner_entry = {
+        "derived_metrics": None,  # engine had no metrics blob to derive family from
+        "concentration": "Eau de Parfum",
+        "year": "2018",
+        "gender": "Feminine",
+        "family": "Amber",
+        "image_url": None,
+    }
+    blank_global = {"brand": "Tom Ford", "name": "Lost Cherry"}
+    flags = heal.project_engine_facts(blank_global, owner_entry)
+    # flag order: family, conc, accords, wear, dm, notes, year, gender, image
+    ok &= _check(
+        "global inherits owner-confirmed gender the engine lacked",
+        flags[7] is True and blank_global.get("gender") == "Feminine",
+    )
+    ok &= _check(
+        "global inherits owner-confirmed concentration the engine lacked",
+        flags[1] is True and blank_global.get("concentration") == "Eau de Parfum",
+    )
+    ok &= _check(
+        "global inherits owner-confirmed family (scalar fold, no derived_metrics)",
+        flags[0] is True and blank_global.get("family") == "Amber",
+    )
+    ok &= _check(
+        "global inherits owner-confirmed year the engine lacked",
+        flags[6] is True and blank_global.get("year") == "2018",
+    )
+
+    # (b) gap-fill never OVERWRITES a value already present on the target.
+    populated_global = {
+        "brand": "Tom Ford",
+        "name": "Lost Cherry",
+        "gender": "Unisex",          # already set -> must survive
+        "concentration": "Parfum",   # already set -> must survive
+        "family": "Woody",           # already set -> must survive
+        "year": "2017",              # already set -> must survive
+    }
+    flags = heal.project_engine_facts(populated_global, owner_entry)
+    ok &= _check(
+        "gap-fill never overwrites an existing gender",
+        flags[7] is False and populated_global["gender"] == "Unisex",
+    )
+    ok &= _check(
+        "gap-fill never overwrites an existing concentration",
+        flags[1] is False and populated_global["concentration"] == "Parfum",
+    )
+    ok &= _check(
+        "gap-fill never overwrites an existing family",
+        flags[0] is False and populated_global["family"] == "Woody",
+    )
+    ok &= _check(
+        "gap-fill never overwrites an existing year",
+        flags[6] is False and populated_global["year"] == "2017",
+    )
+
+    # A scalar family fold must NOT clobber a family already derived from an
+    # engine derived_metrics blob (the derived path runs first and wins).
+    derived_family_entry = {**owner_entry, "derived_metrics": _complete_dm(), "family": "Citrus"}
+    derived_payload = {"brand": "House", "name": "Derived Fam"}
+    heal.project_engine_facts(derived_payload, derived_family_entry)
+    ok &= _check(
+        "derived-metrics family wins over the scalar family fold",
+        heal.is_fact_complete(derived_payload.get("family"), "family")
+        and derived_payload.get("family") != "Citrus",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Bucket-2: junk-purge predicate -- matches brand==name skeleton stubs
+    # but NEVER a legit catalog row like "Chanel No 5". (c)
+    # ------------------------------------------------------------------ #
+    import purge_junk_globals as purge
+
+    junk_stub = {
+        "brand": "Xerjoff",
+        "name": "Xerjoff",
+        "concentration": "Unknown",
+        "accords": ["Citrus", "Musk"],  # generic-default junk, but predicate keys
+        "source_url": "",               # off the structural signals below
+        "derived_metrics": {},
+    }
+    ok &= _check(
+        "purge matches a brand==name skeleton stub",
+        purge.is_junk_global_stub("Xerjoff", "Xerjoff", junk_stub) is True,
+    )
+    ok &= _check(
+        "purge matches case-differing brand==name stub (Tom ford|Tom ford)",
+        purge.is_junk_global_stub(
+            "Tom ford", "Tom ford",
+            {"concentration": "Unknown", "source_url": "", "accords": [], "derived_metrics": {}},
+        )
+        is True,
+    )
+
+    legit_numbered = {
+        "brand": "Chanel",
+        "name": "Chanel No 5",
+        "concentration": "Unknown",
+        "source_url": "",
+        "accords": [],
+        "derived_metrics": {},
+    }
+    ok &= _check(
+        "purge does NOT match a legit 'Chanel No 5' (brand is a substring, not equal)",
+        purge.is_junk_global_stub("Chanel", "Chanel No 5", legit_numbered) is False,
+    )
+
+    real_data_stub = {
+        "brand": "Creed",
+        "name": "Creed",
+        "concentration": "Eau de Parfum",  # real concentration -> keep
+        "source_url": "https://www.fragrantica.com/perfume/Creed/Aventus-9828.html",
+        "accords": ["Fruity", "Woody", "Smoky"],
+        "derived_metrics": {"notes": {"has_pyramid": True}},
+    }
+    ok &= _check(
+        "purge KEEPS a brand==name row that has real enrichment (pyramid/url/conc)",
+        purge.is_junk_global_stub("Creed", "Creed", real_data_stub) is False,
+    )
+    ok &= _check(
+        "purge keeps a brand==name row with a real FG source_url even if conc Unknown",
+        purge.is_junk_global_stub(
+            "House", "House",
+            {
+                "concentration": "Unknown",
+                "source_url": "https://www.fragrantica.com/perfume/House/House-1.html",
+                "accords": [],
+                "derived_metrics": {},
+            },
+        )
+        is False,
+    )
+
     print("ALL CHECKS PASSED" if ok else "CHECKS FAILED")
     return 0 if ok else 1
 
