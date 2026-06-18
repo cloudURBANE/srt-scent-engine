@@ -747,7 +747,12 @@ def _project_wear_facts(payload: dict[str, Any], derived_metrics: dict[str, Any]
     stay stuck with missing/default wear context forever.
     """
     wear_profile = derive_wear_profile(derived_metrics)
-    if not wear_profile:
+    # Only project a wear_profile that is itself complete. Fragrantica emits a
+    # truthy-but-empty profile (primary_seasons/primary_time = None) for cards
+    # with zero community votes; projecting that fills nothing useful AND can
+    # never satisfy the _wear_profile_complete write guard below, so the row
+    # would report changed=True on every drain forever (phantom heal churn).
+    if not _wear_profile_complete(wear_profile):
         return False
 
     changed = False

@@ -2942,6 +2942,26 @@ def test_heal_offline_exact_match_contract() -> None:
         "heal_offline: accords/wear projection is idempotent once clean",
         heal.project_engine_facts(dict(familied_junk), entry)[2:4] == (False, False),
     )
+    # An engine wear_profile that is itself INCOMPLETE (Fragrantica emits a
+    # truthy-but-empty profile -- primary_seasons/primary_time None -- for cards
+    # with zero community votes) must NOT be projected: it fills nothing useful
+    # and can never satisfy the wear-complete write guard, so projecting it would
+    # report wear=True on EVERY drain forever (phantom heal churn that re-writes
+    # the wardrobe row each pass even though nothing changed).
+    incomplete_wear_entry = {
+        "derived_metrics": {"wear_profile": {"primary_seasons": None, "primary_time": None, "raw_votes": {}}},
+        "concentration": None,
+        "year": None,
+        "gender": None,
+        "image_url": None,
+    }
+    incomplete_row = {"family": "Amber", "accords": ["Amber"]}
+    runs = [heal.project_engine_facts(incomplete_row, incomplete_wear_entry)[3] for _ in range(3)]
+    check(
+        "heal_offline: incomplete engine wear_profile is not projected (no churn)",
+        runs == [False, False, False] and "wear_profile" not in incomplete_row,
+        detail=str(runs),
+    )
     # Unknown-family rows still get BOTH family and accords filled (unchanged).
     unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
     fam_u, _c, acc_u, wear_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
