@@ -201,18 +201,59 @@ def main() -> int:
                     {"accord": "Citrus", "score": 91.65},
                 ],
                 "top_accords": ["Amber", "Sponsored", "Citrus"],
+                "accord_summary": "A amber fragrance with sponsored and citrus facets.",
                 "source": "test",
+            },
+        },
+        "raw_engine_detail": {
+            "derived_metrics": {
+                "main_accords": {
+                    "scent_vector": [
+                        {"accord": "Amber", "score": 100.0},
+                        {"accord": "Sponsored", "score": 100.0},
+                        {"accord": "Citrus", "score": 91.65},
+                    ],
+                    "top_accords": ["Amber", "Sponsored", "Citrus"],
+                    "accord_summary": "A amber fragrance with sponsored and citrus facets.",
+                    "source": "test",
+                },
+            },
+            "raw": {
+                "frag_cards": {
+                    "Main accords": [
+                        {"label": "Amber", "display": "Amber", "pct": 100.0},
+                        {"label": "Sponsored", "display": "Sponsored", "pct": 100.0},
+                        {"label": "Citrus", "display": "Citrus", "pct": 91.65},
+                    ],
+                },
             },
         },
         "accords": ["Amber", "Sponsored", "Citrus"],
     }
     changed = heal._sanitize_wardrobe_blob(no_match_row)
     swept_vec = no_match_row["derived_metrics"]["main_accords"]["scent_vector"]
+    swept_raw_vec = no_match_row["raw_engine_detail"]["derived_metrics"]["main_accords"]["scent_vector"]
     ok &= _check(
         "unmatched row's stale scent_vector is sanitized with no engine match",
         changed is True
         and [v["accord"] for v in swept_vec] == ["Amber", "Citrus"]
+        and [v["accord"] for v in swept_raw_vec] == ["Amber", "Citrus"]
         and no_match_row["accords"] == ["Amber", "Citrus"],
+    )
+    ok &= _check(
+        "sanitize sweep rebuilds accord summaries that mention junk",
+        no_match_row["derived_metrics"]["main_accords"]["accord_summary"]
+        == "A amber fragrance with citrus facets."
+        and no_match_row["raw_engine_detail"]["derived_metrics"]["main_accords"]["accord_summary"]
+        == "A amber fragrance with citrus facets.",
+    )
+    ok &= _check(
+        "sanitize sweep drops junk from raw Main accords frag_cards",
+        [
+            row["label"]
+            for row in no_match_row["raw_engine_detail"]["raw"]["frag_cards"]["Main accords"]
+        ]
+        == ["Amber", "Citrus"],
     )
     ok &= _check(
         "sanitize sweep is idempotent (clean row reports no change)",
