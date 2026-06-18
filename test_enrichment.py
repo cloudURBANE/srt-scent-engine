@@ -1965,6 +1965,135 @@ def test_actionable_missing_contract() -> None:
         db.get_jobs_by_keys = saved_jobs_by_keys
 
 
+def test_no_perfume_page_skeleton_non_actionable() -> None:
+    print("No-perfume-page skeleton actionability (audit honesty, no DATABASE_URL required):")
+    import enrichment_facts
+
+    nh = enrichment_facts.non_healable_facts
+    act = enrichment_facts.actionable_missing_facts
+
+    # A Basenotes-only skeleton: the whole FG status pyramid + accords/family/
+    # gender/notes/reviews are missing and there is no perfume page to fetch, so
+    # NONE of them are actionable.
+    skeleton_missing = [
+        "gender", "family", "main_accords", "wear_profile",
+        "performance_score", "value_score", "community_interest_score",
+        "notes", "reviews",
+    ]
+    check(
+        "no-page skeleton: every page-sourced gap is non-actionable",
+        act(skeleton_missing, "", has_perfume_page=False) == [],
+        str(act(skeleton_missing, "", has_perfume_page=False)),
+    )
+    # year + concentration resolve off-page, so they stay actionable even with no
+    # perfume page -- the gate must NOT swallow them.
+    check(
+        "no-page row: off-page year/concentration stay actionable",
+        set(act(["year", "concentration", "main_accords"], "", has_perfume_page=False))
+        == {"year", "concentration"},
+        str(act(["year", "concentration", "main_accords"], "", has_perfume_page=False)),
+    )
+    # With a perfume page present the gate is inert: page-sourced facts whose
+    # parse is unfinished stay actionable exactly as before.
+    check(
+        "with a perfume page the page gate is inert",
+        set(act(skeleton_missing, "", has_perfume_page=True)) == set(skeleton_missing),
+        str(act(skeleton_missing, "", has_perfume_page=True)),
+    )
+    check(
+        "default has_perfume_page is True (back-compat)",
+        act(["main_accords"], "") == ["main_accords"]
+        and "main_accords" not in nh(["main_accords"], ""),
+        str(act(["main_accords"], "")),
+    )
+    check(
+        "record_has_perfume_page: null fg url is no page",
+        enrichment_facts.record_has_perfume_page({"canonical_fg_url": None}) is False,
+        "null url",
+    )
+    check(
+        "record_has_perfume_page: fg /perfume/ url is a page",
+        enrichment_facts.record_has_perfume_page(
+            {"canonical_fg_url": "https://www.fragrantica.com/perfume/x/Aventus-1.html"}
+        )
+        is True,
+        "fg url",
+    )
+    check(
+        "record_has_perfume_page: parfumo /Perfumes/ url is a page",
+        enrichment_facts.record_has_perfume_page(
+            {"canonical_fg_url": "https://www.parfumo.com/Perfumes/Creed/Aventus"}
+        )
+        is True,
+        "parfumo url",
+    )
+
+    # End-to-end: the completeness endpoint must drop a Basenotes-only skeleton
+    # out of the actionable backlog while still counting it as raw-incomplete.
+    saved_token = api._ENRICHMENT_WORKER_TOKEN
+    saved_enabled = db.ENABLED
+    saved_list = db.list_fragrance_records
+    saved_count = db.count_fragrance_records
+    saved_jobs_by_keys = db.get_jobs_by_keys
+    try:
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
+        db.ENABLED = True
+        # year + concentration already resolved (the off-page facts); the only
+        # remaining gaps are page-sourced, so the whole row is non-actionable.
+        skeleton = {
+            "record_key": "bn:https://basenotes.com/fragrances/tilia-by-marc-antoine-barrois",
+            "canonical_fg_url": None,
+            "bn_url": "https://basenotes.com/fragrances/tilia-by-marc-antoine-barrois",
+            "name": "Tilia",
+            "house": "Marc Antoine Barrois",
+            "year": 2021,
+            "gender": None,
+            "fg_raw": {
+                "concentration": "Eau de Parfum",
+                "raw_identity": {"concentration": "Eau de Parfum"},
+            },
+            "bn_raw": {},
+            "derived_metrics": None,
+        }
+        db.list_fragrance_records = lambda limit=200, offset=0: [skeleton]
+        db.count_fragrance_records = lambda: 1
+        db.get_jobs_by_keys = lambda keys: {}
+        client = TestClient(api.app)
+        auth = {"Authorization": "Bearer test-secret-token"}
+        body = client.get("/api/enrichment/completeness", headers=auth).json()
+        item = (body.get("items") or [{}])[0]
+        check(
+            "skeleton row: raw incomplete but actionable empty",
+            item.get("missing") and item.get("actionable_missing") == []
+            and item.get("has_perfume_page") is False,
+            str(item),
+        )
+        check(
+            "completeness reports actionable_incomplete=0 for a no-page skeleton",
+            body.get("incomplete") == 1 and body.get("actionable_incomplete") == 0,
+            f"incomplete={body.get('incomplete')} actionable={body.get('actionable_incomplete')}",
+        )
+        # /heal must skip it with the distinct no_resolvable_page reason rather
+        # than churn a job that has no page to fetch.
+        heal = client.post(
+            "/api/enrichment/heal",
+            headers=auth,
+            json={"limit": 200, "offset": 0},
+        ).json()
+        reasons = {s.get("reason") for s in (heal.get("skipped_items") or [])}
+        check(
+            "heal skips the no-page skeleton as no_resolvable_page",
+            heal.get("queued") == 0 and "no_resolvable_page" in reasons,
+            str(heal.get("skipped_items")),
+        )
+    finally:
+        api._ENRICHMENT_WORKER_TOKEN = saved_token
+        db.ENABLED = saved_enabled
+        db.list_fragrance_records = saved_list
+        db.count_fragrance_records = saved_count
+        db.get_jobs_by_keys = saved_jobs_by_keys
+
+
 def test_worker_fact_summary_and_serp_retry() -> None:
     print("Per-fragrance fact summary + bounded SERP retry checks (no DATABASE_URL required):")
 
@@ -3611,6 +3740,7 @@ def main() -> int:
     test_junk_accord_filtering()
     test_parfumo_partial_self_heal_alignment()
     test_actionable_missing_contract()
+    test_no_perfume_page_skeleton_non_actionable()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
     test_worker_url_gating_catalog_tier_and_retirement()

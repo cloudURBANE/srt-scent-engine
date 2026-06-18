@@ -63,6 +63,7 @@ from enrichment_facts import (
     missing_facts,
     concentration_meta_marks_ambiguous,
     non_perfume_signal,
+    record_has_perfume_page,
     record_source,
     sanitize_derived_metrics,
     year_meta_marks_unknown,
@@ -5375,11 +5376,14 @@ def _audit_fragrance_records(
     for record in records:
         missing = missing_facts(record)
         source = record_source(record)
+        has_page = record_has_perfume_page(record)
         # actionable = the subset a re-scrape could still resolve (raw missing
         # minus facts this source provably can't supply). A row with [] here is
         # complete for what its source can give -- counting it as incomplete is
-        # what makes drains look like they never finish.
-        actionable = actionable_missing_facts(missing, source)
+        # what makes drains look like they never finish. A Basenotes-only
+        # skeleton (no perfume page) can't grow any page-sourced fact -- the
+        # detail worker has no URL to fetch -- so those drop out of actionable.
+        actionable = actionable_missing_facts(missing, source, has_perfume_page=has_page)
         for field in missing:
             field_counts[field] += 1
         for field in actionable:
@@ -5397,6 +5401,7 @@ def _audit_fragrance_records(
                 "bn_url": record.get("bn_url"),
                 "source": source or None,
                 "job_key": job_key or None,
+                "has_perfume_page": has_page,
                 "missing": missing,
                 "actionable_missing": actionable,
                 "job": None,
@@ -5511,9 +5516,14 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
         # `quality_status == "complete"` gate
         # (scripts.enrichment_worker._auto_requeue_incomplete) so the queue can
         # drain to zero instead of churning a page that can't improve.
-        non_healable = non_healable_facts(missing, item.get("source"))
+        has_page = item.get("has_perfume_page", True)
+        non_healable = non_healable_facts(
+            missing, item.get("source"), has_perfume_page=has_page
+        )
         if all(field in non_healable for field in missing):
-            _skip(item, "source_cannot_supply")
+            # A no-perfume-page skeleton has no URL for the worker to fetch, so
+            # name the cause distinctly from a terminal-partial source gap.
+            _skip(item, "no_resolvable_page" if not has_page else "source_cannot_supply")
             continue
         if not item["job_key"]:
             _skip(item, "no_healable_identity")
