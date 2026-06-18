@@ -215,18 +215,40 @@ def _tier2_serp(query: str, require_literal_support: bool = False) -> dict | Non
     return None
 
 
+# --- Below-floor engine-gap Tier-2 tuning -----------------------------------
+# Every engine-gap name sits *below* the 50% resolve floor by definition (that is
+# why it is a gap). Below the floor a name is one of three things, and the three
+# CANNOT be told apart by counting distinct literal concentrations -- a single
+# sibling/flanker row the SERP drags in ("Khamrah Parfum" under a bare "Khamrah"
+# query) is enough to make the count >=2, which is why the count-only gate marked
+# 23/23 "varies". The real signal is the runner-up's *vote share*:
+#   * a genuinely variant name (J'Adore, truly sold as EDT/EDP/Parfum) has a #2
+#     stated concentration holding real share, with no dominant leader;
+#   * a flanker-diluted but still-dominant base (Khamrah = EDP) has a leader that
+#     is source-stated and clearly out-votes the lone flanker;
+#   * anything weaker stays an ordinary gap (no mark, no fill).
+# Thresholds are a first cut -- tune from a --online re-run if a borderline case
+# lands on the wrong branch.
+AMBIGUITY_RUNNERUP_FLOOR = 25     # % of ballots the #2 stated concentration needs
+AMBIGUITY_DOMINANCE_RATIO = 2.0   # leader must exceed RATIO x runner-up to dominate
+AMBIGUITY_DOMINANCE_MIN = 35      # leader's own % floor before a below-50 base auto-fills
+
+
 def _engine_tier2(query: str) -> dict | None:
     """Engine-cache Tier-2: resolve, mark variant-ambiguous, or give up.
 
-    Three outcomes off one analyze() pass (so the SERP vote is fetched once):
-      * a normal resolved dict when a single concentration clears the floor AND a
-        real source row stated it (the ground-truth gate);
+    Four outcomes off one analyze() pass (so the SERP vote is fetched once):
+      * a normal resolved dict when a single concentration clears the 50% floor AND
+        a real source row stated it (the ground-truth gate);
+      * a *below-floor dominance* resolve when the leader is source-stated and
+        out-votes the runner-up by >=RATIO (sibling rows split the vote below 50%
+        but one base concentration clearly dominates -- fill it, don't freeze it);
       * a *variant-ambiguous marker* (``concentration`` None, ``variant_ambiguous``
-        True) when no winner clears the floor but >=2 distinct concentrations were
-        each literally stated -- the bare name genuinely spans concentrations, so
-        there is no single value to store but the row is page-determined, not a gap;
-      * None when the vote is merely weak/prior-carried (a future page-scrape could
-        still resolve it, so it stays an ordinary gap -- we do NOT mark it).
+        True) when a *second* stated concentration holds >=FLOOR share and the
+        leader does not dominate it -- the bare name genuinely spans concentrations,
+        so there is no single value but the row is page-determined, not a gap;
+      * None when the vote is weak/fragmented/single-stated (a future page-scrape
+        could still resolve it, so it stays an ordinary gap -- we do NOT mark it).
     """
     try:
         profile = SemanticScentEngine.analyze(query)
@@ -236,39 +258,81 @@ def _engine_tier2(query: str) -> dict | None:
     if not profile:
         return None
 
+    p_conc = profile.primary_concentration
+    p_conf = int(profile.primary_confidence or 0)
+    s_conf = int(getattr(profile, "second_confidence", 0) or 0)
+    p_literal = bool(getattr(profile, "primary_has_literal_support", True))
     literal = list(getattr(profile, "literal_concentrations", []) or [])
-    if (
-        profile.primary_confidence >= 50
-        and getattr(profile, "primary_has_literal_support", True)
-    ):
+    attested = sorted({to_scentcast_concentration(c) for c in literal})
+
+    # (1) Clear winner over the floor, source-stated -> resolve.
+    if p_conf >= 50 and p_literal:
         return {
-            "concentration": to_scentcast_concentration(profile.primary_concentration),
+            "concentration": to_scentcast_concentration(p_conc),
             "concentration_meta": {
-                "confidence": profile.primary_confidence,
+                "confidence": p_conf,
                 "source": "semantic_engine_v6",
                 "resolved_at": _now_iso(),
-                "engine_label": profile.primary_concentration,
+                "engine_label": p_conc,
             },
         }
 
-    if len(literal) >= 2:
-        attested = sorted({to_scentcast_concentration(c) for c in literal})
-        if len(attested) >= 2:
+    # Below the floor: decide on the runner-up's vote share, never on the bare count
+    # of distinct literal labels.
+    if p_literal and len(attested) >= 2:
+        primary_scent = to_scentcast_concentration(p_conc)
+        second_scent = to_scentcast_concentration(profile.second_concentration)
+        runner_up_stated = (
+            getattr(profile, "second_source", "") == "consensus"
+            and second_scent in attested
+            and second_scent != primary_scent
+        )
+
+        # (2) Genuine variant split: a second STATED concentration holds real share
+        # and the leader does not dominate it -> no single value, mark "varies".
+        if (
+            runner_up_stated
+            and s_conf >= AMBIGUITY_RUNNERUP_FLOOR
+            and p_conf < AMBIGUITY_DOMINANCE_RATIO * s_conf
+        ):
             print(
-                f"  [AMBIGUOUS] '{query}' is stated in {len(attested)} concentrations "
-                f"({', '.join(attested)}); marking variant-ambiguous, leaving blank."
+                f"  [AMBIGUOUS] '{query}' splits across {len(attested)} stated "
+                f"concentrations ({', '.join(attested)}); top {p_conf}% vs #2 {s_conf}% "
+                f"-> variant-ambiguous, leaving blank."
             )
             return {
                 "concentration": None,
                 "variant_ambiguous": True,
                 "concentration_meta": {
-                    "confidence": profile.primary_confidence,
+                    "confidence": p_conf,
                     "source": CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,
                     "resolved_at": _now_iso(),
                     "attested_concentrations": attested,
                     "engine_labels": sorted(set(literal)),
                 },
             }
+
+        # (3) Flanker-diluted but the stated leader clearly dominates: fill the base
+        # concentration rather than freezing it blank. The value is source-stated
+        # (primary_has_literal_support), just shy of 50% because sibling rows split
+        # the vote.
+        if p_conf >= AMBIGUITY_DOMINANCE_MIN and p_conf >= AMBIGUITY_DOMINANCE_RATIO * s_conf:
+            print(
+                f"  [DOMINANT] '{query}' -> {primary_scent} ({p_conf}% vs #2 {s_conf}%, "
+                f"below the 50% floor but source-stated & dominant)."
+            )
+            return {
+                "concentration": primary_scent,
+                "concentration_meta": {
+                    "confidence": p_conf,
+                    "source": "semantic_engine_v6",
+                    "resolved_at": _now_iso(),
+                    "engine_label": p_conc,
+                    "below_floor_dominant": True,
+                },
+            }
+
+    # (4) Weak / fragmented / single-stated -> stays an ordinary gap.
     return None
 
 
@@ -764,6 +828,101 @@ def mark_engine_concentration_ambiguous(
     return detail_updates, record_updates
 
 
+def unmark_engine_concentration_ambiguous(cur) -> tuple[int, int]:
+    """Strip every variant-ambiguous concentration marker, returning the rows to
+    ordinary gaps. The inverse of mark_engine_concentration_ambiguous: removes the
+    ``concentration_meta`` stamp (and the mirror under ``raw_identity``) wherever its
+    source is the variant-ambiguous marker, leaving any real concentration value and
+    all other fields untouched. Idempotent. Used to undo an over-eager sweep so the
+    rows can be re-evaluated by the (tightened) gate."""
+    detail_updates = 0
+    record_updates = 0
+
+    cur.execute(
+        """
+        SELECT canonical_fg_url, raw_identity_json
+        FROM fg_detail_cache
+        WHERE raw_identity_json->'concentration_meta'->>'source' = %s
+        """,
+        (CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,),
+    )
+    for cache_row in cur.fetchall():
+        raw_identity = dict(cache_row["raw_identity_json"] or {})
+        if not concentration_meta_marks_ambiguous(raw_identity.get("concentration_meta")):
+            continue
+        raw_identity.pop("concentration_meta", None)
+        cur.execute(
+            "UPDATE fg_detail_cache SET raw_identity_json = %s, updated_at = now() WHERE canonical_fg_url = %s",
+            (Json(raw_identity), cache_row["canonical_fg_url"]),
+        )
+        detail_updates += 1
+
+    cur.execute(
+        """
+        SELECT record_key, fg_raw_json
+        FROM fragrance_records
+        WHERE fg_raw_json->'concentration_meta'->>'source' = %s
+           OR fg_raw_json->'raw_identity'->'concentration_meta'->>'source' = %s
+        """,
+        (CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE, CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE),
+    )
+    for record_row in cur.fetchall():
+        fg_raw = dict(record_row["fg_raw_json"] or {})
+        changed = False
+        if concentration_meta_marks_ambiguous(fg_raw.get("concentration_meta")):
+            fg_raw.pop("concentration_meta", None)
+            changed = True
+        raw_identity = fg_raw.get("raw_identity")
+        if isinstance(raw_identity, dict) and concentration_meta_marks_ambiguous(
+            raw_identity.get("concentration_meta")
+        ):
+            raw_identity = dict(raw_identity)
+            raw_identity.pop("concentration_meta", None)
+            fg_raw["raw_identity"] = raw_identity
+            changed = True
+        if not changed:
+            continue
+        cur.execute(
+            "UPDATE fragrance_records SET fg_raw_json = %s, updated_at = now() WHERE record_key = %s",
+            (Json(fg_raw), record_row["record_key"]),
+        )
+        record_updates += 1
+
+    return detail_updates, record_updates
+
+
+def run_unmark_ambiguous(args: argparse.Namespace) -> None:
+    """CLI entry: undo variant-ambiguous markers across the engine DB."""
+    db.init_db()
+    if not db.ENABLED:
+        raise RuntimeError("DATABASE_URL not configured.")
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    if args.dry_run:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) AS n FROM fg_detail_cache "
+                    "WHERE raw_identity_json->'concentration_meta'->>'source' = %s",
+                    (CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE,),
+                )
+                d = cur.fetchone()["n"]
+                cur.execute(
+                    "SELECT count(*) AS n FROM fragrance_records "
+                    "WHERE fg_raw_json->'concentration_meta'->>'source' = %s "
+                    "   OR fg_raw_json->'raw_identity'->'concentration_meta'->>'source' = %s",
+                    (CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE, CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE),
+                )
+                r = cur.fetchone()["n"]
+        print(f"unmark-ambiguous (dry-run): would clear fg_detail_cache={d} fragrance_records={r}")
+        return
+
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            d, r = unmark_engine_concentration_ambiguous(cur)
+        conn.commit()
+    print(f"unmark-ambiguous done. cleared fg_detail_cache={d} fragrance_records={r}")
+
+
 def run(args: argparse.Namespace) -> None:
     if args.brand and args.name and not args.all_unknown and args.limit is None:
         print(f"[direct] {args.brand} - {args.name}")
@@ -890,7 +1049,18 @@ def main() -> None:
         "source states but offline can't parse get filled. No-ops without Decodo "
         "creds. Never writes a brand/pillar-prior guess into the engine cache.",
     )
+    parser.add_argument(
+        "--unmark-ambiguous",
+        action="store_true",
+        help="Roll back every variant-ambiguous concentration marker across the "
+        "engine DB (fg_detail_cache + fragrance_records), returning those rows to "
+        "ordinary gaps so a re-run can re-evaluate them. --dry-run prints counts.",
+    )
     args = parser.parse_args()
+
+    if args.unmark_ambiguous:
+        run_unmark_ambiguous(args)
+        return
 
     if args.engine_gap:
         run_engine_gap(args)

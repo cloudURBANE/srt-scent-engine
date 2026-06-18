@@ -229,13 +229,16 @@ def test_online_never_returns_a_prior_guess(monkeypatch):
 from concentration_grabber import ScentProfile  # noqa: E402
 
 
-def _profile(conc, *, conf=80, literal, literal_concs=None):
+def _profile(
+    conc, *, conf=80, literal, literal_concs=None,
+    second_conc="EDT (Eau de Toilette)", second_conf=0, second_source="none",
+):
     """A minimal Tier-2 ScentProfile carrying just the fields the gate reads."""
     return ScentProfile(
         query="q", is_explicit=False,
         primary_concentration=conc, primary_confidence=conf,
-        second_concentration="EDT (Eau de Toilette)", second_confidence=0,
-        second_source="none", flankers_detected=[], scoring_matrix={},
+        second_concentration=second_conc, second_confidence=second_conf,
+        second_source=second_source, flankers_detected=[], scoring_matrix={},
         primary_has_literal_support=literal,
         literal_concentrations=literal_concs if literal_concs is not None else ([conc] if literal else []),
     )
@@ -360,14 +363,15 @@ def test_engine_tier2_resolves_confident_source_stated(monkeypatch):
     assert not res.get("variant_ambiguous")
 
 
-def test_engine_tier2_marks_variant_ambiguous_when_two_concentrations_stated(monkeypatch):
-    """Sub-floor winner but >=2 concentrations literally stated -> ambiguous marker,
-    concentration left blank."""
+def test_engine_tier2_marks_variant_ambiguous_on_genuine_split(monkeypatch):
+    """Sub-floor winner AND a second STATED concentration holding real share (>=FLOOR),
+    with no dominant leader -> ambiguous marker, concentration left blank."""
     monkeypatch.setattr(
         ec.SemanticScentEngine, "analyze",
         staticmethod(lambda q, *a, **k: _profile(
-            "EDT (Eau de Toilette)", conf=47, literal=False,
+            "EDT (Eau de Toilette)", conf=40, literal=True,
             literal_concs=["EDP (Eau de Parfum)", "EDT (Eau de Toilette)"],
+            second_conc="EDP (Eau de Parfum)", second_conf=33, second_source="consensus",
         )),
     )
     res = ec._engine_tier2("Christian Dior J Adore")
@@ -375,6 +379,40 @@ def test_engine_tier2_marks_variant_ambiguous_when_two_concentrations_stated(mon
     assert res["concentration"] is None
     assert res["concentration_meta"]["source"] == ec.CONCENTRATION_VARIANT_AMBIGUOUS_SOURCE
     assert res["concentration_meta"]["attested_concentrations"] == ["Eau de Parfum", "Eau de Toilette"]
+
+
+def test_engine_tier2_resolves_below_floor_dominant_base(monkeypatch):
+    """Two concentrations stated but the source-stated leader clearly out-votes the
+    lone flanker (>=RATIO, >=DOMINANCE_MIN) -> fill the base, not a 'varies' marker.
+    This is the flanker-dilution case (Khamrah = EDP) the count-only gate froze."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile(
+            "EDP (Eau de Parfum)", conf=44, literal=True,
+            literal_concs=["EDP (Eau de Parfum)", "Parfum (Profumo)"],
+            second_conc="Parfum (Profumo)", second_conf=10, second_source="consensus",
+        )),
+    )
+    res = ec._engine_tier2("Lattafa Perfumes Khamrah")
+    assert res["concentration"] == "Eau de Parfum"
+    assert not res.get("variant_ambiguous")
+    assert res["concentration_meta"]["below_floor_dominant"] is True
+    assert res["concentration_meta"]["source"] == "semantic_engine_v6"
+
+
+def test_engine_tier2_lone_flanker_is_not_ambiguous(monkeypatch):
+    """A single flanker mention (runner-up below FLOOR) with no dominant leader is
+    neither a split nor a confident base -> stays an ordinary gap (no mark, no fill).
+    This is the regression the 23/23 misfire exposed."""
+    monkeypatch.setattr(
+        ec.SemanticScentEngine, "analyze",
+        staticmethod(lambda q, *a, **k: _profile(
+            "EDP (Eau de Parfum)", conf=30, literal=True,
+            literal_concs=["EDP (Eau de Parfum)", "Parfum (Profumo)"],
+            second_conc="Parfum (Profumo)", second_conf=12, second_source="consensus",
+        )),
+    )
+    assert ec._engine_tier2("Some Niche Flanker") is None
 
 
 def test_engine_tier2_gives_up_on_weak_single_signal(monkeypatch):
