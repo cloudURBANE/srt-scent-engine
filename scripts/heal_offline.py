@@ -186,6 +186,7 @@ from enrichment_facts import (  # noqa: E402
     derive_wear_profile,
     is_fact_complete,
     primary_season_from_wear_profile,
+    sanitize_derived_metrics,
     top_accords_from,
 )
 import enrich_concentration as conc  # noqa: E402
@@ -759,6 +760,25 @@ def _metric_group_complete(value: Any, group: str) -> bool:
     return is_fact_complete(value)
 
 
+def _sanitize_main_accords(blob: dict[str, Any]) -> bool:
+    """Junk-filter ``blob["main_accords"]`` on a private copy, in place.
+
+    The merge below copies an engine ``main_accords`` group verbatim, and an
+    existing wardrobe blob may itself predate a junk label -- either way a stale
+    "sponsored 100%" could ride in the scored ``scent_vector`` the SPA card
+    renders (``top_accords_from`` only cleans the plain list). Sanitizing a copy
+    keeps us from mutating the shared engine entry. Returns whether it changed.
+    """
+    main = blob.get("main_accords")
+    if not isinstance(main, dict):
+        return False
+    main_copy = dict(main)
+    if sanitize_derived_metrics({"main_accords": main_copy}):
+        blob["main_accords"] = main_copy
+        return True
+    return False
+
+
 def _merge_derived_metrics(
     existing: Any, incoming: Any
 ) -> tuple[dict[str, Any] | None, bool]:
@@ -777,7 +797,9 @@ def _merge_derived_metrics(
     if not isinstance(incoming, dict) or not incoming:
         return None, False
     if not isinstance(existing, dict) or not existing:
-        return dict(incoming), True
+        result = dict(incoming)
+        _sanitize_main_accords(result)
+        return result, True
 
     merged = dict(existing)
     changed = False
@@ -800,6 +822,9 @@ def _merge_derived_metrics(
                 changed = True
         if merged_cov:
             merged["source_coverage"] = merged_cov
+
+    if _sanitize_main_accords(merged):
+        changed = True
 
     return (merged if changed else existing), changed
 

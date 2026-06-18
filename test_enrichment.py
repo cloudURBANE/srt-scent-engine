@@ -1592,6 +1592,52 @@ def test_junk_accord_filtering() -> None:
         str(fam),
     )
 
+    # The "sponsored 100%" regression: top_accords_from cleans the plain LIST, but
+    # the SPA accord card renders percentages from scent_vector -- which no read
+    # path sanitized. sanitize_derived_metrics is the backstop that drops junk
+    # from BOTH the scored vector and the list on a stored blob.
+    dirty = {
+        "main_accords": {
+            "scent_vector": [
+                {"accord": "sponsored", "score": 100.0},
+                {"accord": "Amber", "score": 91.0},
+                {"accord": "14.9K", "score": 80.0},
+                {"accord": "Citrus", "score": 70.0},
+            ],
+            "top_accords": ["sponsored", "Amber", "14.9K", "Citrus"],
+        }
+    }
+    changed = enrichment_facts.sanitize_derived_metrics(dirty)
+    vec = dirty["main_accords"]["scent_vector"]
+    check("sanitize_derived_metrics reports it cleaned the blob", changed is True, str(changed))
+    check(
+        "sanitize_derived_metrics drops junk from scent_vector",
+        [v["accord"] for v in vec] == ["Amber", "Citrus"],
+        str(vec),
+    )
+    check(
+        "sanitized scent_vector leads with the top real accord",
+        vec[0] == {"accord": "Amber", "score": 91.0},
+        str(vec),
+    )
+    check(
+        "sanitize_derived_metrics drops junk from top_accords too",
+        dirty["main_accords"]["top_accords"] == ["Amber", "Citrus"],
+        str(dirty["main_accords"]["top_accords"]),
+    )
+    # Idempotent: a clean blob is a no-op (no churn on re-serve / re-heal).
+    check(
+        "sanitize_derived_metrics is a no-op on an already-clean blob",
+        enrichment_facts.sanitize_derived_metrics(dirty) is False,
+        "second pass should not report a change",
+    )
+    # Tolerates blobs without a main_accords group.
+    check(
+        "sanitize_derived_metrics is a no-op when there is no main_accords group",
+        enrichment_facts.sanitize_derived_metrics({"performance_score": {"score_raw": 5}}) is False,
+        "missing main_accords",
+    )
+
 
 def test_parfumo_partial_self_heal_alignment() -> None:
     print("Parfumo partial vs self-heal alignment checks (no DATABASE_URL required):")

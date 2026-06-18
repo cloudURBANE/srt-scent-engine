@@ -112,6 +112,81 @@ def main() -> int:
         flags[4] is False and repr(complete_payload["derived_metrics"]) == before_dm,
     )
 
+    # The "sponsored 100%" regression: projecting an engine blob whose scored
+    # scent_vector still carries scraped junk must NOT copy that junk into the
+    # wardrobe's derived_metrics (the SPA accord card renders its percentages
+    # from scent_vector). The merge sanitizes a private copy.
+    dirty_engine_dm = _complete_dm()
+    dirty_engine_dm["main_accords"] = {
+        "scent_vector": [
+            {"accord": "sponsored", "score": 100.0},
+            {"accord": "amber", "score": 90.0},
+            {"accord": "woody", "score": 70.0},
+        ],
+        "top_accords": ["sponsored", "amber", "woody"],
+        "source": "test",
+    }
+    blank_payload = {"brand": "House", "name": "Junk Vector", "family": "Woody"}
+    heal.project_engine_facts(
+        blank_payload,
+        {
+            "derived_metrics": dirty_engine_dm,
+            "concentration": None,
+            "year": None,
+            "gender": None,
+            "image_url": None,
+        },
+    )
+    projected_vec = blank_payload.get("derived_metrics", {}).get("main_accords", {}).get("scent_vector", [])
+    ok &= _check(
+        "projection drops junk from the wardrobe scent_vector",
+        [v["accord"] for v in projected_vec] == ["amber", "woody"],
+    )
+    ok &= _check(
+        "projection drops junk from the wardrobe accords copy",
+        blank_payload.get("accords") == ["amber", "woody"],
+    )
+    ok &= _check(
+        "projection never mutates the shared engine scent_vector",
+        [v["accord"] for v in dirty_engine_dm["main_accords"]["scent_vector"]]
+        == ["sponsored", "amber", "woody"],
+    )
+
+    # An already-projected wardrobe row whose stored blob predates the junk label
+    # converges on the next heal even when no score group needs filling.
+    dirty_wardrobe = {
+        "derived_metrics": {
+            **_complete_dm(),
+            "main_accords": {
+                "scent_vector": [
+                    {"accord": "sponsored", "score": 100.0},
+                    {"accord": "amber", "score": 88.0},
+                ],
+                "top_accords": ["sponsored", "amber"],
+                "source": "test",
+            },
+        },
+        "accords": ["amber"],
+        "wear_profile": {"primary_seasons": ["Fall"], "primary_time": "Night"},
+        "family": "Amber",
+    }
+    clean_engine_dm = _complete_dm()  # nothing new to fill
+    flags = heal.project_engine_facts(
+        dirty_wardrobe,
+        {
+            "derived_metrics": clean_engine_dm,
+            "concentration": None,
+            "year": None,
+            "gender": None,
+            "image_url": None,
+        },
+    )
+    healed_vec = dirty_wardrobe["derived_metrics"]["main_accords"]["scent_vector"]
+    ok &= _check(
+        "stale wardrobe scent_vector is sanitized on heal",
+        [v["accord"] for v in healed_vec] == ["amber"] and flags[4] is True,
+    )
+
     print("ALL CHECKS PASSED" if ok else "CHECKS FAILED")
     return 0 if ok else 1
 
