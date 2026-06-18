@@ -27,3 +27,7 @@ scratch/
 
 # Windows malformed-path artifacts (e.g. accidental "c:\tmp...")
 c*tmp*
+
+# db_audit_export.py generated artifacts (regenerated on demand)
+db_export_fragrances.*
+db_audit_report.json
