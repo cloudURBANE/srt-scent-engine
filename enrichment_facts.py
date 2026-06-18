@@ -373,6 +373,44 @@ PAGE_DETERMINED_FACTS: frozenset[str] = frozenset(
 )
 
 
+def non_healable_facts(missing: Any, source: Any) -> frozenset[str]:
+    """Facts in ``missing`` that NO re-scrape of the same source can ever supply.
+
+    The single source of truth for "is this gap actionable", shared by the heal
+    sweep (which must not requeue a row it can't improve -- that is the forever
+    queue-churn) and the completeness audit (which otherwise reports a row as
+    incomplete forever even though it is fully resolved for what its source can
+    give). Two rules, mirrored from the heal requeue gate:
+
+    * ``SOURCE_UNSUPPLIABLE_FACTS`` -- a terminal-partial source (e.g. Parfumo
+      has no FG status pyramid or review text) can never deliver those facts.
+    * ``PAGE_DETERMINED_FACTS`` (reviews + the community vote scores) -- decided
+      entirely by what the page exposed, but ONLY once the row is
+      metrics-complete. If any of the four score groups is itself still missing
+      the page parse hasn't finished, so a re-fetch CAN still add them and they
+      stay healable. ``metric_groups.isdisjoint(missing)`` is that "page fully
+      parsed" test.
+    """
+    missing_set = {str(f) for f in missing} if missing else set()
+    non_healable: frozenset[str] = SOURCE_UNSUPPLIABLE_FACTS.get(
+        str(source or "").strip().lower()
+    ) or frozenset()
+    metric_groups = PAGE_DETERMINED_FACTS - {"reviews"}
+    if metric_groups.isdisjoint(missing_set):  # metrics-complete: page was parsed
+        non_healable = non_healable | PAGE_DETERMINED_FACTS
+    return non_healable
+
+
+def actionable_missing_facts(missing: Any, source: Any) -> list[str]:
+    """The subset of ``missing`` a worker re-scrape could still resolve.
+
+    ``missing`` minus :func:`non_healable_facts`. An empty result means the row
+    is already complete for everything its source can supply -- counting it as
+    "incomplete" is what makes drains look like they never finish."""
+    non_healable = non_healable_facts(missing, source)
+    return [str(f) for f in (missing or []) if str(f) not in non_healable]
+
+
 def record_source(record: dict[str, Any]) -> str:
     """The stored row's enrichment source ("" when unrecorded / FG-native)."""
     fg_raw = record.get("fg_raw") if isinstance(record.get("fg_raw"), dict) else {}
