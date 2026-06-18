@@ -1849,6 +1849,122 @@ def test_parfumo_partial_self_heal_alignment() -> None:
     )
 
 
+def test_actionable_missing_contract() -> None:
+    print("Actionable-missing contract (audit honesty, no DATABASE_URL required):")
+    import enrichment_facts
+
+    nh = enrichment_facts.non_healable_facts
+    act = enrichment_facts.actionable_missing_facts
+
+    # 1. A heal-worthy gap is always actionable, whatever the source.
+    check(
+        "year gap is actionable for an fg row",
+        act(["year"], "") == ["year"],
+        str(act(["year"], "")),
+    )
+
+    # 2. reviews-only on a metrics-complete fg page is page-determined: a
+    #    re-fetch of the same URL can't add review text, so it is NOT actionable.
+    check(
+        "reviews-only gap is non-actionable once metrics are complete",
+        act(["reviews"], "") == [] and "reviews" in nh(["reviews"], ""),
+        str(act(["reviews"], "")),
+    )
+
+    # 3. If a score group is itself still missing, the page parse is unfinished,
+    #    so the page-determined facts stay healable (must NOT be suppressed).
+    missing = ["value_score", "reviews"]
+    check(
+        "page-determined facts stay actionable while a score group is missing",
+        set(act(missing, "")) == {"value_score", "reviews"},
+        str(act(missing, "")),
+    )
+
+    # 4. Parfumo can never supply votes/reviews -- those are non-actionable even
+    #    when the page parsed cleanly.
+    parfumo_only = ["wear_profile", "performance_score", "value_score",
+                    "community_interest_score", "reviews"]
+    check(
+        "parfumo unsuppliable facts are all non-actionable",
+        act(parfumo_only, "parfumo") == [],
+        str(act(parfumo_only, "parfumo")),
+    )
+    check(
+        "parfumo concentration gap is still actionable",
+        act(["concentration", "reviews"], "parfumo") == ["concentration"],
+        str(act(["concentration", "reviews"], "parfumo")),
+    )
+
+    # 5. The completeness endpoint surfaces the per-item actionable subset plus
+    #    the actionable rollup, so the audit reflects the true backlog rather
+    #    than counting structurally-complete rows as incomplete forever.
+    saved_token = api._ENRICHMENT_WORKER_TOKEN
+    saved_enabled = db.ENABLED
+    saved_list = db.list_fragrance_records
+    saved_count = db.count_fragrance_records
+    saved_jobs_by_keys = db.get_jobs_by_keys
+    try:
+        api._ENRICHMENT_WORKER_TOKEN = "test-secret-token"
+        db.ENABLED = True
+        # An fg row fully parsed except it has no review text on the page: raw
+        # missing == ["reviews"] but actionable == [].
+        review_less = {
+            "record_key": "fg:https://www.fragrantica.com/perfume/x/Aventus-1.html",
+            "canonical_fg_url": "https://www.fragrantica.com/perfume/x/Aventus-1.html",
+            "bn_url": None,
+            "name": "Aventus",
+            "house": "Creed",
+            "year": 2010,
+            "gender": "Masculine",
+            "fg_raw": {
+                "source": "",
+                "concentration": "Eau de Parfum",
+                "notes": {"top": ["bergamot"], "heart": [], "base": ["oakmoss"], "flat": []},
+                "reviews": [],
+                "raw_identity": {"concentration": "Eau de Parfum"},
+            },
+            "bn_raw": {},
+            "derived_metrics": {
+                "main_accords": {"top_accords": ["fruity", "woody"], "source": "fg"},
+                "wear_profile": {"primary_seasons": ["fall"]},
+                "source_coverage": {
+                    "performance_score": {"v": 1},
+                    "value_score": {"v": 1},
+                    "community_interest_score": {"v": 1},
+                },
+            },
+        }
+        db.list_fragrance_records = lambda limit=200, offset=0: [review_less]
+        db.count_fragrance_records = lambda: 1
+        db.get_jobs_by_keys = lambda keys: {}
+        client = TestClient(api.app)
+        auth = {"Authorization": "Bearer test-secret-token"}
+        body = client.get("/api/enrichment/completeness", headers=auth).json()
+        item = (body.get("items") or [{}])[0]
+        check(
+            "review-less row: raw missing reviews, actionable empty",
+            item.get("missing") == ["reviews"] and item.get("actionable_missing") == [],
+            str(item),
+        )
+        check(
+            "completeness reports actionable_incomplete=0 for a structurally-complete row",
+            body.get("incomplete") == 1 and body.get("actionable_incomplete") == 0,
+            f"incomplete={body.get('incomplete')} actionable={body.get('actionable_incomplete')}",
+        )
+        check(
+            "actionable_missing_field_counts zeroes the non-actionable reviews gap",
+            (body.get("actionable_missing_field_counts") or {}).get("reviews") == 0
+            and (body.get("missing_field_counts") or {}).get("reviews") == 1,
+            str(body.get("actionable_missing_field_counts")),
+        )
+    finally:
+        api._ENRICHMENT_WORKER_TOKEN = saved_token
+        db.ENABLED = saved_enabled
+        db.list_fragrance_records = saved_list
+        db.count_fragrance_records = saved_count
+        db.get_jobs_by_keys = saved_jobs_by_keys
+
+
 def test_worker_fact_summary_and_serp_retry() -> None:
     print("Per-fragrance fact summary + bounded SERP retry checks (no DATABASE_URL required):")
 
@@ -3494,6 +3610,7 @@ def main() -> int:
     test_recompute_derived_metrics_sweep()
     test_junk_accord_filtering()
     test_parfumo_partial_self_heal_alignment()
+    test_actionable_missing_contract()
     test_worker_fact_summary_and_serp_retry()
     test_worker_query_normalization_and_retry_grace()
     test_worker_url_gating_catalog_tier_and_retirement()

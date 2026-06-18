@@ -54,8 +54,8 @@ from pydantic import BaseModel, Field
 import db
 from enrichment_facts import (
     FACT_FIELDS,
-    PAGE_DETERMINED_FACTS,
-    SOURCE_UNSUPPLIABLE_FACTS,
+    actionable_missing_facts,
+    non_healable_facts,
     derive_families,
     derive_wear_profile,
     expand_raw_accords,
@@ -5359,21 +5359,31 @@ def _record_heal_job_key(record: dict[str, Any]) -> str:
 
 def _audit_fragrance_records(
     limit: int, offset: int
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int]]:
     """Audit one page of fragrance_records for granular fact completeness.
 
-    Returns (items, missing_field_counts). Every item carries its record
-    identity, its exact missing facts, its heal job_key (may be ""), and the
+    Returns (items, missing_field_counts, actionable_field_counts). Every item
+    carries its record identity, its exact missing facts, the actionable subset
+    a re-scrape could still resolve, its heal job_key (may be ""), and the
     current durable job state for that key when one exists.
     """
     records = db.list_fragrance_records(limit=limit, offset=offset)
     items: list[dict[str, Any]] = []
     field_counts: dict[str, int] = {field: 0 for field in FACT_FIELDS}
+    actionable_field_counts: dict[str, int] = {field: 0 for field in FACT_FIELDS}
     job_keys: list[str] = []
     for record in records:
         missing = missing_facts(record)
+        source = record_source(record)
+        # actionable = the subset a re-scrape could still resolve (raw missing
+        # minus facts this source provably can't supply). A row with [] here is
+        # complete for what its source can give -- counting it as incomplete is
+        # what makes drains look like they never finish.
+        actionable = actionable_missing_facts(missing, source)
         for field in missing:
             field_counts[field] += 1
+        for field in actionable:
+            actionable_field_counts[field] += 1
         job_key = _record_heal_job_key(record)
         if missing and job_key:
             job_keys.append(job_key)
@@ -5385,9 +5395,10 @@ def _audit_fragrance_records(
                 "year": record.get("year"),
                 "canonical_fg_url": record.get("canonical_fg_url"),
                 "bn_url": record.get("bn_url"),
-                "source": record_source(record) or None,
+                "source": source or None,
                 "job_key": job_key or None,
                 "missing": missing,
+                "actionable_missing": actionable,
                 "job": None,
             }
         )
@@ -5399,7 +5410,7 @@ def _audit_fragrance_records(
     for item in items:
         if item["job_key"]:
             item["job"] = jobs_by_key.get(item["job_key"])
-    return items, field_counts
+    return items, field_counts, actionable_field_counts
 
 
 @app.get(
@@ -5420,8 +5431,13 @@ def enrichment_completeness(
     same identity. Read-only; pair with POST /api/enrichment/heal to requeue.
     """
     _require_db()
-    items, field_counts = _audit_fragrance_records(limit, offset)
+    items, field_counts, actionable_field_counts = _audit_fragrance_records(limit, offset)
     incomplete = [item for item in items if item["missing"]]
+    # actionable_incomplete excludes rows whose only gaps are facts their source
+    # provably can't supply (parfumo votes/reviews, page-determined scores on a
+    # fully-parsed page). It is the true addressable backlog; `incomplete` will
+    # never reach zero because those structural gaps are permanent.
+    actionable_incomplete = [item for item in items if item["actionable_missing"]]
     return {
         "total_records": db.count_fragrance_records(),
         "limit": limit,
@@ -5429,8 +5445,10 @@ def enrichment_completeness(
         "audited": len(items),
         "complete": len(items) - len(incomplete),
         "incomplete": len(incomplete),
+        "actionable_incomplete": len(actionable_incomplete),
         "fields": list(FACT_FIELDS),
         "missing_field_counts": field_counts,
+        "actionable_missing_field_counts": actionable_field_counts,
         "items": items if include_complete else incomplete,
     }
 
@@ -5463,7 +5481,7 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
             )
         wanted = set(payload.fields)
 
-    items, field_counts = _audit_fragrance_records(payload.limit, payload.offset)
+    items, field_counts, _ = _audit_fragrance_records(payload.limit, payload.offset)
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
@@ -5486,20 +5504,14 @@ def heal_incomplete_enrichment(payload: HealSweepRequest) -> dict[str, Any]:
             continue
         incomplete += 1
         # Terminal-partial sources (e.g. Parfumo) can never deliver certain
-        # facts, so those are always non-healable. PAGE_DETERMINED_FACTS (reviews
-        # + the community vote scores) are decided by what the page exposed -- but
-        # only once the row is metrics-complete (the four derived-metric groups
-        # parsed). If a score group is itself still missing the page parse hasn't
-        # finished, so a re-fetch CAN still add it and we must requeue. This
-        # mirrors the worker's `quality_status == "complete"` gate
-        # (scripts.enrichment_worker._auto_requeue_incomplete) so the inline and
-        # sweep requeue decisions stay identical and the queue can drain to zero.
-        non_healable = (
-            SOURCE_UNSUPPLIABLE_FACTS.get(str(item.get("source") or "")) or frozenset()
-        )
-        metric_groups = PAGE_DETERMINED_FACTS - {"reviews"}
-        if metric_groups.isdisjoint(missing):  # metrics-complete: page was parsed
-            non_healable = non_healable | PAGE_DETERMINED_FACTS
+        # facts, and PAGE_DETERMINED_FACTS are decided by what the page exposed
+        # once it is metrics-complete -- both encoded in non_healable_facts, the
+        # single source of truth shared with the completeness audit so the inline
+        # and sweep requeue decisions can never drift. This mirrors the worker's
+        # `quality_status == "complete"` gate
+        # (scripts.enrichment_worker._auto_requeue_incomplete) so the queue can
+        # drain to zero instead of churning a page that can't improve.
+        non_healable = non_healable_facts(missing, item.get("source"))
         if all(field in non_healable for field in missing):
             _skip(item, "source_cannot_supply")
             continue
