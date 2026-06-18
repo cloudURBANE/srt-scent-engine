@@ -187,6 +187,38 @@ def main() -> int:
         [v["accord"] for v in healed_vec] == ["amber"] and flags[4] is True,
     )
 
+    # The real "sponsored 100%" persistence: a wardrobe row whose abbreviated
+    # name never matches an engine record (e.g. "Dylan Blue" vs the engine's
+    # "Pour Homme Dylan Blue") never reaches the engine-projection sanitize path,
+    # so its stored scent_vector kept the junk forever. _sanitize_wardrobe_blob
+    # is the unconditional sweep that cleans it with no engine match at all.
+    no_match_row = {
+        "derived_metrics": {
+            "main_accords": {
+                "scent_vector": [
+                    {"accord": "Amber", "score": 100.0},
+                    {"accord": "Sponsored", "score": 100.0},
+                    {"accord": "Citrus", "score": 91.65},
+                ],
+                "top_accords": ["Amber", "Sponsored", "Citrus"],
+                "source": "test",
+            },
+        },
+        "accords": ["Amber", "Sponsored", "Citrus"],
+    }
+    changed = heal._sanitize_wardrobe_blob(no_match_row)
+    swept_vec = no_match_row["derived_metrics"]["main_accords"]["scent_vector"]
+    ok &= _check(
+        "unmatched row's stale scent_vector is sanitized with no engine match",
+        changed is True
+        and [v["accord"] for v in swept_vec] == ["Amber", "Citrus"]
+        and no_match_row["accords"] == ["Amber", "Citrus"],
+    )
+    ok &= _check(
+        "sanitize sweep is idempotent (clean row reports no change)",
+        heal._sanitize_wardrobe_blob(no_match_row) is False,
+    )
+
     print("ALL CHECKS PASSED" if ok else "CHECKS FAILED")
     return 0 if ok else 1
 

@@ -1022,6 +1022,28 @@ def fill_core_scalars(
     return conc_filled, year_filled, gender_filled, image_filled
 
 
+def _sanitize_wardrobe_blob(payload: dict[str, Any]) -> bool:
+    """Junk-filter a wardrobe row's *already-stored* derived_metrics + accords,
+    independent of any engine match.
+
+    The SPA renders the accord card's percentages straight from the stored
+    ``derived_metrics.main_accords.scent_vector``. The engine-projection path
+    (``_merge_derived_metrics``) only converges a stale "sponsored 100%" blob
+    when an engine record matches the row -- so an abbreviated wardrobe name that
+    never matches (e.g. "Dylan Blue" vs the engine's "Pour Homme Dylan Blue")
+    keeps the junk forever no matter how many drains run. This sweep runs on
+    every row regardless of match, mutating ``payload`` in place. Returns whether
+    it removed any junk.
+    """
+    dm = payload.get("derived_metrics")
+    if not sanitize_derived_metrics(dm):
+        return False
+    clean = top_accords_from(dm)
+    if clean and clean != _str_accords(payload.get("accords")):
+        payload["accords"] = clean
+    return True
+
+
 def heal_wardrobe(
     index: dict[str, dict[str, Any]],
     *,
@@ -1035,6 +1057,7 @@ def heal_wardrobe(
         "uf_year": 0, "uf_gender": 0, "uf_image": 0,
         "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_wear": 0, "gf_dm": 0, "gf_notes": 0,
         "gf_year": 0, "gf_gender": 0, "gf_image": 0,
+        "uf_san": 0, "gf_san": 0,
         "no_match": 0, "core_match": 0,
     }
 
@@ -1099,6 +1122,9 @@ def heal_wardrobe(
             if only_keys is not None and norm not in only_keys:
                 continue
             fam, cc, acc, wear, dm, notes, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
+            san = _sanitize_wardrobe_blob(fdata)
+            if san:
+                stats["uf_san"] += 1
             if fam:
                 stats["uf_family"] += 1
             if cc:
@@ -1117,7 +1143,7 @@ def heal_wardrobe(
                 stats["uf_gender"] += 1
             if img:
                 stats["uf_image"] += 1
-            if (fam or cc or acc or wear or dm or notes or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or dm or notes or yr or gen or img or san) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -1138,6 +1164,9 @@ def heal_wardrobe(
             if only_keys is not None and norm not in only_keys:
                 continue
             fam, cc, acc, wear, dm, notes, yr, gen, img = _project(pdata, norm, str(brand), str(name))
+            san = _sanitize_wardrobe_blob(pdata)
+            if san:
+                stats["gf_san"] += 1
             if fam:
                 stats["gf_family"] += 1
             if cc:
@@ -1156,7 +1185,7 @@ def heal_wardrobe(
                 stats["gf_gender"] += 1
             if img:
                 stats["gf_image"] += 1
-            if (fam or cc or acc or wear or dm or notes or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or dm or notes or yr or gen or img or san) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -1168,11 +1197,11 @@ def heal_wardrobe(
         f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
         f"accords~{stats['uf_acc']} wear+{stats['uf_wear']} dm+{stats['uf_dm']} notes+{stats['uf_notes']} "
         f"year+{stats['uf_year']} gender+{stats['uf_gender']} "
-        f"image+{stats['uf_image']}] "
+        f"image+{stats['uf_image']} sanitized~{stats['uf_san']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
         f"accords~{stats['gf_acc']} wear+{stats['gf_wear']} dm+{stats['gf_dm']} notes+{stats['gf_notes']} "
         f"year+{stats['gf_year']} gender+{stats['gf_gender']} "
-        f"image+{stats['gf_image']}] "
+        f"image+{stats['gf_image']} sanitized~{stats['gf_san']}] "
         f"core_match={stats['core_match']} no_engine_match={stats['no_match']} dry_run={dry_run}"
     )
     return stats
