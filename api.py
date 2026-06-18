@@ -4391,6 +4391,7 @@ def _persist_detail_record(
             and not _review_source_is(r, "fragrantica")
         ]
         notes_blob = _notes_to_dict(details.notes)
+        concentration = str(getattr(details, "concentration", "") or "").strip()
         db.upsert_fragrance_details(
             {
                 "canonical_fg_url": _canonical_fg_url(selected.frag_url),
@@ -4412,6 +4413,7 @@ def _persist_detail_record(
                     {
                         "frag_cards": details.frag_cards or {},
                         "notes": notes_blob,
+                        "concentration": concentration or None,
                         "pros_cons": details.pros_cons or [],
                         "reviews": fg_reviews,
                     }

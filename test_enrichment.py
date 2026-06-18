@@ -858,6 +858,34 @@ def test_concentration_pipeline() -> None:
         getattr(stored_details, "concentration", None) == "Extrait",
     )
 
+    captured_upsert: dict[str, object] = {}
+    saved_enabled = api.db.ENABLED
+    saved_upsert_details = api.db.upsert_fragrance_details
+    try:
+        api.db.ENABLED = True
+
+        def fake_upsert_detail(row: dict[str, object]) -> None:
+            captured_upsert.update(row)
+
+        api.db.upsert_fragrance_details = fake_upsert_detail  # type: ignore[assignment]
+        selected = api.engine.UnifiedFragrance(
+            name="Test",
+            brand="Test House",
+            year="2026",
+            frag_url="https://www.fragrantica.com/perfume/Test-House/Test-1.html",
+        )
+        details_for_persist = api.engine.UnifiedDetails(notes=api.engine.NotesList())
+        setattr(details_for_persist, "concentration", "Eau de Parfum")
+        api._persist_detail_record(selected, details_for_persist)
+    finally:
+        api.db.ENABLED = saved_enabled
+        api.db.upsert_fragrance_details = saved_upsert_details  # type: ignore[assignment]
+    check(
+        "persisted detail record keeps hydrated concentration durable",
+        (captured_upsert.get("fg_raw") or {}).get("concentration") == "Eau de Parfum",  # type: ignore[union-attr]
+        str(captured_upsert.get("fg_raw")),
+    )
+
     # 6. The backlog sweeper flags rows missing base fields.
     import scripts.enrich_database_metrics as sweeper
 
@@ -2861,7 +2889,7 @@ def test_heal_offline_exact_match_contract() -> None:
     )
     ramz_entry = ramz_index.get(heal._norm_key("Lattafa", "Ramz Gold"))
     ramz_payload = {"brand": "Lattafa", "name": "Ramz Gold", "year": "", "concentration": ""}
-    _f0, c0, _a0, _w0, y0, _g0, i0 = heal.project_engine_facts(ramz_payload, ramz_entry or {})
+    _f0, c0, _a0, _w0, _dm0, _n0, y0, _g0, i0 = heal.project_engine_facts(ramz_payload, ramz_entry or {})
     check(
         "heal_offline: duplicated house token alias projects Ramz facts",
         ramz_entry is not None
@@ -2920,7 +2948,7 @@ def test_heal_offline_exact_match_contract() -> None:
         "accords": ["14.9K", "Hate", "Amber", "Summer", "Citrus"],
         "season": "Universal",
     }
-    fam, _cc, acc, wear, _yr, _gen, _img = heal.project_engine_facts(familied_junk, entry)
+    fam, _cc, acc, wear, _dm, _notes, _yr, _gen, _img = heal.project_engine_facts(familied_junk, entry)
     check(
         "heal_offline: already-familied row gets junk accords and wear refreshed (not the family)",
         acc is True
@@ -2964,7 +2992,7 @@ def test_heal_offline_exact_match_contract() -> None:
     )
     # Unknown-family rows still get BOTH family and accords filled (unchanged).
     unknown = {"family": "Unknown", "accords": ["14.9K", "Hate"]}
-    fam_u, _c, acc_u, wear_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
+    fam_u, _c, acc_u, wear_u, _dm_u, _notes_u, _yu, _gu, _iu = heal.project_engine_facts(unknown, entry)
     check(
         "heal_offline: unknown-family row fills family, clean accords, and wear",
         fam_u is True
@@ -2981,7 +3009,7 @@ def test_heal_offline_exact_match_contract() -> None:
             untouched,
             {"derived_metrics": None, "concentration": None, "year": None, "gender": None, "image_url": None},
         )
-        == (False, False, False, False, False, False, False)
+        == (False, False, False, False, False, False, False, False, False)
         and untouched["accords"] == ["Woody"],
     )
     # Year/gender are projected from the engine record (not derived_metrics) when
@@ -2994,7 +3022,7 @@ def test_heal_offline_exact_match_contract() -> None:
         "gender": "Men",
         "image_url": "https://cdn.example.test/dylan-blue.jpg",
     }
-    _f, _c2, _a2, _w2, y_filled, g_filled, image_filled = heal.project_engine_facts(yearless, y_entry)
+    _f, _c2, _a2, _w2, _dm2, _notes2, y_filled, g_filled, image_filled = heal.project_engine_facts(yearless, y_entry)
     check(
         "heal_offline: missing wardrobe year+gender+image filled from engine record",
         y_filled is True
@@ -3008,7 +3036,7 @@ def test_heal_offline_exact_match_contract() -> None:
     has_year = {"year": "1999", "gender": "Women", "image_url": "https://cdn.example.test/existing.jpg"}
     check(
         "heal_offline: existing wardrobe year/gender/image left untouched",
-        heal.project_engine_facts(has_year, y_entry)[4:] == (False, False, False)
+        heal.project_engine_facts(has_year, y_entry)[6:] == (False, False, False)
         and has_year["year"] == "1999"
         and has_year["image_url"] == "https://cdn.example.test/existing.jpg",
     )
@@ -3089,7 +3117,7 @@ def test_heal_offline_number_norm_contract() -> None:
         number_entry is not None and number_entry.get("year") == "2007",
     )
     payload = {"brand": ward_brand, "name": ward_name, "year": "", "gender": ""}
-    _f, _c, _a, _w, y_filled, g_filled, _i = heal.project_engine_facts(payload, number_entry or {})
+    _f, _c, _a, _w, _dm, _notes, y_filled, g_filled, _i = heal.project_engine_facts(payload, number_entry or {})
     check(
         "heal_offline number: 'N22' inherits year 2007 + gender from 'No 22'",
         y_filled is True

@@ -739,6 +739,126 @@ def _wear_profile_complete(value: Any) -> bool:
     )
 
 
+_DERIVED_METRIC_GROUPS = (
+    "performance_score",
+    "value_score",
+    "community_interest_score",
+    "wear_profile",
+    "main_accords",
+    "notes",
+)
+
+
+def _metric_group_complete(value: Any, group: str) -> bool:
+    if group == "wear_profile":
+        return _wear_profile_complete(value)
+    if group == "main_accords":
+        return bool(top_accords_from({"derived_metrics": {"main_accords": value}}))
+    if isinstance(value, dict):
+        return bool(value)
+    return is_fact_complete(value)
+
+
+def _merge_derived_metrics(
+    existing: Any, incoming: Any
+) -> tuple[dict[str, Any] | None, bool]:
+    """Add missing engine metric-card groups to a wardrobe payload.
+
+    The phone reads score-card data from ``fragrance_data.derived_metrics``.
+    Engine recompute fills ``fragrance_records.derived_metrics_json``, but the
+    wardrobe projection used to copy only flattened facts, leaving rows with
+    blank score cards even when the engine already had the canonical blob.
+
+    Merge fill-only: existing populated groups win, missing groups are copied
+    from the engine, and source_coverage is OR-merged so coverage never moves
+    backwards. This keeps the projection idempotent and avoids downgrading rows
+    that already carry app-visible metric data.
+    """
+    if not isinstance(incoming, dict) or not incoming:
+        return None, False
+    if not isinstance(existing, dict) or not existing:
+        return dict(incoming), True
+
+    merged = dict(existing)
+    changed = False
+    for group in _DERIVED_METRIC_GROUPS:
+        inc_value = incoming.get(group)
+        if not _metric_group_complete(inc_value, group):
+            continue
+        current_value = merged.get(group)
+        if not _metric_group_complete(current_value, group):
+            merged[group] = inc_value
+            changed = True
+
+    existing_cov = existing.get("source_coverage")
+    incoming_cov = incoming.get("source_coverage")
+    if isinstance(incoming_cov, dict):
+        merged_cov = dict(existing_cov) if isinstance(existing_cov, dict) else {}
+        for key, value in incoming_cov.items():
+            if value and not merged_cov.get(key):
+                merged_cov[key] = value
+                changed = True
+        if merged_cov:
+            merged["source_coverage"] = merged_cov
+
+    return (merged if changed else existing), changed
+
+
+def _notes_dict_complete(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key in ("top", "heart", "base", "flat"):
+        items = value.get(key)
+        if isinstance(items, list) and any(str(item or "").strip() for item in items):
+            return True
+    return False
+
+
+def _payload_notes_complete(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(str(item or "").strip() for item in value)
+    return _notes_dict_complete(value)
+
+
+def _flat_notes_from(notes: dict[str, Any]) -> list[str]:
+    flat = notes.get("flat")
+    if isinstance(flat, list) and any(str(item or "").strip() for item in flat):
+        return [str(item).strip() for item in flat if str(item or "").strip()]
+    out: list[str] = []
+    for key in ("top", "heart", "base"):
+        items = notes.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
+def _project_notes(payload: dict[str, Any], derived_metrics: dict[str, Any]) -> bool:
+    notes = derived_metrics.get("notes")
+    if not _notes_dict_complete(notes):
+        return False
+    assert isinstance(notes, dict)
+    changed = False
+    if not _payload_notes_complete(payload.get("notes")):
+        flat = _flat_notes_from(notes)
+        if flat:
+            payload["notes"] = flat
+            changed = True
+    if not _notes_dict_complete(payload.get("pyramid")):
+        payload["pyramid"] = {
+            "has_pyramid": bool(notes.get("has_pyramid", False)),
+            "top": list(notes.get("top", []) or []),
+            "heart": list(notes.get("heart", []) or []),
+            "base": list(notes.get("base", []) or []),
+            "flat": list(notes.get("flat", []) or []),
+        }
+        changed = True
+    return changed
+
+
 def _project_wear_facts(payload: dict[str, Any], derived_metrics: dict[str, Any]) -> bool:
     """Fill missing wardrobe wear/season context from engine metrics.
 
@@ -776,18 +896,24 @@ def _project_wear_facts(payload: dict[str, Any], derived_metrics: dict[str, Any]
 
 def project_engine_facts(
     payload: dict[str, Any], entry: dict[str, Any]
-) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool, bool, bool, bool, bool]:
     """Project one engine-cache entry's facts onto a wardrobe payload, in place.
 
     Returns ``(family_filled, concentration_filled, accords_refreshed,
-    wear_filled, year_filled, gender_filled, image_filled)``. Pure apart from mutating
-    ``payload`` -- no DB, so it is unit-testable. ``entry`` is
+    wear_filled, derived_metrics_filled, notes_filled, year_filled, gender_filled,
+    image_filled)``. Pure apart from mutating ``payload`` -- no DB, so it is
+    unit-testable. ``entry`` is
     ``{"derived_metrics": <blob|None>, "concentration": <str|None>,
     "year": <str|None>, "gender": <str|None>, "image_url": <str|None>}``.
     """
-    fam_filled = conc_filled = acc_refreshed = wear_filled = year_filled = gender_filled = image_filled = False
+    fam_filled = conc_filled = acc_refreshed = wear_filled = dm_filled = notes_filled = year_filled = gender_filled = image_filled = False
     dm = entry.get("derived_metrics")
     if dm is not None:
+        merged_dm, dm_filled = _merge_derived_metrics(payload.get("derived_metrics"), dm)
+        if dm_filled and merged_dm is not None:
+            payload["derived_metrics"] = merged_dm
+        if isinstance(dm, dict):
+            notes_filled = _project_notes(payload, dm)
         # Always re-project the junk-filtered top accords. The scrape leak
         # (vote counts / Hate-Like / seasons) poisons the wardrobe accords copy
         # too, and a row whose family is *already* set never enters the family
@@ -825,7 +951,7 @@ def project_engine_facts(
     if not _payload_image_url(payload) and image_url:
         payload["image_url"] = image_url
         image_filled = True
-    return fam_filled, conc_filled, acc_refreshed, wear_filled, year_filled, gender_filled, image_filled
+    return fam_filled, conc_filled, acc_refreshed, wear_filled, dm_filled, notes_filled, year_filled, gender_filled, image_filled
 
 
 def fill_core_scalars(
@@ -868,17 +994,17 @@ def heal_wardrobe(
     dsn = _wardrobe_dsn()
     core_index = _build_core_index(index)
     stats = {
-        "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_wear": 0,
+        "uf_family": 0, "uf_conc": 0, "uf_acc": 0, "uf_wear": 0, "uf_dm": 0, "uf_notes": 0,
         "uf_year": 0, "uf_gender": 0, "uf_image": 0,
-        "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_wear": 0,
+        "gf_family": 0, "gf_conc": 0, "gf_acc": 0, "gf_wear": 0, "gf_dm": 0, "gf_notes": 0,
         "gf_year": 0, "gf_gender": 0, "gf_image": 0,
         "no_match": 0, "core_match": 0,
     }
 
     def _project(
         payload: dict[str, Any], norm: str, brand: str, name: str
-    ) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
-        """Returns (family, concentration, accords, wear, year, gender, image) flags."""
+    ) -> tuple[bool, bool, bool, bool, bool, bool, bool, bool, bool]:
+        """Returns (family, concentration, accords, wear, dm, notes, year, gender, image) flags."""
         entry = index.get(norm)
         # Bridge inconsistent number spellings ("N22" <-> "No 22") to the canonical
         # engine identity (see _NUMBER_TOKEN_RE). This is a *secondary* gap-fill
@@ -888,15 +1014,15 @@ def heal_wardrobe(
         # must still be consulted to fill what that empty entry can't.
         number_key = _number_norm_key(brand, name)
         number_entry = index.get(number_key) if number_key else None
-        fam = cc = acc = wear = yr = gen = img = False
+        fam = cc = acc = wear = dm = notes = yr = gen = img = False
         sources: list[dict[str, Any]] = []
         for src in (entry, number_entry):
             if src is not None and not any(src is s for s in sources):
                 sources.append(src)
         for src in sources:
-            f2, c2, a2, w2, y2, g2, i2 = project_engine_facts(payload, src)
-            fam, cc, acc, wear, yr, gen, img = (
-                fam or f2, cc or c2, acc or a2, wear or w2,
+            f2, c2, a2, w2, d2, n2, y2, g2, i2 = project_engine_facts(payload, src)
+            fam, cc, acc, wear, dm, notes, yr, gen, img = (
+                fam or f2, cc or c2, acc or a2, wear or w2, dm or d2, notes or n2,
                 yr or y2, gen or g2, img or i2,
             )
         # If scalar facts are still missing, resolve the abbreviated wardrobe name
@@ -919,7 +1045,7 @@ def heal_wardrobe(
                 cc, yr, gen, img = cc or c2, yr or y2, gen or g2, img or i2
         if not sources and not (cc or yr or gen or img):
             stats["no_match"] += 1
-        return fam, cc, acc, wear, yr, gen, img
+        return fam, cc, acc, wear, dm, notes, yr, gen, img
 
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         # user_fragrances
@@ -935,7 +1061,7 @@ def heal_wardrobe(
             norm = _norm_key(brand_uf, name_uf)
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, wear, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
+            fam, cc, acc, wear, dm, notes, yr, gen, img = _project(fdata, norm, brand_uf, name_uf)
             if fam:
                 stats["uf_family"] += 1
             if cc:
@@ -944,13 +1070,17 @@ def heal_wardrobe(
                 stats["uf_acc"] += 1
             if wear:
                 stats["uf_wear"] += 1
+            if dm:
+                stats["uf_dm"] += 1
+            if notes:
+                stats["uf_notes"] += 1
             if yr:
                 stats["uf_year"] += 1
             if gen:
                 stats["uf_gender"] += 1
             if img:
                 stats["uf_image"] += 1
-            if (fam or cc or acc or wear or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or dm or notes or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE user_fragrances SET fragrance_data = %s WHERE id = %s",
@@ -970,7 +1100,7 @@ def heal_wardrobe(
             norm = _norm_key(str(brand), str(name))
             if only_keys is not None and norm not in only_keys:
                 continue
-            fam, cc, acc, wear, yr, gen, img = _project(pdata, norm, str(brand), str(name))
+            fam, cc, acc, wear, dm, notes, yr, gen, img = _project(pdata, norm, str(brand), str(name))
             if fam:
                 stats["gf_family"] += 1
             if cc:
@@ -979,13 +1109,17 @@ def heal_wardrobe(
                 stats["gf_acc"] += 1
             if wear:
                 stats["gf_wear"] += 1
+            if dm:
+                stats["gf_dm"] += 1
+            if notes:
+                stats["gf_notes"] += 1
             if yr:
                 stats["gf_year"] += 1
             if gen:
                 stats["gf_gender"] += 1
             if img:
                 stats["gf_image"] += 1
-            if (fam or cc or acc or wear or yr or gen or img) and not dry_run:
+            if (fam or cc or acc or wear or dm or notes or yr or gen or img) and not dry_run:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE global_fragrances SET profile_data = %s WHERE id = %s",
@@ -995,11 +1129,11 @@ def heal_wardrobe(
             conn.commit()
     print(
         f"wardrobe: user_fragrances[family+{stats['uf_family']} conc+{stats['uf_conc']} "
-        f"accords~{stats['uf_acc']} wear+{stats['uf_wear']} "
+        f"accords~{stats['uf_acc']} wear+{stats['uf_wear']} dm+{stats['uf_dm']} notes+{stats['uf_notes']} "
         f"year+{stats['uf_year']} gender+{stats['uf_gender']} "
         f"image+{stats['uf_image']}] "
         f"global_fragrances[family+{stats['gf_family']} conc+{stats['gf_conc']} "
-        f"accords~{stats['gf_acc']} wear+{stats['gf_wear']} "
+        f"accords~{stats['gf_acc']} wear+{stats['gf_wear']} dm+{stats['gf_dm']} notes+{stats['gf_notes']} "
         f"year+{stats['gf_year']} gender+{stats['gf_gender']} "
         f"image+{stats['gf_image']}] "
         f"core_match={stats['core_match']} no_engine_match={stats['no_match']} dry_run={dry_run}"
