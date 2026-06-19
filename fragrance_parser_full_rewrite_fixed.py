@@ -559,6 +559,15 @@ class IdentityTools:
         "homme", "femme", "men", "women", "man", "woman", "male", "female",
         "unisex", "spray", "version", "original", "new", "intense",
     }
+    # Connector / descriptor tokens that must not dominate ranking. A query whose
+    # only matched tokens are these "filler" words must not clear the relevance
+    # floor on filler alone -- the cause of "layton de" surfacing Caron "Nuit De
+    # Noel" and YSL "La Nuit De L'Homme" (matched purely on "de"/"la"). Includes
+    # every STOPWORD plus the pure grammatical connectors the stopword list omits.
+    RANKING_FILLER_TOKENS = STOPWORDS | {
+        "the", "of", "and", "or", "a", "an", "by", "to", "with",
+        "el", "des", "di", "et", "il", "lo",
+    }
     GENDER_TOKEN_GROUPS = {
         "homme": "masculine",
         "men": "masculine",
@@ -611,7 +620,46 @@ class IdentityTools:
         "martin margiela": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
         "replica": {"maison margiela", "maison martin margiela", "martin margiela", "replica"},
         "thom browne": {"thom browne", "thombrony"},
+        "hugo boss": {"hugo boss", "boss"},
+        "boss": {"hugo boss", "boss"},
+        "montblanc": {"montblanc", "mont blanc"},
+        "mont blanc": {"montblanc", "mont blanc"},
+        "parfums de marly": {"parfums de marly", "pdm"},
+        "pdm": {"parfums de marly", "pdm"},
+        "le labo": {"le labo"},
+        "jo malone": {"jo malone", "jo malone london"},
+        "jo malone london": {"jo malone", "jo malone london"},
     }
+    # Whole-query rewrites: a known shorthand / common misspelling that, on its
+    # own (after trailing filler words are trimmed), names a specific fragrance
+    # or house. Matched only on the *entire* trimmed query, never as a substring,
+    # so a real name token is never corrupted. Keys are normalized; values are
+    # the canonical query we actually search. Covers the user-reported misses
+    # "monet blanco"/"mont blanco" (-> Montblanc), "ysev saint laurent" (typo of
+    # the YSL house), bare "baccarat"/"layton" (single famous flanker of a house
+    # we would otherwise treat as a one-word, houseless name).
+    QUERY_CANONICAL_REWRITES = {
+        "monet blanco": "Montblanc",
+        "mont blanco": "Montblanc",
+        "ysev saint laurent": "Yves Saint Laurent",
+        "baccarat": "Maison Francis Kurkdjian Baccarat Rouge 540",
+        "br540": "Maison Francis Kurkdjian Baccarat Rouge 540",
+        "layton": "Parfums de Marly Layton",
+    }
+    # Known product LINES whose parent house is frequently omitted from the
+    # query. When the line phrase appears (as a contiguous run of query tokens)
+    # but none of the house's own forms is present, prepend the house so both
+    # the discovery leg and the relevance ranker anchor on the right designer.
+    # Distinct from QUERY_CANONICAL_REWRITES: this *augments* the query instead
+    # of replacing it, so longer real queries survive ("le male elixir absolu
+    # parfum intense" -> "Jean Paul Gaultier le male elixir absolu parfum
+    # intense"). Ordered longest-phrase-first so the most specific line wins.
+    QUERY_LINE_HOUSE_HINTS = (
+        ("baccarat rouge", "Maison Francis Kurkdjian"),
+        ("le male", "Jean Paul Gaultier"),
+        ("bottled night", "Hugo Boss"),
+        ("layton", "Parfums de Marly"),
+    )
     # Fragrantica designer-page slugs for sub-lines that differ from the parent house.
     # Keys are normalized sub-line tokens; values are designer labels to crawl.
     FRAGRANTICA_LINE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -812,6 +860,69 @@ class IdentityTools:
                         return prefix
 
         return cleaned_name
+
+    @staticmethod
+    def _house_present_in_tokens(token_set: set[str], house: str) -> bool:
+        """True when every distinctive token of some form of ``house`` is present."""
+        for form in IdentityTools.brand_forms(house):
+            form_tokens = IdentityTools.identity_tokens(TextSanitizer.normalize_identity(form))
+            if form_tokens and form_tokens <= token_set:
+                return True
+        return False
+
+    @staticmethod
+    def expand_query_aliases(query: str) -> str:
+        """Rewrite known shorthands / misspellings and prepend an omitted house.
+
+        Pure and conservative: it only fires on the curated tables above, so a
+        query it does not recognise is returned byte-for-byte. Wired into the top
+        of ``search_once`` so both the discovery leg and the relevance ranker see
+        the canonical form, turning the user-reported misses ("monet blanco",
+        "ysev saint laurent", "layton de", "boss bottled night", "le male elixir
+        absolu parfum intense", bare "baccarat") into anchored queries.
+        """
+        cleaned = TextSanitizer.clean(query)
+        norm = TextSanitizer.normalize_identity(cleaned)
+        if not norm:
+            return query
+
+        tokens = norm.split()
+        # Trailing-filler-trimmed form, so "layton de" matches the "layton"
+        # shorthand and "ysl perfume" matches a house. Keep at least one token.
+        trimmed_tokens = list(tokens)
+        while len(trimmed_tokens) > 1 and trimmed_tokens[-1] in IdentityTools.STOPWORDS:
+            trimmed_tokens.pop()
+        trimmed = " ".join(trimmed_tokens)
+
+        # 1) Whole-query rewrite (exact or filler-trimmed match only).
+        rewrite = (
+            IdentityTools.QUERY_CANONICAL_REWRITES.get(norm)
+            or IdentityTools.QUERY_CANONICAL_REWRITES.get(trimmed)
+        )
+        if rewrite:
+            return rewrite
+
+        # 2) Known line whose house is missing: prepend the house.
+        distinctive = {t for t in tokens if t not in IdentityTools.STOPWORDS}
+        for phrase, house in IdentityTools.QUERY_LINE_HOUSE_HINTS:
+            phrase_tokens = phrase.split()
+            if not IdentityTools._tokens_contains_run(tokens, phrase_tokens):
+                continue
+            if IdentityTools._house_present_in_tokens(distinctive | set(tokens), house):
+                break
+            return f"{house} {cleaned}".strip()
+
+        return query
+
+    @staticmethod
+    def _tokens_contains_run(haystack: list[str], needle: list[str]) -> bool:
+        """True when ``needle`` appears as a contiguous run inside ``haystack``."""
+        if not needle or len(needle) > len(haystack):
+            return False
+        for start in range(len(haystack) - len(needle) + 1):
+            if haystack[start:start + len(needle)] == needle:
+                return True
+        return False
 
     @staticmethod
     def canonical_brand_query(query: str) -> str:
@@ -1096,21 +1207,57 @@ class IdentityTools:
         if not q_tokens or not target_words:
             return 0.0
 
-        matched_score = 0.0
-        for qt in q_tokens:
-            if qt in target_words:
-                matched_score += 1.0
-            elif len(qt) >= IdentityTools.MIN_FUZZY_TOKEN_LEN:
-                best_word_match = max([SequenceMatcher(None, qt, t_word).ratio() for t_word in target_words] + [0.0])
-                matched_score += best_word_match
+        # Weight distinctive (non-filler) query tokens fully and filler tokens
+        # ("de", "la", "le", "eau", "man", "the", "of"...) at a fraction, so a
+        # candidate that only happens to share filler words cannot out-score one
+        # that shares the real anchor. Fuzzy matching is reserved for distinctive
+        # tokens -- a two-letter filler should never fuzzy-match its way in.
+        target_word_set = set(target_words)
+        filler = IdentityTools.RANKING_FILLER_TOKENS
+        distinctive_tokens = [qt for qt in q_tokens if qt not in filler]
 
-        token_confidence = matched_score / max(1, len(q_tokens))
+        matched_weight = 0.0
+        total_weight = 0.0
+        covered_distinctive = 0
+        for qt in q_tokens:
+            is_filler = qt in filler
+            weight = 0.15 if is_filler else 1.0
+            total_weight += weight
+            if qt in target_word_set:
+                matched_weight += weight
+                if not is_filler:
+                    covered_distinctive += 1
+            elif not is_filler and len(qt) >= IdentityTools.MIN_FUZZY_TOKEN_LEN:
+                best_word_match = max(
+                    (SequenceMatcher(None, qt, t_word).ratio() for t_word in target_words),
+                    default=0.0,
+                )
+                matched_weight += best_word_match
+                if best_word_match >= 0.8:
+                    covered_distinctive += 1
+
+        token_confidence = matched_weight / total_weight if total_weight else 0.0
         raw_ratio = max(
             SequenceMatcher(None, query_clean, name_clean).ratio(),
             SequenceMatcher(None, query_clean, brand_clean).ratio(),
             SequenceMatcher(None, query_clean, target_full).ratio()
         )
         alias_ratio = IdentityTools.fused_identity_score(query, item.name, item.brand)
+
+        # The query carries a real anchor word but the candidate covers none of
+        # them -- not even fuzzily. Filler overlap or coincidental whole-string
+        # similarity must not float an unrelated row over the floor (the
+        # "layton de" -> "Nuit De Noel" / "La Nuit De L'Homme" failure). Cap it
+        # below the result floor so it is dropped instead of ranked.
+        if distinctive_tokens and covered_distinctive == 0:
+            return min(max(token_confidence, raw_ratio, alias_ratio), 0.50)
+
+        # A query made entirely of filler/descriptor words ("le male", "eau de
+        # parfum") has no distinctive anchor, so token_confidence over filler is
+        # meaningless -- fall back to whole-phrase similarity. (The known-line
+        # expander prepends the house for these before they reach the ranker.)
+        if not distinctive_tokens:
+            return max(raw_ratio, alias_ratio)
 
         return max(token_confidence, raw_ratio, alias_ratio)
 
@@ -10779,6 +10926,14 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
     # unbounded (the CLI/default behavior); only the HTTP API sets a concrete
     # budget via ``API_SEARCH_TOTAL_BUDGET``.
     overall = Deadline(getattr(args, "search_total_budget", None))
+    # Canonicalise known shorthands / misspellings and prepend an omitted house
+    # before any provider call, so the discovery leg and the ranker both see the
+    # anchored form (e.g. "layton de" -> "Parfums de Marly Layton", "monet
+    # blanco" -> "Montblanc"). A query the table does not recognise is unchanged.
+    expanded = IdentityTools.expand_query_aliases(query)
+    if expanded != query:
+        print(f"{Y}[SYS] Search expanded: {query!r} -> {expanded!r}{Z}")
+        query = expanded
     candidates, bn_results, _ = _search_core(scraper, query, args, allow_repair=True, timing=timing)
     if QueryRepair.needs_repair(bn_results, candidates):
         # "Resolve faster, not looser." The structured Decodo brand-URL discovery

@@ -1962,6 +1962,152 @@ def test_zero_candidates_with_raw_bn_rows_still_repairs() -> None:
     )
 
 
+def _norm(value: str) -> str:
+    return engine.TextSanitizer.normalize_identity(value)
+
+
+def test_query_expander_rewrites_known_shorthands_and_typos() -> None:
+    # Regression for the search task list items 1 & 4: bare shorthands and common
+    # misspellings of famous houses/flankers returned "No Olfactory Matches" because
+    # nothing anchored them to a real designer. expand_query_aliases canonicalises
+    # them before any provider call so discovery + ranking both see the right house.
+    print("Query expander shorthand/typo checks:")
+    expand = engine.IdentityTools.expand_query_aliases
+    cases = {
+        "monet blanco": "montblanc",
+        "mont blanco": "montblanc",
+        "ysev saint laurent": "yves saint laurent",
+        "baccarat": "maison francis kurkdjian baccarat rouge 540",
+        "layton": "parfums de marly layton",
+        # trailing connector noise must be trimmed before the shorthand match
+        "layton de": "parfums de marly layton",
+    }
+    for query, expected in cases.items():
+        got = _norm(expand(query))
+        check(f"{query!r} expands to {expected!r}", got == expected, got)
+
+    # An unrecognised query must pass through byte-for-byte (no surprise rewrites).
+    for untouched in ("dior sauvage", "creed aventus", "tom ford oud wood"):
+        check(f"{untouched!r} is left unchanged", expand(untouched) == untouched, expand(untouched))
+
+
+def test_query_expander_prepends_omitted_house_for_known_lines() -> None:
+    # Items 1 & 4: a known product LINE typed without its house ("le male ...",
+    # bare "bottled night") must be anchored to the parent designer, while a query
+    # that already names the house is left alone (no double-prepend).
+    print("Query expander line-house hint checks:")
+    expand = engine.IdentityTools.expand_query_aliases
+
+    long_jpg = expand("Le Male Elixir Absolu Parfum Intense")
+    check(
+        "long Le Male query gains the JPG house and keeps its tail",
+        _norm(long_jpg).startswith("jean paul gaultier") and "elixir" in _norm(long_jpg),
+        long_jpg,
+    )
+
+    bare_line = expand("le male")
+    check("bare 'le male' gains the JPG house", _norm(bare_line) == "jean paul gaultier le male", bare_line)
+
+    night = expand("bottled night")
+    check("bare 'bottled night' gains the Hugo Boss house", _norm(night) == "hugo boss bottled night", night)
+
+    # House already present -> no change (boss is an alias of Hugo Boss).
+    check("'boss bottled night' is not re-prepended", expand("boss bottled night") == "boss bottled night", expand("boss bottled night"))
+    check(
+        "'Parfums de Marly Layton' is not re-prepended",
+        expand("Parfums de Marly Layton") == "Parfums de Marly Layton",
+        expand("Parfums de Marly Layton"),
+    )
+
+
+def test_filler_words_do_not_overpower_distinctive_anchor() -> None:
+    # Task item 2: "layton de" surfaced Caron "Nuit De Noel", YSL "La Nuit De
+    # L'Homme"/"... Bleu Electrique" and Armaf "Club De Nuit ... Man" because the
+    # ranker rewarded the filler word "de" (and coincidental whole-string
+    # similarity) instead of the missing anchor "layton". A query that carries a
+    # distinctive token the candidate does not cover must fall below the floor.
+    print("Filler-word ranking guard checks:")
+    score = engine.IdentityTools.relevance_score
+    floor = engine.QueryRepair.MIN_RESULT_SCORE
+    junk = [
+        candidate("Caron", "Nuit De Noel"),
+        candidate("Yves Saint Laurent", "La Nuit De L'homme Eau De Toilette"),
+        candidate("Yves Saint Laurent", "La Nuit De L Homme Bleu Electrique"),
+        candidate("Armaf", "Club De Nuit Intense Man Limited Edition Parfum"),
+    ]
+    for row in junk:
+        s = score("layton de", row)
+        check(f"'layton de' does not match {row.brand} {row.name!r}", s < floor, f"{s:.3f}")
+
+    # The real target, once present, must still rank strongly.
+    layton = candidate("Parfums de Marly", "Layton")
+    check("'layton de' still matches Parfums de Marly Layton", score("layton de", layton) >= floor, f"{score('layton de', layton):.3f}")
+
+    # End-to-end through the filter: only the real house survives.
+    survivors = [item.name for item in engine.filter_relevant_candidates("layton de", junk + [layton])]
+    check("filter keeps only the Layton row for 'layton de'", survivors == ["Layton"], str(survivors))
+
+    # The guard must NOT harm legitimate queries whose anchor IS covered.
+    check(
+        "'dior sauvage' still scores strongly",
+        score("dior sauvage", candidate("Dior", "Sauvage")) >= 0.9,
+        f"{score('dior sauvage', candidate('Dior', 'Sauvage')):.3f}",
+    )
+    check(
+        "typo'd 'ysev saint laurent' still matches YSL via saint+laurent",
+        score("ysev saint laurent", candidate("Yves Saint Laurent", "Libre")) >= floor,
+        f"{score('ysev saint laurent', candidate('Yves Saint Laurent', 'Libre')):.3f}",
+    )
+
+
+def test_new_brand_aliases_are_brand_only_and_keep_house() -> None:
+    # Task item 3: "le labo", "jo malone", "boss", "montblanc", "parfums de marly"
+    # must register as whole-house (brand-only) searches that return the catalogue,
+    # not a failed single-fragrance identification.
+    print("New brand-alias brand-only checks:")
+    brand_only = engine.IdentityTools.query_is_brand_only
+    cases = [
+        ("le labo", "Le Labo"),
+        ("jo malone", "Jo Malone London"),
+        ("boss", "Hugo Boss"),
+        ("montblanc", "Montblanc"),
+        ("pdm", "Parfums de Marly"),
+        ("parfums de marly", "Parfums de Marly"),
+    ]
+    for query, brand in cases:
+        check(f"{query!r} is brand-only for {brand!r}", brand_only(query, brand), "")
+        check(
+            f"{query!r} scores {brand!r} as a full house match",
+            engine.IdentityTools.relevance_score(query, candidate(brand, "Some Fragrance")) >= 0.99,
+            f"{engine.IdentityTools.relevance_score(query, candidate(brand, 'Some Fragrance')):.3f}",
+        )
+
+    # canonical_brand_query must resolve the aliases so the catalog crawl is seeded.
+    check("'pdm' resolves to the Parfums de Marly house", _norm(engine.IdentityTools.canonical_brand_query("pdm")) == "parfums de marly", engine.IdentityTools.canonical_brand_query("pdm"))
+    check("'boss' resolves to the Hugo Boss house", _norm(engine.IdentityTools.canonical_brand_query("boss")) == "hugo boss", engine.IdentityTools.canonical_brand_query("boss"))
+
+
+def test_jo_malone_brand_query_keeps_both_house_spellings() -> None:
+    # Task item 7 (backend half): "JO MALONE" and "JO MALONE LONDON" are the same
+    # house, so a "jo malone" brand search must keep both spellings' rows (the SPA
+    # can then merge the chips) and must not leak unrelated houses.
+    print("Jo Malone house-spelling checks:")
+    rows = [
+        candidate("Jo Malone", "Lime Basil & Mandarin"),
+        candidate("Jo Malone London", "Wood Sage & Sea Salt"),
+        candidate("Dior", "Sauvage"),
+    ]
+    filtered = engine.filter_relevant_candidates("jo malone", rows)
+    houses = {item.brand for item in filtered}
+    check("both Jo Malone spellings survive", {"Jo Malone", "Jo Malone London"} <= houses, str(houses))
+    check("unrelated house is dropped", "Dior" not in houses, str(houses))
+    check(
+        "both spellings are recognised as the same house",
+        engine.IdentityTools.compatible_brand("Jo Malone", "Jo Malone London"),
+        "",
+    )
+
+
 def main() -> int:
     test_live_candidate_filter()
     test_sub_brand_catalog_keys_for_casamorati()
@@ -2009,6 +2155,11 @@ def main() -> int:
     test_strip_house_from_name()
     test_q_relevance_is_word_based()
     test_brand_alias_query_keeps_house_catalog()
+    test_query_expander_rewrites_known_shorthands_and_typos()
+    test_query_expander_prepends_omitted_house_for_known_lines()
+    test_filler_words_do_not_overpower_distinctive_anchor()
+    test_new_brand_aliases_are_brand_only_and_keep_house()
+    test_jo_malone_brand_query_keeps_both_house_spellings()
     test_dolce_gabbana_identity_recovery_and_persistence()
     test_house_echo_poison_is_suppressed()
     test_brand_only_query_gets_catalog_labels()
