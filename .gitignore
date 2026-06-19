@@ -6,7 +6,10 @@ __pycache__/
 venv/
 
 # Editor / OS
-.claude/
+# Ignore everything in .claude EXCEPT the committed, team-shared settings.json
+# (settings.local.json and all other .claude contents stay local/ignored).
+/.claude/*
+!/.claude/settings.json
 .cursor/
 desktop.ini
 

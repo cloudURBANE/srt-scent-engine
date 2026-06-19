@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest *)",
+      "Bash(python -m py_compile *)",
+      "Bash(python -m unittest *)",
+      "Bash(python -m json.tool*)",
+      "Bash(python -m uvicorn *)",
+      "Bash(python test_*.py*)",
+      "Bash(curl * srt-scent-engine-production.up.railway.app*)",
+      "Bash(curl * 127.0.0.1*)",
+      "Bash(curl * localhost*)",
+      "Bash(git blame *)"
+    ]
+  }
+}
