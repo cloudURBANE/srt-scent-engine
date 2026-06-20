@@ -1,0 +1,15 @@
+# Development / test-only dependencies.
+#
+# The runtime image installs `requirements.txt` only; pytest must NOT leak into
+# the production deploy. Install this file in a dev/CI checkout to run the suite:
+#
+#     pip install -r requirements-dev.txt
+#     python run_tests.py            # full offline suite (no DATABASE_URL)
+#
+# `run_tests.py` drives pytest-style files (those without an `if __name__ ==
+# "__main__"` block, e.g. test_year_resolver.py / test_concentration_backfill.py)
+# via `python -m pytest`, so pytest is required for the suite to run -- without
+# it those files error instead of executing. Pinned to the verified-green
+# version so a fresh clone reproduces the same result.
+-r requirements.txt
+pytest==9.0.3
