@@ -21,9 +21,12 @@ _SAVED_ENV_KEYS = (
 
 
 class _FakeDecodoResponse:
-    def __init__(self, payload: dict, status_code: int = 200) -> None:
+    def __init__(
+        self, payload: dict, status_code: int = 200, headers: dict | None = None
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
         self.text = ""
 
     def raise_for_status(self) -> None:
@@ -465,6 +468,129 @@ def test_decodo_designer_and_brand_discovery() -> None:
     )
 
 
+def test_parse_retry_after_seconds_and_http_date() -> None:
+    print("Decodo Retry-After parsing checks:")
+    parse = engine.DecodoScraperClient._parse_retry_after
+    check("integer delta-seconds parses", parse("5") == 5.0, str(parse("5")))
+    check("negative delta-seconds clamps to 0", parse("-3") == 0.0, str(parse("-3")))
+    check("blank header returns None", parse("") is None, str(parse("")))
+    check("garbage header returns None", parse("soon") is None, str(parse("soon")))
+    # A far-future HTTP-date yields a positive wait; a past date clamps to 0.
+    future = parse("Wed, 21 Oct 2099 07:28:00 GMT")
+    past = parse("Wed, 21 Oct 1999 07:28:00 GMT")
+    check("future HTTP-date yields positive wait", future is not None and future > 0, str(future))
+    check("past HTTP-date clamps to 0", past == 0.0, str(past))
+
+
+def test_decodo_429_retries_then_succeeds() -> None:
+    print("Decodo 429 retry-then-succeed checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    old_sleep = engine.time.sleep
+    calls: list[int] = []
+    slept: list[float] = []
+    try:
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        responses = [
+            _FakeDecodoResponse({}, status_code=429, headers={"Retry-After": "1"}),
+            _FakeDecodoResponse(_DECODO_SEARCH_PAYLOAD),
+        ]
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            del url, json, headers, timeout, kwargs
+            calls.append(1)
+            return responses[len(calls) - 1]
+
+        engine.requests.post = fake_post
+        engine.time.sleep = lambda s: slept.append(s)
+        # Ample budget so the single retry fits before the deadline.
+        out = engine.DecodoScraperClient._post_google("xerjoff naxos", 15.0)
+    finally:
+        engine.requests.post = old_post
+        engine.time.sleep = old_sleep
+        _restore_env(saved)
+
+    check("429 then 200 makes exactly two POSTs", len(calls) == 2, str(len(calls)))
+    check("retry slept once", len(slept) == 1, str(slept))
+    check("Retry-After header drives the wait (1s)", slept and slept[0] == 1.0, str(slept))
+    check("successful retry returns the parsed payload", out == _DECODO_SEARCH_PAYLOAD, str(out))
+
+
+def test_decodo_429_exhausts_and_surfaces_bounded() -> None:
+    print("Decodo 429 exhaustion checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    old_sleep = engine.time.sleep
+    calls: list[int] = []
+    try:
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            del url, json, headers, timeout, kwargs
+            calls.append(1)
+            return _FakeDecodoResponse({}, status_code=429, headers={"Retry-After": "0"})
+
+        engine.requests.post = fake_post
+        engine.time.sleep = lambda s: None
+        raised = False
+        try:
+            engine.DecodoScraperClient._post_google("xerjoff naxos", 15.0)
+        except engine.requests.HTTPError:
+            raised = True
+    finally:
+        engine.requests.post = old_post
+        engine.time.sleep = old_sleep
+        _restore_env(saved)
+
+    check("a sustained 429 ultimately raises (no silent collapse)", raised, "")
+    check(
+        "billed POSTs are bounded to MAX_ATTEMPTS + 1 (no request storm)",
+        len(calls) == engine.DecodoScraperClient.RETRY_429_MAX_ATTEMPTS + 1,
+        str(len(calls)),
+    )
+
+
+def test_decodo_429_does_not_overshoot_deadline() -> None:
+    print("Decodo 429 deadline-safety checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    old_sleep = engine.time.sleep
+    calls: list[int] = []
+    slept: list[float] = []
+    try:
+        _clear_decodo_env()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+            del url, json, headers, timeout, kwargs
+            calls.append(1)
+            # Retry-After far larger than the tiny remaining budget.
+            return _FakeDecodoResponse({}, status_code=429, headers={"Retry-After": "30"})
+
+        engine.requests.post = fake_post
+        engine.time.sleep = lambda s: slept.append(s)
+        raised = False
+        try:
+            # Budget too small to wait 30s and still finish a retry -> no sleep.
+            engine.DecodoScraperClient._post_google("xerjoff naxos", 0.5)
+        except engine.requests.HTTPError:
+            raised = True
+    finally:
+        engine.requests.post = old_post
+        engine.time.sleep = old_sleep
+        _restore_env(saved)
+
+    check("an unaffordable backoff surfaces immediately", raised, "")
+    check("no POST is retried when the wait can't fit the budget", len(calls) == 1, str(len(calls)))
+    check("the engine never sleeps past the deadline", slept == [], str(slept))
+
+
 def main() -> int:
     test_decodo_scraper_search_payload_and_parsing()
     test_decodo_envelope_wrapper_does_not_starve_url_discovery()
@@ -473,6 +599,10 @@ def main() -> int:
     test_decodo_auth_token_alias_and_casing()
     test_structured_search_provider_selection()
     test_decodo_designer_and_brand_discovery()
+    test_parse_retry_after_seconds_and_http_date()
+    test_decodo_429_retries_then_succeeds()
+    test_decodo_429_exhausts_and_surfaces_bounded()
+    test_decodo_429_does_not_overshoot_deadline()
     print()
     print("All Decodo scraper API checks passed.")
     return 0

@@ -15,7 +15,9 @@ import tempfile
 import threading
 import time
 import unicodedata
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3633,6 +3635,19 @@ class DecodoScraperClient:
     # the connect/read split above, this is the second half of the cold-query
     # overshoot fix (see `_viable_budget` / `_request_timeout`).
     DEADLINE_SAFETY = 0.4
+    # 429 (rate-limit) resilience for `_post_request`. A bare `raise_for_status()`
+    # on a 429 silently collapses the call to [] -> the cold-search/concentration
+    # leg degrades to Basenotes-only with no signal. Retry a *bounded* number of
+    # times so a transient throttle clears, honoring `Retry-After` when the server
+    # sends it and otherwise backing off exponentially with jitter. Every wait is
+    # capped by `RETRY_429_MAX_BACKOFF` (a hostile header can't stall the worker)
+    # and by the per-call budget (the backoff can never overshoot the search
+    # deadline). `MAX_ATTEMPTS` is the retry count *after* the first try, so the
+    # total billed POSTs per logical call is at most MAX_ATTEMPTS + 1 -- this is
+    # what keeps a sustained 429 from becoming a request storm.
+    RETRY_429_MAX_ATTEMPTS = 2
+    RETRY_429_BASE_BACKOFF = 0.5
+    RETRY_429_MAX_BACKOFF = 8.0
     # Secondary SERP + AI-Overview discovery are OFF by default and gated behind
     # these env flags. They exist to recover rows for cold, never-seen niche
     # brand-only houses where Google organic parsing returns zero Fragrantica
@@ -3840,25 +3855,95 @@ class DecodoScraperClient:
             "locale": cls._locale(),
         }
 
+    @staticmethod
+    def _parse_retry_after(value: str) -> float | None:
+        """Parse an HTTP ``Retry-After`` value into seconds-to-wait.
+
+        Per RFC 7231 the header is either a non-negative delta-seconds integer
+        or an HTTP-date. Returns the wait in seconds (clamped at >= 0), or
+        ``None`` when the header is absent or unparseable (caller falls back to
+        exponential backoff)."""
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            return max(float(value), 0.0)
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+
+    @classmethod
+    def _retry_after_seconds(cls, res: Any, attempt: int) -> float:
+        """Backoff before a 429 retry: honor a usable ``Retry-After`` header,
+        else exponential backoff with jitter. Always bounded by
+        ``RETRY_429_MAX_BACKOFF`` so one hostile header can't stall the call."""
+        try:
+            header = (getattr(res, "headers", None) or {}).get("Retry-After", "")
+        except Exception:
+            header = ""
+        retry_after = cls._parse_retry_after(str(header))
+        if retry_after is not None:
+            return min(retry_after, cls.RETRY_429_MAX_BACKOFF)
+        backoff = min(
+            cls.RETRY_429_BASE_BACKOFF * (2 ** (attempt - 1)),
+            cls.RETRY_429_MAX_BACKOFF,
+        )
+        return backoff + random.uniform(0.0, cls.RETRY_429_BASE_BACKOFF)
+
     @classmethod
     def _post_request(cls, payload: dict, timeout: float) -> dict:
         """Single Decodo POST with a connect/read split so a call started near
         the overall deadline cannot overshoot it (a lone `timeout` float is
-        applied to connect and read separately => up to ~2x the budget)."""
+        applied to connect and read separately => up to ~2x the budget).
+
+        A 429 (rate-limit) is retried with bounded `Retry-After`/backoff rather
+        than collapsing the leg to [] (which surfaces as Basenotes-only). The
+        retry sleeps only while there is enough of the per-call budget left to
+        also finish a follow-up request, so a backoff can never push the call
+        past the search deadline; once the budget or attempt cap is exhausted
+        the 429 is surfaced and the caller degrades gracefully (cache / other
+        legs still supply partial results)."""
         if not cls.enabled():
             raise RuntimeError("Decodo Scraper API is not enabled")
         if not _DecodoProxyBudget.reserve("serp"):
             # Daily kill-switch tripped: refuse the billed call. Callers already
             # degrade to [] on a RuntimeError, exactly as if the provider failed.
             raise RuntimeError("Decodo daily request cap reached")
-        res = requests.post(
-            cls.ENDPOINT,
-            json=payload,
-            headers=cls._headers(),
-            timeout=cls._request_timeout(timeout),
-        )
-        res.raise_for_status()
-        return res.json() or {}
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        attempt = 0
+        while True:
+            budget = deadline - time.monotonic()
+            res = requests.post(
+                cls.ENDPOINT,
+                json=payload,
+                headers=cls._headers(),
+                timeout=cls._request_timeout(budget),
+            )
+            status = int(getattr(res, "status_code", 200) or 200)
+            if status != 429:
+                res.raise_for_status()
+                return res.json() or {}
+            attempt += 1
+            wait = cls._retry_after_seconds(res, attempt)
+            remaining = deadline - time.monotonic()
+            if attempt > cls.RETRY_429_MAX_ATTEMPTS or wait + cls.MIN_VIABLE_BUDGET > remaining:
+                # Out of retries, or not enough runway to wait *and* still finish
+                # a follow-up request before the deadline -> surface the 429.
+                cls._log_request_failure(
+                    "SERP rate-limited (429)",
+                    requests.HTTPError(f"429 after {attempt - 1} retr(y/ies)"),
+                )
+                res.raise_for_status()
+                return res.json() or {}
+            time.sleep(wait)
 
     @classmethod
     def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
