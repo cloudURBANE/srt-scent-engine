@@ -17,6 +17,11 @@ FIELD_DEFAULTS = {
     "family": {"unknown family", "unknown"},
     "primary_family": {"unknown family", "unknown"},
     "season": {"universal"},
+    # "environment" is a default-display sentinel ONLY -- "Universal" is the
+    # placeholder the SPA shows when no occasion/setting is known. No source page
+    # supplies an environment fact, so it is intentionally NOT in FACT_FIELDS and
+    # is never projected; this entry exists solely so the placeholder is treated
+    # as incomplete by is_fact_complete and never fabricated into a "real" value.
     "environment": {"universal"},
 }
 
