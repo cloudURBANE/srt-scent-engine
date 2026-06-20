@@ -1463,7 +1463,11 @@ def lookup_fragrance_record(
         ctx.__exit__(None, None, None)
 
 
-def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]]:
+def search_fragrance_records(
+    query: str,
+    limit: int = 15,
+    house_forms: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Search aggregate identities. Empty when storage is absent/disabled.
 
     Selects only the light identity columns the search/candidate path actually
@@ -1472,6 +1476,14 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
     returns up to 50 rows and the caller discards those blobs, so fetching them
     is pure Supabase egress. Per-URL hydration uses lookup_fragrance_record,
     which still does SELECT * for the full record.
+
+    ``house_forms`` is an optional list of normalized brand-alias forms (e.g.
+    {"jean paul gaultier", "jpg", "gaultier"} for a brand-only query). When
+    supplied, rows whose ``house`` matches any alias are recalled in addition to
+    the plain ``%query%`` substring match -- so a house stored under an alias
+    ("JPG", "Gaultier") is no longer missed. Precision is preserved downstream:
+    the caller re-scores every returned row against the original query and drops
+    non-matches, so widening recall here is safe.
     """
     if not ENABLED:
         return []
@@ -1480,8 +1492,50 @@ def search_fragrance_records(query: str, limit: int = 15) -> list[dict[str, Any]
         return []
     limit = max(1, min(int(limit or 15), 50))
     mode, term = _identity_search_term(text)
+    # Brand-alias recall: only meaningful alias forms (>= 3 chars) become house
+    # patterns, so a 1-2 char alias fragment cannot broaden the match to noise.
+    house_patterns = [
+        f"%{form.strip()}%"
+        for form in (house_forms or [])
+        if form and len(form.strip()) >= 3
+    ]
     ctx, conn = _conn()
     try:
+        if mode == "ilike" and house_patterns:
+            rows = conn.execute(
+                f"""
+                SELECT {_FRAGRANCE_RECORD_SEARCH_COLUMNS}
+                FROM fragrance_records
+                WHERE name ILIKE %s
+                   OR house ILIKE %s
+                   OR concat_ws(' ', house, name) ILIKE %s
+                   OR concat_ws(' ', name, house) ILIKE %s
+                   OR house ILIKE ANY(%s)
+                ORDER BY
+                    CASE
+                        WHEN house ILIKE ANY(%s) THEN 0
+                        WHEN concat_ws(' ', house, name) ILIKE %s THEN 1
+                        WHEN name ILIKE %s THEN 2
+                        WHEN house ILIKE %s THEN 3
+                        ELSE 4
+                    END,
+                    last_seen_at DESC
+                LIMIT %s
+                """,
+                (
+                    term,
+                    term,
+                    term,
+                    term,
+                    house_patterns,
+                    house_patterns,
+                    term,
+                    term,
+                    term,
+                    limit,
+                ),
+            ).fetchall()
+            return [_fragrance_record_search_to_dict(row) for row in rows]
         if mode == "regex":
             rows = conn.execute(
                 f"""
