@@ -5959,6 +5959,33 @@ def _clean_note_display(text: str) -> str:
     return text
 
 
+# Some sources record a single note slot under two interchangeable common names
+# joined by a disjunction — "Pepperwood or Hercules Club", "Mastic or Lentisque",
+# "Benzoin / Tolu Balsam". The note tokenizer splits on commas/semicolons/pipes
+# but not on these, so the whole phrase leaks through as one dirty "note". Split
+# the disjunctive " or " and "/" so each name becomes its own clean token.
+#
+# Deliberately NOT split: " and " / "&", which routinely form genuine *single*
+# compound note names ("Pink & Black Pepper", "Saffron & Leather Accord",
+# "Turkish Rose Essence and Absolute") — splitting those would manufacture
+# garbage fragments. Limiting to " or " and "/" keeps this regression-free.
+_NOTE_DISJUNCTION_RE = re.compile(r"\s+or\s+|\s*/\s*", re.IGNORECASE)
+
+
+def _split_note_disjunction(note: str) -> list[str]:
+    """Expand a "X or Y" / "X / Y" note into its constituent names.
+
+    Returns the original token unchanged unless the split yields two or more
+    real (len > 1) fragments, so ordinary notes are never disturbed.
+    """
+    text = note if isinstance(note, str) else str(note)
+    if not _NOTE_DISJUNCTION_RE.search(text):
+        return [text]
+    parts = [p.strip() for p in _NOTE_DISJUNCTION_RE.split(text)]
+    parts = [p for p in parts if len(p) > 1]
+    return parts if len(parts) >= 2 else [text]
+
+
 def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     """De-duplicate olfactory notes within and across pyramid layers.
 
@@ -5979,7 +6006,10 @@ def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     The bare canonical form is displayed when present; otherwise the shortest
     variant wins. Returns one cleaned list per input layer, in order.
     """
-    materialised = [list(layer) for layer in layers]
+    materialised = [
+        [part for note in layer for part in _split_note_disjunction(note)]
+        for layer in layers
+    ]
 
     def base_identity(note: str) -> str:
         ident = TextSanitizer.normalize_identity(note)
