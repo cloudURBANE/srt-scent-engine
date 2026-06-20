@@ -1657,6 +1657,14 @@ def _details_to_dict(
     # label entered the filter, without a network recompute. See
     # enrichment_facts.sanitize_derived_metrics.
     sanitize_derived_metrics(getattr(details, "derived_metrics", None))
+    # Same backstop, for note tokens: a detail hydrated straight from a cache/DB
+    # row never passed through normalize_notes (the cache-serve path skips it), so
+    # dirty tokens persisted before the parser fix — "Pepperwood or Hercules Club"
+    # (un-split disjunction), "Agarwood (Oud)" (redundant synonym), "Pepperwood™"
+    # (trademark glyph) — would otherwise reach the SPA verbatim. This converges
+    # them losslessly without a network re-scrape. Fresh builds are already clean,
+    # so it is a no-op on the live path. See engine.sanitize_note_tokens.
+    engine.sanitize_note_tokens(details.notes)
     notes = details.notes
     concentration = getattr(details, "concentration", None)
     family_facts = derive_families(details)

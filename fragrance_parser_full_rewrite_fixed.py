@@ -388,7 +388,11 @@ class ResolverTrace:
         return int(max(0.0, remaining) * 1000)
 
 class TextSanitizer:
-    ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\uFEFF]")
+    # Zero-width joiners/spaces plus the variation selectors (U+FE00\u2013U+FE0F).
+    # The latter ride along after trademark glyphs in scraped names
+    # ("Ambrox\u00AE\uFE0FSuper") and survive \u00AE stripping as an invisible artifact;
+    # they only modify a preceding glyph's rendering, so dropping them is safe.
+    ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\uFEFF\uFE00-\uFE0F]")
     SPACE = re.compile(r"\s+")
     YEAR_RE = re.compile(r"\b(?:17|18|19|20)\d{2}\b")
     ELISION_PARTICLES = ("d", "l")
@@ -5959,6 +5963,68 @@ def _clean_note_display(text: str) -> str:
     return text
 
 
+# Some sources record a single note slot under two interchangeable common names
+# joined by a disjunction — "Pepperwood or Hercules Club", "Mastic or Lentisque",
+# "Benzoin / Tolu Balsam". The note tokenizer splits on commas/semicolons/pipes
+# but not on these, so the whole phrase leaks through as one dirty "note". Split
+# the disjunctive " or " and "/" so each name becomes its own clean token.
+#
+# Deliberately NOT split: " and " / "&", which routinely form genuine *single*
+# compound note names ("Pink & Black Pepper", "Saffron & Leather Accord",
+# "Turkish Rose Essence and Absolute") — splitting those would manufacture
+# garbage fragments. Limiting to " or " and "/" keeps this regression-free.
+_NOTE_DISJUNCTION_RE = re.compile(r"\s+or\s+|\s*/\s*", re.IGNORECASE)
+
+
+def _split_note_disjunction(note: str) -> list[str]:
+    """Expand a "X or Y" / "X / Y" note into its constituent names.
+
+    Returns the original token unchanged unless the split yields two or more
+    real (len > 1) fragments, so ordinary notes are never disturbed.
+    """
+    text = note if isinstance(note, str) else str(note)
+    if not _NOTE_DISJUNCTION_RE.search(text):
+        return [text]
+    parts = [p.strip() for p in _NOTE_DISJUNCTION_RE.split(text)]
+    parts = [p for p in parts if len(p) > 1]
+    return parts if len(parts) >= 2 else [text]
+
+
+# A parenthetical that merely restates the same note under a synonym —
+# "Agarwood (Oud)", "Olibanum (Frankincense)" — is redundant: drop it down to the
+# single canonical name. Strictly gated on the curated NOTE_SYNONYMS table: the
+# outer name and the parenthetical must resolve to the *same* canonical note, so
+# genuinely-clarifying parentheticals ("Cistus (Labdanum)", "Neroli (Orange
+# Blossom)", "Bergamot Essence (Calabrian)") — whose two sides are distinct
+# notes/provenance — are left exactly as they are.
+_NOTE_PAREN_RE = re.compile(r"^(.*?)\s*\(([^()]+)\)\s*$")
+
+
+def _collapse_synonym_paren(note: str) -> str:
+    text = note if isinstance(note, str) else str(note)
+    m = _NOTE_PAREN_RE.match(text.strip())
+    if not m:
+        return text
+    outer, inner = m.group(1).strip(), m.group(2).strip()
+    if not outer or not inner:
+        return text
+
+    def canon(value: str) -> str:
+        ident = TextSanitizer.normalize_identity(value)
+        return NOTE_SYNONYMS.get(ident, ident)
+
+    shared = canon(outer)
+    if not shared or shared != canon(inner):
+        return text  # two distinct notes — keep the clarifying parenthetical
+    # Redundant restatement: prefer whichever side is already spelled as the
+    # canonical note, else fall back to the parenthetical clarifier.
+    if TextSanitizer.normalize_identity(inner) == shared:
+        return inner
+    if TextSanitizer.normalize_identity(outer) == shared:
+        return outer
+    return inner
+
+
 def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     """De-duplicate olfactory notes within and across pyramid layers.
 
@@ -5979,7 +6045,14 @@ def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
     The bare canonical form is displayed when present; otherwise the shortest
     variant wins. Returns one cleaned list per input layer, in order.
     """
-    materialised = [list(layer) for layer in layers]
+    materialised = [
+        [
+            _collapse_synonym_paren(part)
+            for note in layer
+            for part in _split_note_disjunction(note)
+        ]
+        for layer in layers
+    ]
 
     def base_identity(note: str) -> str:
         ident = TextSanitizer.normalize_identity(note)
@@ -6046,6 +6119,43 @@ def dedupe_notes(*layers: Iterable[str]) -> list[list[str]]:
             cleaned.append(display[key])
         result.append(cleaned)
     return result
+
+def sanitize_note_tokens(notes: NotesList) -> bool:
+    """Repair individual dirty note tokens in place, losslessly.
+
+    A serve-time *backstop* for details hydrated straight from a cache/DB row
+    that never passed through ``normalize_notes`` (the cache-serve path skips it).
+    It applies only the per-token cleanups — disjunction split ("Pepperwood or
+    Hercules Club"), redundant-synonym parenthetical collapse ("Agarwood (Oud)"
+    -> "Oud"), and junk/invisible-glyph stripping ("Pepperwood™" -> "Pepperwood")
+    — plus intra-layer identity de-duplication.
+
+    Crucially it does NOT do the cross-layer dedup or qualifier/plural folding
+    that ``normalize_notes`` performs, so it converges stored data with a
+    minimal, predictable diff and never re-litigates existing note merges.
+    Idempotent: already-clean (e.g. freshly normalized) notes are unchanged.
+    Returns True if any layer was modified.
+    """
+    changed = False
+    for attr in ("top", "heart", "base", "flat"):
+        layer = getattr(notes, attr)
+        if not layer:
+            continue
+        out: list[str] = []
+        seen: set[str] = set()
+        for note in layer:
+            for part in _split_note_disjunction(note):
+                part = _clean_note_display(TextSanitizer.clean(_collapse_synonym_paren(part)))
+                key = TextSanitizer.normalize_identity(part)
+                if not part or not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(part)
+        if out != list(layer):
+            setattr(notes, attr, out)
+            changed = True
+    return changed
+
 
 def normalize_notes(notes: NotesList) -> NotesList:
     notes.top, notes.heart, notes.base = dedupe_notes(notes.top, notes.heart, notes.base)
