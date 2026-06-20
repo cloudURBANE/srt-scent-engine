@@ -29,11 +29,13 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
 import sys
-from collections import Counter
+import unicodedata
+from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,12 +44,14 @@ OWNER = "1c6184cb-0342-48d9-a99a-6cd7018c09ad"
 # ---------------------------------------------------------------------------
 # Canonical taxonomy (shared with the normalization in dirty_data.py)
 # ---------------------------------------------------------------------------
-from dirty_data import (  # noqa: E402  (local helper, see scripts/dirty_data.py)
-    VALID_CONCENTRATIONS,
-    VALID_GENDERS,
-    audit_row,
-    norm_family,
-)
+try:
+    from dirty_data import (  # type: ignore[import-not-found]
+        VALID_CONCENTRATIONS, VALID_GENDERS, audit_row, norm_family,
+    )
+except ImportError:  # imported as scripts.db_audit_export by tests/tooling
+    from scripts.dirty_data import (
+        VALID_CONCENTRATIONS, VALID_GENDERS, audit_row, norm_family,
+    )
 
 
 def _resolve_dsn() -> str:
@@ -66,10 +70,17 @@ def _resolve_dsn() -> str:
 def _connect(dsn):
     try:
         import psycopg2
-        return psycopg2.connect(dsn)
-    except Exception:
+    except ImportError:
         import psycopg
-        return psycopg.connect(dsn)
+        conn = psycopg.connect(dsn)
+        conn.read_only = True
+        conn.autocommit = True
+        return conn
+    conn = psycopg2.connect(dsn)
+    # Defense in depth: this tool must remain DB-read-only even if a future
+    # refactor accidentally adds a mutating statement.
+    conn.set_session(readonly=True, autocommit=True)
+    return conn
 
 
 def _load(cur, owner_only: bool):
@@ -141,6 +152,49 @@ def _flatten(source, rid, owner, blob):
     }
 
 
+def _identity_key(value):
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode().casefold()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _append_issue(row, issue):
+    flags = row["issues"].split("; ") if row["issues"] else []
+    if issue not in flags:
+        flags.append(issue)
+        row["issues"] = "; ".join(flags)
+        row["n_issues"] = len(flags)
+
+
+def _duplicate_scope(row):
+    if row["source"] == "user_fragrances":
+        return row["source"], row["owner"]
+    return row["source"], "global"
+
+
+def _annotate_cross_row_issues(rows):
+    """Report duplicates within the catalog or one owner's wardrobe only."""
+    identities = defaultdict(list)
+    source_urls = defaultdict(list)
+    for row in rows:
+        brand = _identity_key(row["brand"])
+        name = _identity_key(row["name"])
+        if brand and name:
+            identities[(*_duplicate_scope(row), brand, name)].append(row)
+        source_url = str(row["source_url"] or "").strip().casefold()
+        if source_url:
+            source_urls[(*_duplicate_scope(row), source_url)].append(row)
+
+    for group in identities.values():
+        if len(group) > 1:
+            for row in group:
+                _append_issue(row, "duplicate_identity")
+    for group in source_urls.values():
+        if len(group) > 1:
+            for row in group:
+                _append_issue(row, "duplicate_source_url")
+
+
 COLUMNS = [
     "source", "row_id", "owner", "brand", "name", "year", "concentration",
     "family", "gender", "n_accords", "accords", "performance_score",
@@ -150,6 +204,7 @@ COLUMNS = [
 
 
 def _write_csv(rows, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=COLUMNS)
         w.writeheader()
@@ -164,6 +219,7 @@ def _write_xlsx(rows, path):
         from openpyxl.utils import get_column_letter
     except Exception:
         return False
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     wb = Workbook()
     ws = wb.active
     ws.title = "fragrances"
@@ -198,13 +254,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--owner-only", action="store_true", help="only the owner's wardrobe rows")
     ap.add_argument("--out", default="db_export_fragrances", help="output basename")
+    ap.add_argument(
+        "--report",
+        help="audit JSON path (default: db_audit_report.json for the standard export, "
+        "otherwise <out>.audit.json)",
+    )
     args = ap.parse_args()
 
     dsn = _resolve_dsn()
     conn = _connect(dsn)
     cur = conn.cursor()
-    raw = _load(cur, args.owner_only)
-    rows = [_flatten(*r) for r in raw]
+    try:
+        raw = _load(cur, args.owner_only)
+        rows = [_flatten(*r) for r in raw]
+        _annotate_cross_row_issues(rows)
+    finally:
+        cur.close()
+        conn.close()
 
     csv_path = f"{args.out}.csv"
     xlsx_path = f"{args.out}.xlsx"
@@ -219,15 +285,32 @@ def main():
             tag = flag.split(":", 1)[0]
             issue_counts[tag] += 1
 
+    issue_rows = {
+        tag: sorted(
+            f"{r['source']}:{r['row_id']}"
+            for r in dirty
+            if any(flag.split(":", 1)[0] == tag for flag in r["issues"].split("; "))
+        )
+        for tag in issue_counts
+    }
+    snapshot_payload = json.dumps(issue_rows, sort_keys=True, separators=(",", ":"))
     report = {
         "generated_at": _dt.datetime.utcnow().isoformat() + "Z",
         "db_host": re.sub(r"//[^@]*@", "//***@", dsn).split("?")[0],
+        "snapshot_id": hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest()[:16],
         "total_rows": len(rows),
         "rows_with_issues": len(dirty),
         "issue_counts": dict(issue_counts.most_common()),
+        "issue_rows": issue_rows,
         "rows": rows,
     }
-    with open("db_audit_report.json", "w", encoding="utf-8") as fh:
+    report_path = args.report or (
+        "db_audit_report.json"
+        if args.out == "db_export_fragrances"
+        else f"{args.out}.audit.json"
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, default=str)
 
     print(f"DB: {report['db_host']}")
@@ -236,7 +319,7 @@ def main():
     print(f"rows with >=1 issue: {len(dirty)} / {len(rows)}")
     for tag, c in issue_counts.most_common():
         print(f"  {c:>4}  {tag}")
-    print("\nFull per-row flags + export -> db_audit_report.json")
+    print(f"\nFull per-row flags + export -> {report_path}")
     print("To repair: python scripts/sanitize_wardrobe_accords.py --commit")
 
 

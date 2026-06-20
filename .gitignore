@@ -34,3 +34,7 @@ c*tmp*
 # db_audit_export.py generated artifacts (regenerated on demand)
 db_export_fragrances.*
 db_audit_report.json
+audit_runs/
+baseline_*.csv
+baseline_*.xlsx
+baseline_*.audit.json
