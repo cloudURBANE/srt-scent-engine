@@ -263,6 +263,168 @@ def test_no_reserve_keeps_spell_repair_first():
         _restore(snap)
 
 
+def test_designer_reserve_after_holds_back_budget():
+    """`reserve_after` is subtracted from the early designer leg's deadline so a
+    later stage (spell repair) keeps its runway. With reserve_after=0 the budget
+    is unchanged (byte-for-byte the prior behavior)."""
+    snap = _snapshot()
+    try:
+        seen = {}
+
+        class FakeProvider:
+            def search_fragrantica_brand_urls(self, label, deadline=None, max_results=25):
+                # Record the budget this leg was actually handed, once.
+                seen.setdefault("brand_seconds", getattr(deadline, "seconds", None))
+                return []
+
+            def search_fragrantica_designer_urls(self, q, deadline=None, max_results=1):
+                seen.setdefault("designer_seconds", getattr(deadline, "seconds", None))
+                return []
+
+        fp.structured_search_provider = lambda: FakeProvider()
+        args = _build_args(total_budget=18.0)
+
+        # reserve_after=0 -> clamped only to remaining (~10s here).
+        seen.clear()
+        fp._designer_provider_fallback_results(
+            "thom browne", args, overall_deadline=fp.Deadline(10.0), reserve_after=0.0
+        )
+        unreserved = seen["brand_seconds"]
+        assert unreserved is not None and unreserved <= 10.0 + 0.05, unreserved
+
+        # reserve_after=5 -> the leg must be clamped to leave ~5s for spell repair.
+        seen.clear()
+        fp._designer_provider_fallback_results(
+            "thom browne", args, overall_deadline=fp.Deadline(10.0), reserve_after=5.0
+        )
+        reserved = seen["brand_seconds"]
+        assert reserved is not None and reserved <= 5.0 + 0.05, (
+            f"reserve_after=5 should cap the designer leg to ~5s of a 10s budget, got {reserved}"
+        )
+        assert reserved < unreserved, "reserve_after must reduce the designer leg's budget"
+        print(
+            f"PASS designer_reserve_after_holds_back_budget: "
+            f"unreserved={unreserved:.2f}s reserved={reserved:.2f}s"
+        )
+    finally:
+        _restore(snap)
+
+
+def test_designer_reserve_after_skips_when_no_runway():
+    """When the reserve exceeds the time left, the early designer leg yields
+    entirely (returns []) rather than running with a sub-reserve budget, so the
+    reserved spell-repair stage is guaranteed its slice."""
+    snap = _snapshot()
+    try:
+        class FakeProvider:
+            def search_fragrantica_brand_urls(self, label, deadline=None, max_results=25):
+                raise AssertionError("designer leg ran despite insufficient runway for the reserve")
+
+            def search_fragrantica_designer_urls(self, q, deadline=None, max_results=1):
+                raise AssertionError("designer leg ran despite insufficient runway for the reserve")
+
+        fp.structured_search_provider = lambda: FakeProvider()
+        args = _build_args(total_budget=18.0)
+        out = fp._designer_provider_fallback_results(
+            "thom browne", args, overall_deadline=fp.Deadline(3.0), reserve_after=5.0
+        )
+        assert out == [], f"expected [], got {out!r}"
+        print("PASS designer_reserve_after_skips_when_no_runway")
+    finally:
+        _restore(snap)
+
+
+def test_search_once_reserves_spell_repair_budget():
+    """End-to-end wiring: with both a designer-provider reserve and a
+    spell-repair reserve configured (the production HTTP setting), the early
+    designer leg is invoked with reserve_after == spell_repair_reserve, so a
+    typo whose designer leg resolves nothing still reaches spell repair. This is
+    the fix for "misspelled queries return nothing in prod"."""
+    snap = _snapshot()
+    saved_designer = fp._designer_provider_fallback_results
+    try:
+        args = _build_args(total_budget=18.0, spell=4.0, catalog=3.5)
+        args.designer_provider_reserve = 7.0
+        args.spell_repair_reserve = 5.0
+        order = []
+        captured = {}
+
+        fp._search_core = lambda scraper, q, a, allow_repair=True, timing=None: ([], [], [])
+        fp.QueryRepair.needs_repair = staticmethod(lambda bn, cands: True)
+        fp.IdentityTools.catalog_brand_keys = staticmethod(lambda *a, **k: [])
+        fp.IdentityTools.canonical_brand_query = staticmethod(lambda *a, **k: "")
+
+        def fake_designer(query, a, overall_deadline=None, reserve_after=0.0):
+            order.append("designer")
+            # Record the FIRST (early) designer call -- the one that must reserve
+            # spell-repair runway. search_once also runs a final designer pass
+            # (with no reserve, correctly) after spell repair / catalog miss.
+            captured.setdefault("reserve_after", reserve_after)
+            return []   # genuine typo: no brand resolved here
+        fp._designer_provider_fallback_results = fake_designer
+
+        def fake_suggest(scraper, query, seconds=0.0):
+            order.append("spell")
+            captured["spell_seconds"] = seconds
+            return None
+        fp.QueryRepair.suggest = staticmethod(fake_suggest)
+
+        fp.search_once(None, "blu de chanl", args)
+        assert order[:2] == ["designer", "spell"], (
+            f"designer leg should run first, then spell repair; got {order}"
+        )
+        assert abs(captured.get("reserve_after", 0.0) - 5.0) < 1e-9, (
+            f"early designer leg must reserve spell_repair_reserve seconds; got "
+            f"{captured.get('reserve_after')}"
+        )
+        assert captured.get("spell_seconds", 0.0) >= fp.QueryRepair.STRUCTURED_MIN_BUDGET, (
+            "spell repair must still receive enough budget to fire its structured "
+            f"leg; got {captured.get('spell_seconds')}s (need >= "
+            f"{fp.QueryRepair.STRUCTURED_MIN_BUDGET}s)"
+        )
+        print(
+            f"PASS search_once_reserves_spell_repair_budget: "
+            f"reserve_after={captured['reserve_after']:.2f}s "
+            f"spell_seconds={captured['spell_seconds']:.2f}s"
+        )
+    finally:
+        fp._designer_provider_fallback_results = saved_designer
+        _restore(snap)
+
+
+def test_zero_spell_reserve_unchanged():
+    """Guardrail: spell_repair_reserve=0 (CLI/script default) leaves the early
+    designer leg with the full remaining budget -- reserve_after passed as 0."""
+    snap = _snapshot()
+    saved_designer = fp._designer_provider_fallback_results
+    try:
+        args = _build_args(total_budget=18.0, spell=4.0)
+        args.designer_provider_reserve = 7.0
+        args.spell_repair_reserve = 0.0
+        captured = {}
+
+        fp._search_core = lambda scraper, q, a, allow_repair=True, timing=None: ([], [], [])
+        fp.QueryRepair.needs_repair = staticmethod(lambda bn, cands: True)
+        fp.IdentityTools.catalog_brand_keys = staticmethod(lambda *a, **k: [])
+        fp.IdentityTools.canonical_brand_query = staticmethod(lambda *a, **k: "")
+
+        def fake_designer(query, a, overall_deadline=None, reserve_after=0.0):
+            captured["reserve_after"] = reserve_after
+            return []
+        fp._designer_provider_fallback_results = fake_designer
+        fp.QueryRepair.suggest = staticmethod(lambda scraper, query, seconds=0.0: None)
+
+        fp.search_once(None, "blu de chanl", args)
+        assert captured.get("reserve_after") == 0.0, (
+            f"with spell_repair_reserve=0 the designer leg must get reserve_after=0; "
+            f"got {captured.get('reserve_after')}"
+        )
+        print("PASS zero_spell_reserve_unchanged")
+    finally:
+        fp._designer_provider_fallback_results = saved_designer
+        _restore(snap)
+
+
 if __name__ == "__main__":
     test_overall_budget_bounds_chain()
     test_catalog_crawl_is_clamped()
@@ -270,4 +432,8 @@ if __name__ == "__main__":
     test_unbounded_budget_does_not_clamp()
     test_structured_discovery_runs_before_spell_repair()
     test_no_reserve_keeps_spell_repair_first()
+    test_designer_reserve_after_holds_back_budget()
+    test_designer_reserve_after_skips_when_no_runway()
+    test_search_once_reserves_spell_repair_budget()
+    test_zero_spell_reserve_unchanged()
     print("\nALL TESTS PASSED")

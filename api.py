@@ -185,6 +185,18 @@ _ARGS.search_total_budget = _env_float("API_SEARCH_TOTAL_BUDGET", 18.0)
 # Addict", "Bortnikoff" within the SAME ceiling instead of raising it. 0 =>
 # disabled (original catalog-first order). Must stay < API_SEARCH_TOTAL_BUDGET.
 _ARGS.designer_provider_reserve = _env_float("API_DESIGNER_PROVIDER_RESERVE", 7.0)
+# Seconds held back from the EARLY structured designer/brand discovery so the
+# spell-repair pass that follows always has enough runway to fire its structured
+# (Decodo) leg. The early designer leg resolves nothing for a genuine typo, but
+# at the old behavior (0 reserve) it could still spend most of the remaining
+# budget on doomed brand-URL lookups, leaving spell repair below
+# STRUCTURED_MIN_BUDGET (~1.2s) -- so a misspelled query ("sovage", "blue de
+# chanel") came back empty in prod instead of self-correcting. Reserving ~5s
+# guarantees the repair leg fires while still leaving the designer leg ~7-8s
+# (it resolves real brands in ~2-4s). Set to 0 to instantly revert to the
+# prior ordering/behavior without a redeploy. Must stay < the budget left after
+# the first pass; keep well under API_SEARCH_TOTAL_BUDGET.
+_ARGS.spell_repair_reserve = _env_float("API_SPELL_REPAIR_RESERVE", 5.0)
 
 _LIVE_SEARCH_MAX_CONCURRENT = max(1, _env_int("API_LIVE_SEARCH_MAX_CONCURRENT", 6))
 _LIVE_SEARCH_QUEUE_TIMEOUT = max(
@@ -2799,6 +2811,7 @@ _SEARCH_TIMING_ARG_KEYS = (
     "spell_repair_budget",
     "search_total_budget",
     "designer_provider_reserve",
+    "spell_repair_reserve",
     "max_frag_results",
     "max_results",
 )

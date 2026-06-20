@@ -6651,6 +6651,36 @@ class IdentityCache:
                 except Exception:
                     pass
 
+_SHARED_IDENTITY_CACHES: dict[str, "IdentityCache"] = {}
+_SHARED_IDENTITY_CACHES_LOCK = threading.Lock()
+
+
+def _shared_identity_cache(path: "str | Path | None") -> "IdentityCache":
+    """Return a process-shared :class:`IdentityCache` for ``path``.
+
+    ``IdentityCache.__init__`` re-reads and re-parses the entire identity-cache
+    JSON from disk; ``_search_core`` builds one on every live search (and twice
+    for a spell-repaired query). Against a fat ``~/.cache`` that disk read
+    dominates the cold-search budget -- the same constructor the api.py loader
+    was memoized to avoid (commit 73f6cee). The cache is thread-safe (RLock) and
+    is the authoritative in-memory copy for this process (the only writer to the
+    file is this process, via ``save()``), so a single shared instance per
+    resolved path is correct, accumulates hits across requests, and never serves
+    staler rows than a per-call reload would. Sharing also removes the
+    file-replace race two concurrent searches' separate instances would have on
+    ``save()``. CLI runs are one process per query, so behavior there is
+    unchanged.
+    """
+    default_path = Path.home() / ".cache" / "fragrance_parser_fg_identity_cache_v2.json"
+    resolved = str(Path(path or default_path))
+    with _SHARED_IDENTITY_CACHES_LOCK:
+        inst = _SHARED_IDENTITY_CACHES.get(resolved)
+        if inst is None:
+            inst = IdentityCache(path)
+            _SHARED_IDENTITY_CACHES[resolved] = inst
+        return inst
+
+
 class SearchSniper:
     _designer_catalog_cache: dict[str, list[CatalogItem]] = {}
     # Thread-local diagnostic for the last catalog_candidates_for_brand call:
@@ -10795,7 +10825,9 @@ def print_results_table(results: list[UnifiedFragrance], search_time: float, deb
 def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[str, Any] | None = None) -> tuple[list[UnifiedFragrance], list[UnifiedFragrance], list[UnifiedFragrance]]:
     timer = StageTimer(enabled=args.debug_timing, sink=timing)
     trace = ResolverTrace(enabled=args.debug_timing)
-    cache = IdentityCache(args.fg_cache)
+    # Process-shared per path: the constructor re-parses the whole cache file
+    # from disk, and this runs on every live search. See _shared_identity_cache.
+    cache = _shared_identity_cache(args.fg_cache)
     # 1-C: BN and FG run under independent soft-deadlines instead of one shared
     # ceiling. BN keeps the full first-pass budget; FG/provider is capped tighter
     # -- it is the slower, lower-yield leg and its misses are backstopped by the
@@ -10963,7 +10995,8 @@ def _search_core(scraper, query: str, args, *, allow_repair: bool, timing: dict[
     return candidates, bn_results, frag_results
 
 def _designer_provider_fallback_results(
-    query: str, args, overall_deadline: "Deadline | None" = None
+    query: str, args, overall_deadline: "Deadline | None" = None,
+    reserve_after: float = 0.0,
 ) -> list[UnifiedFragrance]:
     """Use structured SERP evidence to turn brand/designer queries into rows.
 
@@ -10978,6 +11011,15 @@ def _designer_provider_fallback_results(
     in the cold-query fallback chain, so its own budget is clamped to whatever
     time is left -- otherwise its ~16.5s internal budget, stacked on the stages
     before it, pushes the request past the client/gateway timeout.
+
+    ``reserve_after`` (seconds) is held back from this stage's budget for a
+    *later* stage in the same request. When the early-designer leg runs BEFORE
+    spell repair (the production HTTP ordering), a genuine typo resolves no brand
+    here and otherwise drains the remaining budget, leaving the spell-repair pass
+    below ``STRUCTURED_MIN_BUDGET`` so the only leg that can correct the spelling
+    never fires -> a misspelled query returns nothing. Reserving this slice keeps
+    that runway. ``0.0`` (the default, and every CLI/script caller) is byte-for-
+    byte the prior behavior.
     """
     provider = structured_search_provider()
     if provider is None:
@@ -10999,7 +11041,15 @@ def _designer_provider_fallback_results(
         if remaining is not None:
             if remaining <= 0:
                 return []
-            budget = min(budget, remaining)
+            # Hold back `reserve_after` for a later stage (spell repair) so this
+            # leg cannot consume the whole remaining budget. reserve_after=0
+            # (default) leaves `min(budget, remaining)` byte-for-byte unchanged.
+            usable = remaining - max(0.0, reserve_after)
+            if usable <= 0:
+                # Not enough runway to both run this leg AND preserve the
+                # reserve; yield entirely to the reserved stage.
+                return []
+            budget = min(budget, usable)
     deadline = Deadline(budget)
     labels: list[str] = []
     seen_labels: set[str] = set()
@@ -11145,9 +11195,21 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
         # original spell-repair-first ordering byte-for-byte.
         reserve = getattr(args, "designer_provider_reserve", None) or 0.0
         if reserve > 0 and not overall.expired():
-            early_designer = _designer_provider_fallback_results(
-                query, args, overall_deadline=overall
-            )
+            # Hold back a slice for the spell-repair pass below so the early
+            # designer leg -- which returns nothing for a genuine typo -- cannot
+            # drain the budget and starve the only leg that can actually correct
+            # a misspelling. Only meaningful when spell repair is itself enabled;
+            # defaults to 0.0 (no reserve), preserving the prior behavior for
+            # CLI/script callers byte-for-byte. See `spell_repair_reserve`.
+            spell_reserve = max(0.0, getattr(args, "spell_repair_reserve", 0.0) or 0.0)
+            if not (args.spell_repair_budget > 0):
+                spell_reserve = 0.0
+            # Pass reserve_after only when a reserve is configured, so the call is
+            # byte-for-byte the prior one for CLI/script/default callers.
+            designer_kwargs = {"overall_deadline": overall}
+            if spell_reserve > 0:
+                designer_kwargs["reserve_after"] = spell_reserve
+            early_designer = _designer_provider_fallback_results(query, args, **designer_kwargs)
             if early_designer:
                 return early_designer
         if args.spell_repair_budget > 0 and not overall.expired():
@@ -11406,6 +11468,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spell-repair-budget", type=float, default=1.6, help="Google/Bing spelling repair budget, only used after a clearly bad first pass. Use 0 to disable.")
     parser.add_argument("--search-total-budget", type=float, default=None, help="Overall wall-clock ceiling (seconds) for the entire live search, including the cold-query spell-repair/catalog/designer fallback chain. None => unbounded. The HTTP API sets a concrete value so a bare designer/brand query cannot stack per-stage budgets past the client timeout.")
     parser.add_argument("--designer-provider-reserve", type=float, default=None, help="Seconds of the overall budget reserved for the reliable structured designer/brand discovery so a slow catalog crawl cannot starve it. When set (>0), that leg runs FIRST for cold brand queries and the catalog crawl is capped to leave this slice. None/0 => original catalog-first ordering (CLI/script default, unchanged).")
+    parser.add_argument("--spell-repair-reserve", type=float, default=0.0, help="Seconds of the overall budget held back from the EARLY structured designer/brand discovery so the spell-repair pass that follows always has enough runway to fire its structured (Decodo) leg. A genuine typo returns nothing from the designer leg, so without this it could drain the budget and leave spell repair below STRUCTURED_MIN_BUDGET -> a misspelled query returns nothing. 0 => current behavior, unchanged (the early designer leg keeps the whole remaining budget).")
     parser.add_argument("--fg-cache", default=str(Path.home() / ".cache" / "fragrance_parser_fg_identity_cache_v2.json"))
     parser.add_argument("--debug", action="store_true", help="Print resolver diagnostics/timing trace. Alias for --debug-timing.")
     parser.add_argument("--debug-timing", action="store_true", help="Print timing checkpoints for each resolver stage.")
