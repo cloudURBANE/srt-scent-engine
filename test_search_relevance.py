@@ -340,7 +340,7 @@ def test_cache_search_rejects_same_house_sibling() -> None:
     print("API cache sibling relevance checks:")
     old_record_search = api.db.search_fragrance_records
     try:
-        api.db.search_fragrance_records = lambda query, limit=15: [
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: [
             {
                 "name": "Wild Vétiver",
                 "house": "Creed",
@@ -370,7 +370,7 @@ def test_aggregate_cache_search_does_not_expose_unproven_image() -> None:
     print("API aggregate image provenance checks:")
     old_record_search = api.db.search_fragrance_records
     try:
-        api.db.search_fragrance_records = lambda query, limit=15: [
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: [
             {
                 "name": "Bayrhum Vetiver",
                 "house": "Creed",
@@ -442,7 +442,7 @@ def test_api_cache_fallback_uses_long_anchor_variants() -> None:
         api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
         api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
 
-        def fake_record_search(query, limit=15):
+        def fake_record_search(query, limit=15, house_forms=None):
             calls.append(query)
             if query.lower() != "montaig":
                 return []
@@ -494,7 +494,7 @@ def test_api_strong_cache_precheck_skips_live_identity_hit() -> None:
         api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
         api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
         api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
-        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
         api.db.search_detail_cache = lambda query, limit=15: []
 
         def fail_live_search(*args, **kwargs):
@@ -527,7 +527,7 @@ def test_api_strong_cache_precheck_does_not_bypass_brand_only() -> None:
     calls = {"live": 0}
     try:
         api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
-        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
         api.db.search_detail_cache = lambda query, limit=15: []
 
         def empty_live_search(*args, **kwargs):
@@ -556,7 +556,7 @@ def test_api_bn_only_cache_hit_does_not_skip_live_search() -> None:
     calls = {"live": 0}
     try:
         api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
-        api.db.search_fragrance_records = lambda query, limit=15: [
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: [
             {
                 "name": "1861 Naxos",
                 "house": "Xerjoff",
@@ -614,7 +614,7 @@ def test_api_identity_cache_rescues_bn_only_precheck() -> None:
         api._ARGS.fg_cache = str(Path(__file__).with_name("fg_cache") / "fg_identity_cache_v2.json")
         api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
         api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
-        api.db.search_fragrance_records = lambda query, limit=15: [
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: [
             {
                 "name": "1861 Naxos",
                 "house": "Xerjoff",
@@ -670,7 +670,7 @@ def test_api_live_search_saturation_uses_cache_fallback() -> None:
         api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False
         api._ALLOW_BUNDLED_FG_DETAIL_CACHE = False
 
-        def fake_record_search(query, limit=15):
+        def fake_record_search(query, limit=15, house_forms=None):
             calls["record"] += 1
             if calls["record"] <= 2:
                 return []
@@ -747,7 +747,7 @@ def test_api_fact_question_answers_from_stored_record() -> None:
             calls.update({"strong_query": query}) or ([item], "unit")
         )
         api.db.lookup_fragrance_record = lambda canonical_fg_url=None, bn_url=None: record
-        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
         api.db.recover_or_enqueue_job = lambda **kwargs: calls.update({"recovered": True}) or None
         api.engine.search_once = lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("live search should not run for strong fact-question hit")
@@ -799,7 +799,7 @@ def test_api_fact_question_recovers_missing_fact() -> None:
     try:
         api._strong_cache_search = lambda query, limit, min_score=api._STRONG_CACHE_MIN_SCORE: ([item], "unit")
         api.db.lookup_fragrance_record = lambda canonical_fg_url=None, bn_url=None: record
-        api.db.search_fragrance_records = lambda query, limit=15: []
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
 
         def recover(**kwargs):
             calls.update(kwargs)
@@ -1050,7 +1050,7 @@ def test_poisoned_db_records_are_filtered() -> None:
     print("Poisoned DB record filtering checks:")
     old_record_search = api.db.search_fragrance_records
     try:
-        api.db.search_fragrance_records = lambda query, limit=15: [
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: [
             {
                 "name": "and gabana Q",
                 "house": "Dolce",
@@ -1249,6 +1249,250 @@ def test_bundled_identity_cache_rescues_deploy_repros() -> None:
         "santal 33 falls back to shipped identity cache",
         santal_source == "identity" and any(row.brand == "Le Labo" and row.name == "Santal 33" for row in santal_rows),
         f"{santal_source} {[(row.brand, row.name) for row in santal_rows[:5]]}",
+    )
+
+
+class _FakeIdentityCache:
+    """Minimal stand-in for engine.IdentityCache: only ``.data`` is read."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.data = {f"k{i}": row for i, row in enumerate(rows)}
+
+
+def _jpg_cache_rows(count: int) -> list[dict]:
+    return [
+        {
+            "brand": "Jean Paul Gaultier",
+            "name": f"Le Male Variant {i}",
+            "year": "",
+            "url": f"https://www.fragrantica.com/perfume/Jean-Paul-Gaultier/Le-Male-{i}.html",
+        }
+        for i in range(count)
+    ]
+
+
+def test_brand_only_unions_bundled_catalogue_over_sparse_db() -> None:
+    """The JPG '2 results' bug: a sparse aggregate DB must not hide the catalogue.
+
+    Before the fix, the first non-empty source (a 1-row aggregate DB) won and the
+    bundled house catalogue was never consulted. Brand-only queries now union the
+    shipped catalogue on top of whatever the DB returned.
+    """
+    print("Brand-only catalogue union checks:")
+    old_load = api._load_identity_cache
+    old_record = api.db.search_fragrance_records
+    old_detail = api.db.search_detail_cache
+    old_allow = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._load_identity_cache = lambda: _FakeIdentityCache(_jpg_cache_rows(12))
+
+        def sparse_db(query, limit=15, house_forms=None):
+            return [
+                {
+                    "name": "Ultra Male",
+                    "house": "Jean Paul Gaultier",
+                    "year": 2015,
+                    "canonical_fg_url": "https://www.fragrantica.com/perfume/Jean-Paul-Gaultier/Ultra-Male-30772.html",
+                    "source_captured_at": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+
+        api.db.search_fragrance_records = sparse_db
+        api.db.search_detail_cache = lambda query, limit=15: []
+        rows, source = api._cache_search_fallback("jean paul gaultier", 15)
+    finally:
+        api._load_identity_cache = old_load
+        api.db.search_fragrance_records = old_record
+        api.db.search_detail_cache = old_detail
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow
+
+    names = {row.name for row in rows}
+    check(
+        "brand-only widens far past the sparse DB row count",
+        len(rows) >= 12,
+        f"{len(rows)} rows",
+    )
+    check(
+        "the original aggregate DB row is preserved",
+        "Ultra Male" in names,
+        str(sorted(names)[:5]),
+    )
+    check(
+        "source records the catalogue union",
+        source is not None and "identity" in source and "aggregate_db" in source,
+        str(source),
+    )
+    check(
+        "no cross-brand contamination",
+        all(row.brand == "Jean Paul Gaultier" for row in rows),
+        str({row.brand for row in rows}),
+    )
+
+
+def test_brand_only_serves_bundled_cache_even_when_disabled() -> None:
+    """RC3: with the bundled cache opt-in off (prod), brand-only still reads it."""
+    print("Brand-only prod-disabled bundled-cache checks:")
+    old_load = api._load_identity_cache
+    old_allow = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = False  # simulate prod (DATABASE_URL set)
+        api._load_identity_cache = lambda: _FakeIdentityCache(_jpg_cache_rows(6))
+        brand_rows = api._identity_cache_search("jean paul gaultier", 15)
+        alias_rows = api._identity_cache_search("jpg", 15)
+        junk_rows = api._identity_cache_search("zzzz nonexistent house", 15)
+    finally:
+        api._load_identity_cache = old_load
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow
+
+    check(
+        "brand-only query reads bundled cache despite opt-in off",
+        len(brand_rows) >= 6,
+        f"{len(brand_rows)} rows",
+    )
+    check(
+        "brand alias ('jpg') reads bundled cache despite opt-in off",
+        len(alias_rows) >= 6,
+        f"{len(alias_rows)} rows",
+    )
+    check(
+        "non-brand query stays gated off in prod",
+        junk_rows == [],
+        f"{len(junk_rows)} rows",
+    )
+
+
+def test_brand_alias_forms_drive_durable_recall() -> None:
+    """RC2: brand-only queries pass house-alias forms to the durable store."""
+    print("Brand-alias durable-recall wiring checks:")
+    captured: dict[str, object] = {}
+    old_record = api.db.search_fragrance_records
+    try:
+        def capture(query, limit=15, house_forms=None):
+            captured["query"] = query
+            captured["forms"] = house_forms
+            return []
+
+        api.db.search_fragrance_records = capture
+        api._fragrance_record_search("jpg", 15)
+    finally:
+        api.db.search_fragrance_records = old_record
+
+    forms = captured.get("forms") or []
+    check(
+        "brand-only query forwards alias forms to SQL",
+        "jpg" in forms and "jean paul gaultier" in forms,
+        str(forms),
+    )
+
+    captured.clear()
+    try:
+        api.db.search_fragrance_records = capture
+        api._fragrance_record_search("santal 33", 15)
+    finally:
+        api.db.search_fragrance_records = old_record
+    check(
+        "non-brand query forwards no alias forms (tight match preserved)",
+        captured.get("forms") is None,
+        str(captured.get("forms")),
+    )
+
+
+def test_brand_only_cap_applied_after_expansion() -> None:
+    """RC5: the cap is the brand-only ceiling and is applied AFTER expansion.
+
+    A 15-row default limit must not truncate a designer's catalogue; brand-only
+    fallbacks expand the candidate pool first, then cap at _BRAND_ONLY_MAX_RESULTS.
+    """
+    print("Brand-only result-cap checks:")
+    old_load = api._load_identity_cache
+    old_record = api.db.search_fragrance_records
+    old_detail = api.db.search_detail_cache
+    old_allow = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._load_identity_cache = lambda: _FakeIdentityCache(_jpg_cache_rows(40))
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
+        api.db.search_detail_cache = lambda query, limit=15: []
+        rows, _ = api._cache_search_fallback("jean paul gaultier", 15)
+    finally:
+        api._load_identity_cache = old_load
+        api.db.search_fragrance_records = old_record
+        api.db.search_detail_cache = old_detail
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow
+
+    check(
+        "brand-only result set is not truncated to the 15 default",
+        len(rows) > 15,
+        f"{len(rows)} rows",
+    )
+    check(
+        "brand-only result set respects the brand ceiling",
+        len(rows) <= api._BRAND_ONLY_MAX_RESULTS,
+        f"{len(rows)} rows vs cap {api._BRAND_ONLY_MAX_RESULTS}",
+    )
+
+
+def test_identity_cache_tolerates_dirty_rows() -> None:
+    """Dirty/partial cache rows must be skipped, never crash the response."""
+    print("Identity-cache dirty-row hardening checks:")
+    old_load = api._load_identity_cache
+    old_allow = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    dirty = [
+        "not-a-dict",
+        {"brand": "Jean Paul Gaultier"},  # no url, no name
+        {"name": "Le Male", "url": ""},  # empty url
+        {"brand": None, "name": None, "url": None},  # all None
+        {"brand": "Jean Paul Gaultier", "name": "Le Male", "url": "not-a-fragrantica-url"},
+        {
+            "brand": "Jean Paul Gaultier",
+            "name": "Le Male",
+            "year": "",
+            "url": "https://www.fragrantica.com/perfume/Jean-Paul-Gaultier/Le-Male-207.html",
+        },
+    ]
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._load_identity_cache = lambda: _FakeIdentityCache(dirty)
+        rows = api._identity_cache_search("jean paul gaultier", 15)
+    finally:
+        api._load_identity_cache = old_load
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow
+
+    check(
+        "exactly the one well-formed row survives the dirty sweep",
+        len(rows) == 1 and rows[0].name == "Le Male",
+        str([(r.brand, r.name) for r in rows]),
+    )
+
+
+def test_unseeded_house_is_honest_coverage_gap() -> None:
+    """A house with no stored rows returns empty -- a data gap, not a code bug.
+
+    Guards against 'fixing' an unseeded house (e.g. boss bottled night) by
+    fabricating rows: the path is correct, the durable store simply lacks data.
+    """
+    print("Unseeded-house honesty checks:")
+    old_load = api._load_identity_cache
+    old_record = api.db.search_fragrance_records
+    old_detail = api.db.search_detail_cache
+    old_allow = api._ALLOW_BUNDLED_FG_SEARCH_CACHE
+    try:
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = True
+        api._load_identity_cache = lambda: _FakeIdentityCache(_jpg_cache_rows(8))
+        api.db.search_fragrance_records = lambda query, limit=15, house_forms=None: []
+        api.db.search_detail_cache = lambda query, limit=15: []
+        rows, source = api._cache_search_fallback("boss bottled night", 15)
+    finally:
+        api._load_identity_cache = old_load
+        api.db.search_fragrance_records = old_record
+        api.db.search_detail_cache = old_detail
+        api._ALLOW_BUNDLED_FG_SEARCH_CACHE = old_allow
+
+    check(
+        "unseeded house yields no fabricated rows",
+        rows == [] and source is None,
+        f"{len(rows)} rows source={source}",
     )
 
 

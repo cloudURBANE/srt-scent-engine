@@ -43,6 +43,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -210,6 +211,11 @@ _HEAL_SWEEP_DEFAULT_MAX_REQUESTED = max(
 
 
 _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
+# A brand-only query ("jpg", "creed") wants the whole house, not one row. The
+# default per-query cap (_ARGS.max_results, 15) truncates a major designer to a
+# fraction of its line, so brand-only fallbacks are allowed a wider result set.
+# Clamped to the DB search ceiling (50) so this can only widen, never overflow.
+_BRAND_ONLY_MAX_RESULTS = max(1, min(_env_int("API_BRAND_ONLY_MAX_RESULTS", 50), 50))
 _DERIVED_METRICS_LOCK_GUARD = threading.Lock()
 _DERIVED_METRICS_LOCKS: dict[str, threading.Lock] = {}
 
@@ -877,12 +883,31 @@ def _fragrance_record_is_stale(record: dict[str, Any]) -> bool:
     )
 
 
+def _brand_alias_forms(query: str) -> list[str] | None:
+    """Normalized house-alias forms for a brand-only query, else None.
+
+    Used to widen the durable-store lookup so a house stored under an alias
+    (e.g. "JPG"/"Gaultier" for Jean Paul Gaultier) is recalled. Returns None
+    for non-brand queries so ordinary searches keep their tight substring match.
+    """
+    try:
+        canonical = engine.IdentityTools.canonical_brand_query(query)
+        if not canonical:
+            return None
+        forms = engine.IdentityTools.brand_forms(canonical)
+        return sorted(forms) if forms else None
+    except Exception:
+        return None
+
+
 def _fragrance_record_search(
     query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
 ) -> list[engine.UnifiedFragrance]:
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
-    for record in db.search_fragrance_records(query, limit=limit * 2):
+    for record in db.search_fragrance_records(
+        query, limit=limit * 2, house_forms=_brand_alias_forms(query)
+    ):
         if _fragrance_record_is_stale(record):
             continue
         item = _candidate_from_fragrance_record(record)
@@ -995,6 +1020,40 @@ def _json_cache_search(
     return candidates[:limit]
 
 
+def _query_resolves_known_brand(query: str) -> bool:
+    """True when the whole query normalizes to a known house/alias (brand-only).
+
+    Brand-only queries ("jpg", "jean paul gaultier", "xerjoff") want the full
+    house catalogue, so the shipped identity cache is served for them even in
+    production where the bundled cache is otherwise opt-in -- this is the read-
+    through tier that backfills house breadth while the durable store warms.
+    """
+    try:
+        return bool(engine.IdentityTools.canonical_brand_query(query))
+    except Exception:
+        return False
+
+
+def _load_identity_cache() -> "engine.IdentityCache":
+    """Load the FG identity cache, falling back to the repo-bundled file.
+
+    In production the engine's ``--fg-cache`` default points at a ``~/.cache``
+    path that may not exist; when it is missing we read the deploy-shipped
+    ``fg_cache/fg_identity_cache_v2.json`` next to this module so the brand-only
+    read-through tier is deterministic regardless of FG_CACHE_PATH.
+    """
+    configured = getattr(_ARGS, "fg_cache", "") or ""
+    try:
+        if configured and Path(configured).exists():
+            return engine.IdentityCache(configured)
+    except Exception:
+        pass
+    bundled = Path(__file__).resolve().parent / "fg_cache" / "fg_identity_cache_v2.json"
+    if bundled.exists():
+        return engine.IdentityCache(str(bundled))
+    return engine.IdentityCache(configured)
+
+
 def _identity_cache_search(
     query: str, limit: int, min_score: float = _CACHE_SEARCH_MIN_SCORE
 ) -> list[engine.UnifiedFragrance]:
@@ -1003,30 +1062,39 @@ def _identity_cache_search(
     This is used only when live providers return zero candidates. It does not
     alter resolver scoring or the normal search path; it simply exposes the same
     warmed identity cache that SearchSniper already uses after candidates exist.
+
+    The bundled cache is gated off in prod by default, but a brand-only query is
+    allowed through so the shipped house catalogue (e.g. the 28 Jean Paul
+    Gaultier rows) can widen a sparse durable store.
     """
-    if not _ALLOW_BUNDLED_FG_SEARCH_CACHE:
+    if not _ALLOW_BUNDLED_FG_SEARCH_CACHE and not _query_resolves_known_brand(query):
         return []
-    cache = engine.IdentityCache(getattr(_ARGS, "fg_cache", ""))
+    cache = _load_identity_cache()
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
     for row in cache.data.values():
-        if not isinstance(row, dict):
-            continue
-        fg_url = _canonical_fg_url(str(row.get("url") or ""))
-        if not fg_url or fg_url in seen:
-            continue
-        item = engine.UnifiedFragrance(
-            name=str(row.get("name") or "").strip(),
-            brand=str(row.get("brand") or "").strip(),
-            year=str(row.get("year") or "").strip(),
-            frag_url=fg_url,
-            resolver_source="fg_identity_cache",
-            resolver_score=0.98,
-        )
-        if not item.name or not item.brand:
-            continue
-        item.query_score = engine.IdentityTools.relevance_score(query, item)
-        if not engine.candidate_relevance_ok(query, item, min_score):
+        # Dirty/partial rows must never crash the search response: skip a bad
+        # row rather than let a malformed cache entry abort the whole sweep.
+        try:
+            if not isinstance(row, dict):
+                continue
+            fg_url = _canonical_fg_url(str(row.get("url") or ""))
+            if not fg_url or fg_url in seen:
+                continue
+            item = engine.UnifiedFragrance(
+                name=str(row.get("name") or "").strip(),
+                brand=str(row.get("brand") or "").strip(),
+                year=str(row.get("year") or "").strip(),
+                frag_url=fg_url,
+                resolver_source="fg_identity_cache",
+                resolver_score=0.98,
+            )
+            if not item.name or not item.brand:
+                continue
+            item.query_score = engine.IdentityTools.relevance_score(query, item)
+            if not engine.candidate_relevance_ok(query, item, min_score):
+                continue
+        except Exception:
             continue
         seen.add(fg_url)
         candidates.append(item)
@@ -1144,29 +1212,51 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
         )
         return candidates[:source_limit]
 
-    candidates = _source_search(_fragrance_record_search, limit)
+    # A brand-only query ("jean paul gaultier") wants the whole house, so it gets
+    # a wider working limit AND the shipped identity catalogue is unioned in --
+    # otherwise a sparse aggregate DB (e.g. 2 stored JPG rows) wins the
+    # first-non-empty-source race and the 14+ bundled house rows are never seen.
+    brand_only = _query_resolves_known_brand(query)
+    effective_limit = max(limit, _BRAND_ONLY_MAX_RESULTS) if brand_only else limit
+
+    candidates = _source_search(_fragrance_record_search, effective_limit)
     source: str | None = None
 
     if candidates:
         source = "aggregate_db"
     else:
-        candidates = _source_search(_db_detail_cache_search, limit)
+        candidates = _source_search(_db_detail_cache_search, effective_limit)
         if candidates:
             source = "db"
     if not candidates:
-        candidates = _source_search(_json_cache_search, limit)
+        candidates = _source_search(_json_cache_search, effective_limit)
         if candidates:
             source = "json"
     if not candidates:
-        candidates = _source_search(_identity_cache_search, limit)
+        candidates = _source_search(_identity_cache_search, effective_limit)
         if candidates:
             source = "identity"
+
+    if brand_only:
+        existing_keys = {
+            (item.frag_url or item.bn_url or item.cache_key) for item in candidates
+        }
+        catalogue_added = False
+        for extra in _source_search(_identity_cache_search, effective_limit):
+            key = extra.frag_url or extra.bn_url or extra.cache_key
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            candidates.append(extra)
+            catalogue_added = True
+        if catalogue_added:
+            source = f"{source}+identity" if source else "identity"
 
     candidates.sort(
         key=lambda item: (item.query_score, item.resolver_score, item.year),
         reverse=True,
     )
-    return candidates[:limit], source
+    return candidates[:effective_limit], source
 
 
 def _strong_cache_candidate_ok(
