@@ -1034,6 +1034,9 @@ def _query_resolves_known_brand(query: str) -> bool:
         return False
 
 
+_IDENTITY_CACHE_MEMO: tuple[Any, "engine.IdentityCache"] | None = None
+
+
 def _load_identity_cache() -> "engine.IdentityCache":
     """Load the FG identity cache, falling back to the repo-bundled file.
 
@@ -1041,17 +1044,49 @@ def _load_identity_cache() -> "engine.IdentityCache":
     path that may not exist; when it is missing we read the deploy-shipped
     ``fg_cache/fg_identity_cache_v2.json`` next to this module so the brand-only
     read-through tier is deterministic regardless of FG_CACHE_PATH.
+
+    The parsed cache is memoized per file version (path + mtime + size). The
+    ``IdentityCache`` constructor re-reads and re-parses the whole JSON file from
+    disk on every call, and a single brand-only query reaches this loader ~9x
+    (the strong-cache precheck plus one call per variant in the fallback sweep).
+    On prod's small bundled file that is cheap; against a fat local ~/.cache it
+    costs ~15s/scan. Keying on the file's stat means any writer that updates the
+    cache bumps the key and forces a fresh parse -- so stale rows are never
+    served. The returned instance is consumed read-only by the search path.
     """
+    global _IDENTITY_CACHE_MEMO
     configured = getattr(_ARGS, "fg_cache", "") or ""
+    target: Path | None = None
     try:
         if configured and Path(configured).exists():
-            return engine.IdentityCache(configured)
+            target = Path(configured)
     except Exception:
-        pass
-    bundled = Path(__file__).resolve().parent / "fg_cache" / "fg_identity_cache_v2.json"
-    if bundled.exists():
-        return engine.IdentityCache(str(bundled))
-    return engine.IdentityCache(configured)
+        target = None
+    if target is None:
+        bundled = Path(__file__).resolve().parent / "fg_cache" / "fg_identity_cache_v2.json"
+        if bundled.exists():
+            target = bundled
+    # No configured-or-bundled file: mirror IdentityCache's own ~/.cache default
+    # so the stat key and the parsed data refer to the same file.
+    path_str = str(target) if target is not None else (
+        configured
+        or os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "fragrance_parser_fg_identity_cache_v2.json",
+        )
+    )
+    try:
+        st = os.stat(path_str)
+        key: Any = (path_str, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (path_str, None, None)
+    memo = _IDENTITY_CACHE_MEMO
+    if memo is not None and memo[0] == key:
+        return memo[1]
+    cache = engine.IdentityCache(path_str)
+    _IDENTITY_CACHE_MEMO = (key, cache)
+    return cache
 
 
 def _identity_cache_search(
