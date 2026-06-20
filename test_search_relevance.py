@@ -2235,6 +2235,41 @@ def test_query_expander_rewrites_known_shorthands_and_typos() -> None:
         check(f"{untouched!r} is left unchanged", expand(untouched) == untouched, expand(untouched))
 
 
+def test_query_expander_repairs_transposed_brand_acronyms() -> None:
+    # Regression for the reported "JGP returns no results" miss: a one-letter
+    # transposition of a brand initialism ("jgp" for "jpg") never web-resolves on
+    # the Fragrantica-blocked runtime, so the Decodo spell-repair leg cannot
+    # recover it. expand_query_aliases must correct it offline to the canonical
+    # house so brand resolution + the catalogue fallback fire.
+    print("Query expander transposed-acronym checks:")
+    expand = engine.IdentityTools.expand_query_aliases
+    repaired = {
+        "jgp": "jean paul gaultier",        # the reported case
+        "JGP": "jean paul gaultier",        # case-insensitive
+        "jgp le male": "jean paul gaultier le male",  # acronym leads a longer query
+        "mkf": "maison francis kurkdjian",
+        "pmd": "parfums de marly",
+        "yls": "yves saint laurent",
+        "gd": "dolce and gabbana",
+    }
+    for query, expected in repaired.items():
+        got = _norm(expand(query))
+        check(f"{query!r} repairs to {expected!r}", got == expected, got)
+
+    # The expanded acronym must actually resolve to a brand downstream.
+    check(
+        "repaired 'jgp' resolves to the JPG house",
+        "jean paul gaultier" in engine.IdentityTools.brand_forms(expand("jgp")),
+        repr(engine.IdentityTools.brand_forms(expand("jgp"))),
+    )
+
+    # Valid acronyms and real query tokens must pass through byte-for-byte: an
+    # exact alias is handled by brand_forms, a substitution typo ("ysk") is not a
+    # swap, and a 4-letter real-ish shorthand ("diro") must never be corrupted.
+    for untouched in ("jpg", "dg", "mfk", "ysl", "ysk", "diro sauvage", "ford", "dior sauvage"):
+        check(f"{untouched!r} is left unchanged", expand(untouched) == untouched, expand(untouched))
+
+
 def test_query_expander_prepends_omitted_house_for_known_lines() -> None:
     # Items 1 & 4: a known product LINE typed without its house ("le male ...",
     # bare "bottled night") must be anchored to the parent designer, while a query
@@ -2400,6 +2435,7 @@ def main() -> int:
     test_q_relevance_is_word_based()
     test_brand_alias_query_keeps_house_catalog()
     test_query_expander_rewrites_known_shorthands_and_typos()
+    test_query_expander_repairs_transposed_brand_acronyms()
     test_query_expander_prepends_omitted_house_for_known_lines()
     test_filler_words_do_not_overpower_distinctive_anchor()
     test_new_brand_aliases_are_brand_only_and_keep_house()

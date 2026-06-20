@@ -876,6 +876,46 @@ class IdentityTools:
                 return True
         return False
 
+    # Lazily-built {transposable shorthand acronym -> canonical full brand},
+    # derived from BRAND_ALIASES so it stays in sync with the alias table.
+    _BRAND_ACRONYM_REPAIRS_CACHE: dict[str, str] | None = None
+    _BRAND_ALIAS_FORMS_CACHE: set[str] | None = None
+
+    @staticmethod
+    def _brand_acronym_repairs() -> tuple[dict[str, str], set[str]]:
+        """Map a short brand *shorthand* (e.g. "jpg", "ysl", "mfk") to its full
+        canonical brand, plus the set of every known alias form.
+
+        Only single-token *initialisms* of length 2-3 that differ from the full
+        brand name are eligible (the cases where a one-letter transposition like
+        "jgp" cannot be a real fragrance word). Four-plus-letter shorthands that
+        are real-ish words ("dior", "ford", "boss") are deliberately excluded so
+        a transposition can never collide with a genuine query token. Memoized;
+        tiny table.
+        """
+        if IdentityTools._BRAND_ACRONYM_REPAIRS_CACHE is not None:
+            return (
+                IdentityTools._BRAND_ACRONYM_REPAIRS_CACHE,
+                IdentityTools._BRAND_ALIAS_FORMS_CACHE or set(),
+            )
+        repairs: dict[str, str] = {}
+        known_forms: set[str] = set()
+        for canonical_key, forms in IdentityTools.BRAND_ALIASES.items():
+            all_forms = {
+                TextSanitizer.normalize_identity(item)
+                for item in ({canonical_key} | set(forms))
+            }
+            all_forms = {form for form in all_forms if form}
+            known_forms |= all_forms
+            # Full brand = the form with the most tokens (ties: the longest).
+            full = max(all_forms, key=lambda form: (len(form.split()), len(form)))
+            for form in all_forms:
+                if " " not in form and 2 <= len(form) <= 3 and form != full:
+                    repairs[form] = full
+        IdentityTools._BRAND_ACRONYM_REPAIRS_CACHE = repairs
+        IdentityTools._BRAND_ALIAS_FORMS_CACHE = known_forms
+        return repairs, known_forms
+
     @staticmethod
     def expand_query_aliases(query: str) -> str:
         """Rewrite known shorthands / misspellings and prepend an omitted house.
@@ -907,6 +947,23 @@ class IdentityTools:
         )
         if rewrite:
             return rewrite
+
+        # 1b) Repair a transposed brand shorthand (e.g. "jgp" -> Jean Paul
+        # Gaultier). A short acronym alias ("jpg", "ysl", "mfk", "pdm", "dg")
+        # is the one place a single adjacent-letter swap is essentially always a
+        # typo rather than a real word, and on the Fragrantica-blocked runtime a
+        # bare 3-letter token like "jgp" never web-resolves, so the Decodo
+        # spell-repair leg cannot recover it -- it must be corrected offline
+        # here. Fires only when the leading token is *not* already a known alias
+        # form and is exactly one adjacent swap away from a shorthand, so a real
+        # query token is never corrupted.
+        repairs, known_forms = IdentityTools._brand_acronym_repairs()
+        first = tokens[0]
+        if first not in known_forms:
+            for acronym, canonical in repairs.items():
+                if QueryRepair._one_adjacent_swap(first, acronym):
+                    tail = " ".join(cleaned.split()[1:])
+                    return f"{canonical} {tail}".strip()
 
         # 2) Known line whose house is missing: prepend the house.
         distinctive = {t for t in tokens if t not in IdentityTools.STOPWORDS}
