@@ -1300,6 +1300,34 @@ def test_completeness_self_heal_sweep() -> None:
         str(bare_missing),
     )
 
+    # 2b. `environment` is a default-display sentinel, NOT a derivable wardrobe
+    # fact. FIELD_DEFAULTS carries "environment": {"universal"} purely so that a
+    # "Universal" placeholder is never mistaken for a real value -- there is no
+    # source field anywhere in the engine that supplies environment/occasion, so
+    # it is deliberately absent from FACT_FIELDS. This guard fails loudly if a
+    # future change adds it to the completeness contract (which would make every
+    # row report a permanent, unhealable "environment" miss and churn the queue
+    # forever, since no scrape can ever fill a fact with no source).
+    check(
+        "environment is not part of the completeness contract",
+        "environment" not in enrichment_facts.FACT_FIELDS,
+        str(enrichment_facts.FACT_FIELDS),
+    )
+    check(
+        "record_fact_status never emits an environment key",
+        "environment" not in enrichment_facts.record_fact_status(make_complete_record()),
+        str(sorted(enrichment_facts.record_fact_status(make_complete_record()))),
+    )
+    check(
+        "missing_facts never lists environment, even for a bare record",
+        "environment" not in enrichment_facts.missing_facts(bare),
+        str(bare_missing),
+    )
+    check(
+        "default 'Universal' environment is not a complete fact",
+        enrichment_facts.is_fact_complete("Universal", "environment") is False,
+    )
+
     # 3. Endpoint contract: token-gated, then granular audit + heal sweep.
     saved_token = api._ENRICHMENT_WORKER_TOKEN
     saved_enabled = db.ENABLED
