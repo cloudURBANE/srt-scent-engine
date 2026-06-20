@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 VALID_CONCENTRATIONS = {
     "Eau de Cologne", "Eau Fraiche", "Eau de Toilette", "Eau de Parfum",
@@ -44,6 +45,7 @@ _FAMILY_WORDS = {
 _BLANK = {"", "unknown", "unknown family", "none", "null", "n/a", "-", "universal"}
 _DEPRECATED_FAMILY = {"oriental"}
 _FAMILY_TYPO = {"chypere": "Chypre"}
+_MOJIBAKE_MARKERS = ("\ufffd", "Ã", "Â", "â€", "ðŸ")
 
 # A token is junk (not a real accord) if it carries any of these.
 _ACCORD_JUNK_RE = re.compile(
@@ -132,6 +134,18 @@ def audit_row(blob: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     name = str(blob.get("name") or "").strip()
     brand = str(blob.get("brand") or blob.get("house") or "").strip()
+    source_url = str(blob.get("source_url") or "").strip()
+
+    if not brand:
+        issues.append("brand_missing")
+    if not name:
+        issues.append("name_missing")
+    if any(marker in f"{brand} {name}" for marker in _MOJIBAKE_MARKERS):
+        issues.append("identity_mojibake")
+    if source_url:
+        parsed = urlsplit(source_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            issues.append(f"source_url_malformed: {source_url!r}")
 
     # --- accords ---
     acc = blob.get("accords")
