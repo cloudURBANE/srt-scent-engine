@@ -103,6 +103,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Force child python to stream stdout/stderr UNBUFFERED. When python's stdout is
+# a pipe (which it is here -- we feed it through `| Add-Stamp | Tee-Object`), the
+# interpreter switches from line- to BLOCK-buffering, so every print() in the
+# worker is trapped in an ~8KB buffer until the process exits. A single
+# process-pending pass over a full batch with only a couple of workers runs for
+# minutes (the ~60s clearance mint preflight alone produces no output), so the
+# terminal looks dead the whole time and the run reads as "hung". -u / this env
+# var make the line-by-line streaming the loop below actually promises real.
+$env:PYTHONUNBUFFERED = "1"
+
 # Prefix every streamed line with a wall-clock time so the parallel bursts are
 # readable (you can see which jobs resolved in the same second).
 filter Add-Stamp { "{0:HH:mm:ss}  {1}" -f (Get-Date), $_ }
