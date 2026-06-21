@@ -3713,6 +3713,25 @@ class DecodoScraperClient:
     # live smoke. Values: 1/true/yes/on.
     _BING_FALLBACK_ENV = "DECODO_ENABLE_BING_FALLBACK"
     _AI_OVERVIEW_ENV = "DECODO_ENABLE_AI_OVERVIEW"
+    # Retail price capture (best-effort, structured). Unlike the Bing/AI-Overview
+    # recovery legs this is ON by default -- it feeds the web app's Beam
+    # budget-gating and is a single cheap structured call -- but it is individually
+    # killable per-deploy with DECODO_DISABLE_PRICE_CAPTURE=1 (mirrors the
+    # DECODO_DISABLE_UNIVERSAL_FALLBACK kill-switch convention). Bounded to a short
+    # per-call read budget and a single attempt per fragrance.
+    _PRICE_CAPTURE_DISABLE_ENV = "DECODO_DISABLE_PRICE_CAPTURE"
+    PRICE_MAX_TIMEOUT = 8.0
+    # Keys a parsed google_shopping result item may carry the price under, in
+    # priority order (most-structured numeric first, raw display string last).
+    _PRICE_FIELD_KEYS = (
+        "price",
+        "price_value",
+        "current_price",
+        "sale_price",
+        "offer_price",
+        "amount",
+    )
+    _CURRENCY_FIELD_KEYS = ("currency", "currency_code", "price_currency")
     _RESOLVER_SCORE = 0.9
     _PROVIDER_ALIASES = {"decodo", "decodo_scraper", "decodo-scraper", "decodo_api"}
     _LEGACY_PROVIDER_ALIASES = {"serper", "scrapedo", "scrape_do", "scrape.do", "scrapedo_proxy"}
@@ -4013,6 +4032,137 @@ class DecodoScraperClient:
     @classmethod
     def _post_ai_overview(cls, query: str, timeout: float) -> dict:
         return cls._post_request(cls._ai_overview_payload(query), timeout)
+
+    @classmethod
+    def price_capture_enabled(cls) -> bool:
+        """Whether the structured retail-price capture leg may fire.
+
+        ON by default (it backs the web app's Beam budget-gating and is a single
+        cheap structured call), but individually killable per-deploy with
+        ``DECODO_DISABLE_PRICE_CAPTURE=1`` -- mirroring
+        ``_universal_fallback_enabled`` / ``DECODO_DISABLE_UNIVERSAL_FALLBACK``.
+        Requires the client to be enabled (credentials present) at all.
+        """
+        flag = (os.environ.get(cls._PRICE_CAPTURE_DISABLE_ENV) or "").strip().lower()
+        return cls.enabled() and flag not in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _price_payload(cls, query: str) -> dict[str, Any]:
+        # `google_shopping` is Decodo's dedicated retail-price target template: a
+        # premium-pool, structured (`parse: true`) parser that returns priced
+        # shopping offers as JSON. Chosen over amazon_pricing/amazon_search
+        # because it aggregates across many retailers (not a single marketplace)
+        # so a niche fragrance is far likelier to have at least one priced offer,
+        # and it needs no ASIN/marketplace plumbing -- a single free-text query is
+        # enough. The structured parse means we read a numeric price + currency
+        # straight from the JSON instead of regex-scraping rendered HTML.
+        return {
+            "target": "google_shopping",
+            "query": query,
+            "parse": True,
+            "locale": cls._locale(),
+        }
+
+    @classmethod
+    def _post_price(cls, query: str, timeout: float) -> dict:
+        # Routes through `_post_request`, so the billed POST still reserves the
+        # shared daily kill-switch budget (`_DecodoProxyBudget.reserve`).
+        return cls._post_request(cls._price_payload(query), timeout)
+
+    @staticmethod
+    def _coerce_price(value: Any) -> float | None:
+        """Coerce a structured/display price into a positive USD float, else None.
+
+        Accepts a bare number or a display string like "$129.00" / "USD 1,299".
+        Returns None for anything non-positive or unparseable so a malformed
+        field never fabricates a price."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            price = float(value)
+            return price if price > 0 else None
+        if isinstance(value, str):
+            # Keep digits, separators and sign; strip currency glyphs/letters.
+            cleaned = re.sub(r"[^0-9.,-]", "", value).strip()
+            if not cleaned:
+                return None
+            # Drop thousands separators; a price never legitimately uses commas
+            # as a decimal here (Decodo google_shopping emits en-us by default).
+            cleaned = cleaned.replace(",", "")
+            try:
+                price = float(cleaned)
+            except ValueError:
+                return None
+            return price if price > 0 else None
+        return None
+
+    @classmethod
+    def price_from_payload(cls, payload: dict) -> dict | None:
+        """Defensively pull the cheapest priced offer out of a parsed
+        google_shopping response. Returns ``{"price", "currency", "source"}`` or
+        ``None`` when nothing priced is present. Never raises on shape drift -- it
+        reuses the same envelope-unwrapping walk as URL/image discovery
+        (`_collect_entries`) so it tolerates the v2 container/array nesting."""
+        try:
+            entries = cls._collect_entries(payload)
+        except Exception:
+            return None
+        best_price: float | None = None
+        best_currency: str | None = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            price: float | None = None
+            for key in cls._PRICE_FIELD_KEYS:
+                price = cls._coerce_price(entry.get(key))
+                if price is not None:
+                    break
+            if price is None:
+                continue
+            if best_price is None or price < best_price:
+                best_price = price
+                currency = None
+                for ckey in cls._CURRENCY_FIELD_KEYS:
+                    raw = entry.get(ckey)
+                    if isinstance(raw, str) and raw.strip():
+                        currency = raw.strip().upper()
+                        break
+                best_currency = currency
+        if best_price is None:
+            return None
+        return {
+            "price": best_price,
+            "currency": best_currency or "USD",
+            "source": "decodo_google_shopping",
+        }
+
+    @classmethod
+    def fetch_price(
+        cls,
+        query: str,
+        *,
+        timeout: float = PRICE_MAX_TIMEOUT,
+    ) -> dict | None:
+        """Best-effort structured retail price for a fragrance query.
+
+        Returns ``{"price": float, "currency": str, "source": str}`` on success,
+        or ``None`` when capture is disabled, the daily cap is tripped, the call
+        fails, or no priced offer is found. Single bounded attempt per call; the
+        billed POST reserves the shared daily budget via `_post_request`. Callers
+        MUST treat a ``None`` as "no price" and keep working."""
+        query = (query or "").strip()
+        if not query or not cls.price_capture_enabled():
+            return None
+        try:
+            payload = cls._post_price(query, min(float(timeout), cls.PRICE_MAX_TIMEOUT))
+        except Exception as exc:
+            cls._log_request_failure("price capture", exc)
+            return None
+        try:
+            return cls.price_from_payload(payload)
+        except Exception as exc:
+            cls._log_request_failure("price parse", exc)
+            return None
 
     @staticmethod
     def _universal_fallback_enabled() -> bool:

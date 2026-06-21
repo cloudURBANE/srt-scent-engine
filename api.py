@@ -1873,6 +1873,34 @@ def _details_to_dict(
     return payload
 
 
+def _attach_price(
+    payload: dict[str, Any],
+    req: "DetailRequest",
+    selected: engine.UnifiedFragrance,
+) -> dict[str, Any]:
+    """Best-effort opt-in retail price for a /details payload.
+
+    A single bounded Decodo google_shopping call, fired ONLY when the caller set
+    `include_price` and the capability is enabled. The billed POST reserves the
+    shared daily kill-switch budget inside `fetch_price`. Any failure (disabled,
+    cap tripped, no offer, shape drift) leaves the payload untouched — price is
+    additive and absent by default, so callers never depend on it. Never raises.
+    """
+    if not getattr(req, "include_price", False):
+        return payload
+    try:
+        query = f"{selected.brand or ''} {selected.name or ''}".strip()
+        priced = engine.DecodoScraperClient.fetch_price(query) if query else None
+        if priced and isinstance(priced.get("price"), (int, float)) and priced["price"] > 0:
+            payload["price"] = priced["price"]
+            payload["currency"] = priced.get("currency") or "USD"
+            payload["price_source"] = priced.get("source") or "decodo_google_shopping"
+    except Exception:
+        # Price is a courtesy; a capture failure must never break /details.
+        pass
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -1882,6 +1910,12 @@ class DetailRequest(BaseModel):
     id: str | None = None
     source_url: str | None = None
     recover_incomplete: bool = False
+    # Opt-in structured retail-price capture (Decodo google_shopping). OFF per
+    # request by default so ordinary detail views — including cached/worker serves
+    # — never incur a billed shopping call; only a caller that actually needs price
+    # (the web app's Beam budget-gating) sets this. The capability itself is gated
+    # by DecodoScraperClient.price_capture_enabled() (ON unless DECODO_DISABLE_PRICE_CAPTURE).
+    include_price: bool = False
 
 
 class RequeueDetailRequest(DetailRequest):
@@ -4979,13 +5013,17 @@ def details(req: DetailRequest) -> dict[str, Any]:
 
     if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
         detail_bundle = _fetch_parfinity_detail_bundle(selected, _ARGS.detail_timeout)
-        return _details_to_dict(
+        return _attach_price(
+            _details_to_dict(
+                selected,
+                detail_bundle,
+                fragrantica_cached=False,
+                fragrantica_cache_source=None,
+                enrichment_status="catalog",
+                enrichment_requested_count=None,
+            ),
+            req,
             selected,
-            detail_bundle,
-            fragrantica_cached=False,
-            fragrantica_cache_source=None,
-            enrichment_status="catalog",
-            enrichment_requested_count=None,
         )
 
     stored_detail = _lookup_stored_detail(selected)
@@ -5030,14 +5068,18 @@ def details(req: DetailRequest) -> dict[str, Any]:
             and not getattr(stored_detail, "_had_stored_derived_metrics", False)
         ):
             _persist_detail_record(selected, stored_detail)
-        return _details_to_dict(
+        return _attach_price(
+            _details_to_dict(
+                selected,
+                stored_detail,
+                fragrantica_cached=bool(stored_detail.frag_cards),
+                fragrantica_cache_source=fragrantica_cache_source
+                or ("aggregate_db" if stored_detail.frag_cards or is_parfumo_fallback else None),
+                enrichment_status=enrichment_status,
+                enrichment_requested_count=enrichment_requested_count,
+            ),
+            req,
             selected,
-            stored_detail,
-            fragrantica_cached=bool(stored_detail.frag_cards),
-            fragrantica_cache_source=fragrantica_cache_source
-            or ("aggregate_db" if stored_detail.frag_cards or is_parfumo_fallback else None),
-            enrichment_status=enrichment_status,
-            enrichment_requested_count=enrichment_requested_count,
         )
 
     if not _try_acquire_gate(_DETAIL_FETCH_SEMAPHORE, _DETAIL_FETCH_QUEUE_TIMEOUT):
@@ -5091,13 +5133,17 @@ def details(req: DetailRequest) -> dict[str, Any]:
     engine.heal_missing_gender_and_year(selected, detail_bundle)
     _persist_detail_record(selected, detail_bundle)
 
-    return _details_to_dict(
+    return _attach_price(
+        _details_to_dict(
+            selected,
+            detail_bundle,
+            fragrantica_cached,
+            fragrantica_cache_source,
+            enrichment_status,
+            enrichment_requested_count,
+        ),
+        req,
         selected,
-        detail_bundle,
-        fragrantica_cached,
-        fragrantica_cache_source,
-        enrichment_status,
-        enrichment_requested_count,
     )
 
 
