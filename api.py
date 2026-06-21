@@ -228,6 +228,14 @@ _FRAGRANCE_RECORD_TTL_HOURS = _env_int("FRAGRANCE_RECORD_TTL_HOURS", 168)
 # fraction of its line, so brand-only fallbacks are allowed a wider result set.
 # Clamped to the DB search ceiling (50) so this can only widen, never overflow.
 _BRAND_ONLY_MAX_RESULTS = max(1, min(_env_int("API_BRAND_ONLY_MAX_RESULTS", 50), 50))
+# Final wire-level ceiling on how many rows the live search path returns. The
+# cache tiers already bound themselves to the per-query cap (_ARGS.max_results),
+# but the primary live path serialized EVERY resolved candidate with no final
+# cap, so a broad/scent-description query could surface dozens of unfamiliar rows
+# (the "67 options the user has never seen" complaint). Cap the live response to
+# keep it focused; the background brand-sweep still warms the full set into cache,
+# and a deliberate brand browse can widen this via API_SEARCH_RESULT_MAX.
+_SEARCH_RESULT_MAX = max(1, _env_int("API_SEARCH_RESULT_MAX", 24))
 _DERIVED_METRICS_LOCK_GUARD = threading.Lock()
 _DERIVED_METRICS_LOCKS: dict[str, threading.Lock] = {}
 
@@ -2723,9 +2731,15 @@ def search(
                 f"{fallback_label}."
             )
 
+    # Warm the full set into cache (brand sweep sees everything) but only return a
+    # bounded, focused slice to the client.
     _maybe_spawn_brand_sweep(results)
-    rows = [_search_result_to_dict(item) for item in results]
-    fact_summary = _apply_fact_query_response(rows, results, fact_query)
+    capped = results[:_SEARCH_RESULT_MAX]
+    if len(results) > len(capped):
+        diagnostics["results_capped_to"] = _SEARCH_RESULT_MAX
+        diagnostics["results_total_available"] = len(results)
+    rows = [_search_result_to_dict(item) for item in capped]
+    fact_summary = _apply_fact_query_response(rows, capped, fact_query)
     if fact_summary:
         diagnostics["fact_query"] = {
             "field": fact_summary["field"],
