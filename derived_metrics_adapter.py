@@ -97,7 +97,12 @@ def _to_int(value: Any) -> int:
     if isinstance(value, float):
         return int(value)
     text = str(value or "").strip().lower().replace(",", "")
-    m = re.search(r"([\d.]+)\s*([km]?)", text)
+    # Match a single well-formed number only. A greedy ``[\d.]+`` would swallow
+    # malformed multi-dot scrape junk ("1.2.3", "..") whole and then raise in
+    # ``float()`` -- and because this best-effort parser feeds the entire
+    # ``build_derived_metrics`` pipeline, one bad count would crash the whole
+    # computation into NULL derived_metrics ("Family Unknown" / blank cards).
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([km]?)", text)
     if not m:
         return 0
     num = float(m.group(1))

@@ -1716,6 +1716,46 @@ def test_junk_accord_filtering() -> None:
     )
 
 
+def test_vote_count_parse_is_crash_proof() -> None:
+    print("Vote-count parse robustness checks (no DATABASE_URL required):")
+    from derived_metrics_adapter import _to_int, build_derived_metrics
+    from fragrance_parser_full_rewrite_fixed import NotesList, UnifiedDetails
+
+    # Well-formed counts still parse exactly as before.
+    check("_to_int parses '1,234 votes'", _to_int("1,234 votes") == 1234, "")
+    check("_to_int parses '1.2k'", _to_int("1.2k") == 1200, "")
+    check("_to_int parses '3.4m'", _to_int("3.4m") == 3_400_000, "")
+    check("_to_int parses bare int", _to_int("12") == 12, "")
+
+    # Malformed scrape junk must degrade to a best-effort number, never raise.
+    # A greedy ``[\d.]+`` used to swallow these whole and crash in float().
+    for junk in ["1.2.3", "..", "k", "", "v1.2.3 k", "...4.."]:
+        try:
+            value = _to_int(junk)
+            ok = isinstance(value, int)
+        except Exception as exc:  # pragma: no cover - the bug being guarded
+            ok = False
+            value = f"CRASH {type(exc).__name__}"
+        check(f"_to_int does not crash on {junk!r}", ok, str(value))
+
+    # Pipeline-level: one malformed count in a card must not nuke the whole
+    # derived_metrics build into None (the "Family Unknown / blank cards" class).
+    details = UnifiedDetails(notes=NotesList())
+    details.frag_cards = {
+        "Longevity": [
+            {"label": "Moderate", "count": "1.2.3"},
+            {"label": "Long Lasting", "count": "500"},
+        ]
+    }
+    dm = build_derived_metrics(details)
+    perf = dm.get("performance_score")
+    check(
+        "build_derived_metrics survives a malformed count and still scores",
+        isinstance(perf, dict) and isinstance(perf.get("score"), int),
+        str(perf),
+    )
+
+
 def test_parfumo_partial_self_heal_alignment() -> None:
     print("Parfumo partial vs self-heal alignment checks (no DATABASE_URL required):")
     import enrichment_facts
@@ -3766,6 +3806,7 @@ def main() -> int:
     test_completeness_self_heal_sweep()
     test_recompute_derived_metrics_sweep()
     test_junk_accord_filtering()
+    test_vote_count_parse_is_crash_proof()
     test_parfumo_partial_self_heal_alignment()
     test_actionable_missing_contract()
     test_no_perfume_page_skeleton_non_actionable()
