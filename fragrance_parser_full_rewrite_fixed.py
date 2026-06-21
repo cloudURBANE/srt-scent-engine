@@ -612,7 +612,8 @@ class IdentityTools:
         "prada": {"prada"},
         "chanel": {"chanel"},
         "versace": {"versace"},
-        "tom ford": {"tom ford", "ford"},
+        "tom ford": {"tom ford", "tf", "ford"},
+        "tf": {"tom ford", "tf", "ford"},
         "maison francis kurkdjian": {"maison francis kurkdjian", "mfk"},
         "mfk": {"maison francis kurkdjian", "mfk"},
         "jean paul gaultier": {"jean paul gaultier", "jpg"},
@@ -635,6 +636,30 @@ class IdentityTools:
         "le labo": {"le labo"},
         "jo malone": {"jo malone", "jo malone london"},
         "jo malone london": {"jo malone", "jo malone london"},
+        # Common designer acronyms / shorthands users type instead of the full
+        # house name. Every alias is also a key (mirrors the convention above) so
+        # both canonical_brand_query() and brand_forms() resolve either direction.
+        # Kept to unambiguous, high-confidence houses -- the lookups only fire on
+        # a whole-query match, so a short token here never corrupts a real name.
+        "comme des garcons": {"comme des garcons", "cdg"},
+        "cdg": {"comme des garcons", "cdg"},
+        "acqua di parma": {"acqua di parma", "adp"},
+        "adp": {"acqua di parma", "adp"},
+        "van cleef and arpels": {"van cleef and arpels", "van cleef arpels", "van cleef", "vca"},
+        "van cleef": {"van cleef and arpels", "van cleef arpels", "van cleef", "vca"},
+        "vca": {"van cleef and arpels", "van cleef arpels", "van cleef", "vca"},
+        "frederic malle": {"frederic malle", "editions de parfums frederic malle"},
+        "editions de parfums frederic malle": {"frederic malle", "editions de parfums frederic malle"},
+        "by kilian": {"by kilian", "kilian"},
+        "kilian": {"by kilian", "kilian"},
+        "paco rabanne": {"paco rabanne", "paco"},
+        "paco": {"paco rabanne", "paco"},
+        "viktor and rolf": {"viktor and rolf", "viktor rolf"},
+        "viktor rolf": {"viktor and rolf", "viktor rolf"},
+        "bvlgari": {"bvlgari", "bulgari"},
+        "bulgari": {"bvlgari", "bulgari"},
+        "initio": {"initio", "initio parfums prives"},
+        "initio parfums prives": {"initio", "initio parfums prives"},
     }
     # Whole-query rewrites: a known shorthand / common misspelling that, on its
     # own (after trailing filler words are trimmed), names a specific fragrance
