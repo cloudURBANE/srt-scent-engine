@@ -35,6 +35,34 @@ def test_compare_reports_tracks_resolved_persistent_and_new_rows():
     assert result["categories"]["gender_missing"]["new_rows"] == ["global_fragrances:3"]
 
 
+def test_compare_reports_reads_indexed_issue_rows():
+    # The current export format writes a pre-indexed ``issue_rows`` dict
+    # (tag -> list of "source:row_id" keys) rather than the legacy per-row
+    # ``rows`` list. compare_reports must consume that primary path identically.
+    before = {
+        "snapshot_id": "before",
+        "issue_rows": {
+            "accord_case": ["user_fragrances:1"],
+            "family_unknown": ["user_fragrances:1"],
+        },
+    }
+    after = {
+        "snapshot_id": "after",
+        "issue_rows": {
+            "family_unknown": ["user_fragrances:1"],
+            "gender_missing": ["global_fragrances:3"],
+        },
+    }
+
+    result = compare_reports(before, after)
+
+    assert result["resolved_issue_count"] == 1
+    assert result["new_issue_count"] == 1
+    assert result["categories"]["accord_case"]["resolved_rows"] == ["user_fragrances:1"]
+    assert result["categories"]["family_unknown"]["persistent_rows"] == ["user_fragrances:1"]
+    assert result["categories"]["gender_missing"]["new_rows"] == ["global_fragrances:3"]
+
+
 def test_progress_cli_fail_on_new(tmp_path: Path):
     before = tmp_path / "before.json"
     after = tmp_path / "after.json"

@@ -1119,7 +1119,11 @@ def _identity_cache_search(
     cache = _load_identity_cache()
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
-    for row in cache.data.values():
+    # Snapshot the values: the shared identity cache can be mutated by the
+    # worker/save path, and a "dictionary changed size during iteration"
+    # RuntimeError is raised by the for-iterator itself (outside the per-row
+    # try/except below), so it would abort the whole response if not snapshotted.
+    for row in list(cache.data.values()):
         # Dirty/partial rows must never crash the search response: skip a bad
         # row rather than let a malformed cache entry abort the whole sweep.
         try:
