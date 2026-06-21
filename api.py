@@ -5119,6 +5119,112 @@ def details(req: DetailRequest) -> dict[str, Any]:
     )
 
 
+def _enrichment_state_level(
+    details: engine.UnifiedDetails, coverage: dict[str, Any]
+) -> str:
+    """Coarse completeness tier for a cached detail bundle. Read-only.
+
+    "full" when all 4 Fragrantica status-derived metric groups made it through
+    (the same predicate /details uses to mark a job completed); "partial" when
+    *some* source contributed or any notes are present; "none" otherwise. Reads
+    only the already-computed coverage dict and the in-memory details bundle, so
+    it never fetches and never writes.
+    """
+    if _fg_metrics_complete(details):
+        return "full"
+    notes = details.notes
+    has_notes = bool(
+        notes.top or notes.heart or notes.base or notes.flat
+    )
+    has_source = bool(
+        coverage.get("basenotes")
+        or coverage.get("fragrantica")
+        or coverage.get("parfinity")
+    )
+    if has_source or has_notes or bool(details.description):
+        return "partial"
+    return "none"
+
+
+@app.post("/api/fragrances/enrichment-state")
+def enrichment_state(req: DetailRequest) -> dict[str, Any]:
+    """Report a fragrance's CACHED enrichment state without any live fetch.
+
+    Strictly read-only and no-egress: it resolves the same candidate as
+    /api/fragrances/details, then consults ONLY the durable cache via
+    `_lookup_stored_detail` (plus the in-process Parfinity catalog). It never
+    enqueues a job, never acquires the detail-fetch semaphore, and never calls
+    the live scraper. The web app polls this cheaply to decide whether a
+    fragrance is already complete before paying for the live /details egress.
+
+    Cached hit -> {complete, level, source_coverage, derived_metrics, cached:
+    true (+ enrichment marker)}. Cache miss -> a cheap "unknown" state with
+    `cached: false` and no side effects.
+    """
+    selected = _candidate_from_request(req)
+    if not selected.bn_url and not selected.frag_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Request resolved to no source URL; provide a valid 'id'.",
+        )
+
+    # Parfinity is a catalog-backed source resolved entirely in-process (no
+    # network). Reuse only the catalog lookup -- NOT _fetch_parfinity_detail_bundle,
+    # which performs a live Basenotes fetch.
+    if selected.frag_url and parfinity.is_parfinity_url(selected.frag_url):
+        pf_entry = parfinity.lookup_detail(selected.frag_url)
+        if pf_entry:
+            details = engine.UnifiedDetails(notes=engine.NotesList())
+            parfinity.overlay_onto_details(details, pf_entry)
+            try:
+                from derived_metrics_adapter import build_derived_metrics
+
+                details.derived_metrics = build_derived_metrics(details)
+            except Exception:
+                details.derived_metrics = None
+            coverage = _source_coverage(selected, details)
+            return {
+                "complete": _fg_metrics_complete(details),
+                "level": _enrichment_state_level(details, coverage),
+                "source_coverage": coverage,
+                "derived_metrics": coverage.get("derived_metrics"),
+                "enrichment": {"status": "catalog", "requires_worker": False},
+                "cached": True,
+            }
+        return {
+            "complete": False,
+            "level": "none",
+            "source_coverage": None,
+            "enrichment": {"status": "unknown", "requires_worker": True},
+            "cached": False,
+        }
+
+    stored_detail = _lookup_stored_detail(selected)
+    if stored_detail is not None:
+        coverage = _source_coverage(selected, stored_detail)
+        return {
+            "complete": _fg_metrics_complete(stored_detail),
+            "level": _enrichment_state_level(stored_detail, coverage),
+            "source_coverage": coverage,
+            "derived_metrics": coverage.get("derived_metrics"),
+            "enrichment": {
+                "status": "completed"
+                if _fg_metrics_complete(stored_detail)
+                else "partial",
+                "requires_worker": not _fg_metrics_complete(stored_detail),
+            },
+            "cached": True,
+        }
+
+    return {
+        "complete": False,
+        "level": "none",
+        "source_coverage": None,
+        "enrichment": {"status": "unknown", "requires_worker": True},
+        "cached": False,
+    }
+
+
 @app.post("/api/fragrances/details/requeue")
 def requeue_details(req: RequeueDetailRequest) -> dict[str, Any]:
     """Force-refresh a detail enrichment job for the same payload as /details."""
