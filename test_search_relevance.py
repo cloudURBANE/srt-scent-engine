@@ -2352,6 +2352,15 @@ def test_new_brand_aliases_are_brand_only_and_keep_house() -> None:
         ("montblanc", "Montblanc"),
         ("pdm", "Parfums de Marly"),
         ("parfums de marly", "Parfums de Marly"),
+        # Newly added designer acronyms / shorthands (F-1.3).
+        ("tf", "Tom Ford"),
+        ("cdg", "Comme des Garcons"),
+        ("adp", "Acqua di Parma"),
+        ("vca", "Van Cleef & Arpels"),
+        ("kilian", "By Kilian"),
+        ("paco", "Paco Rabanne"),
+        ("bulgari", "Bvlgari"),
+        ("initio", "Initio Parfums Prives"),
     ]
     for query, brand in cases:
         check(f"{query!r} is brand-only for {brand!r}", brand_only(query, brand), "")
@@ -2364,6 +2373,23 @@ def test_new_brand_aliases_are_brand_only_and_keep_house() -> None:
     # canonical_brand_query must resolve the aliases so the catalog crawl is seeded.
     check("'pdm' resolves to the Parfums de Marly house", _norm(engine.IdentityTools.canonical_brand_query("pdm")) == "parfums de marly", engine.IdentityTools.canonical_brand_query("pdm"))
     check("'boss' resolves to the Hugo Boss house", _norm(engine.IdentityTools.canonical_brand_query("boss")) == "hugo boss", engine.IdentityTools.canonical_brand_query("boss"))
+    # New acronyms must resolve to their full house so the brand-only catalog path fires.
+    acronym_houses = {
+        "tf": "tom ford",
+        "cdg": "comme des garcons",
+        "adp": "acqua di parma",
+        "vca": "van cleef and arpels",
+        "kilian": "by kilian",
+        "paco": "paco rabanne",
+        "bulgari": "bvlgari",
+        "initio": "initio",
+    }
+    for acronym, house in acronym_houses.items():
+        check(
+            f"{acronym!r} resolves to the {house!r} house",
+            _norm(engine.IdentityTools.canonical_brand_query(acronym)) == house,
+            engine.IdentityTools.canonical_brand_query(acronym),
+        )
 
 
 def test_jo_malone_brand_query_keeps_both_house_spellings() -> None:
