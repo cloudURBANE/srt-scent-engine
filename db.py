@@ -311,7 +311,18 @@ def _cache_row_raw_identity(cache_row: dict[str, Any]) -> dict[str, Any]:
 def _upsert_completed_fragrance_record(
     conn: Any, job: dict[str, Any], cache_row: dict[str, Any]
 ) -> None:
-    """Best-effort aggregate update for a completed enrichment payload."""
+    """Best-effort aggregate update for a completed enrichment payload.
+
+    Identity containment: a job is matched to an existing record by
+    ``canonical_fg_url`` first, then ``bn_url`` (see ``_find_fragrance_record_key``).
+    A worker that re-resolved the wrong version (e.g. base "Sauvage" for a
+    "Sauvage Elixir" job) would match the original record by ``bn_url`` and then
+    clobber its identity + payload. The ``WHERE`` guard on the conflict update only
+    allows the overwrite when the record has no established Fragrantica URL yet, the
+    completion carries none, or the two agree -- so a mis-resolved sibling can never
+    overwrite an already-pinned identity. (The worker-side ``_accept_candidate``
+    identity gate prevents the mis-resolution upstream; this is defense in depth.)
+    """
     from psycopg.types.json import Json
 
     record_key = _find_fragrance_record_key(
@@ -380,6 +391,9 @@ def _upsert_completed_fragrance_record(
             END,
             last_seen_at     = now(),
             updated_at       = now()
+        WHERE fragrance_records.canonical_fg_url IS NULL
+           OR EXCLUDED.canonical_fg_url IS NULL
+           OR fragrance_records.canonical_fg_url = EXCLUDED.canonical_fg_url
         """,
         (
             record_key,
