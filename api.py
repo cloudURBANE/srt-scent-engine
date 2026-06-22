@@ -1827,7 +1827,15 @@ def _details_to_dict(
         # (a durable fact). The SPA renders this as "Unknown" rather than hiding the
         # year row, so a known-unknown reads differently from a not-yet-fetched gap.
         "year_unknown": bool(getattr(details, "year_unknown", False)),
-        "image_url": getattr(selected, "image_url", None),
+        # Prefer an image already attached to the resolved candidate (DB/cache
+        # hydration or worker enrichment); fall back to the bottle image
+        # harvested from the live FG detail page so cold, never-enriched
+        # fragrances still carry an image instead of rendering "no image".
+        "image_url": (
+            getattr(selected, "image_url", None)
+            or getattr(details, "image_url", None)
+            or None
+        ),
         "gender": details.gender,
         "concentration": concentration,
         # True only when an authoritative source states the bare name in >=2
@@ -4598,7 +4606,14 @@ def _persist_detail_record(
                 "house": selected.brand or None,
                 "year": _coerce_year(selected.year),
                 "gender": details.gender,
-                "image_url": getattr(selected, "image_url", None),
+                # Persist the harvested bottle image into the durable cache so
+                # future hydrations carry it without re-scraping; prefer an
+                # already-attached candidate image when present.
+                "image_url": (
+                    getattr(selected, "image_url", None)
+                    or getattr(details, "image_url", None)
+                    or None
+                ),
                 "bn_raw": _json_for_db_blob(
                     {
                         "description": details.description,

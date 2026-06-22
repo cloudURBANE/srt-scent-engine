@@ -171,6 +171,12 @@ class UnifiedDetails:
     # Raw page/og title text. FG appends the launch year to it, so it is the
     # brand-year-filtered fallback when the structured sources are absent.
     page_title: str = ""
+    # Bottle/packshot image harvested from the FG detail page's durable
+    # structured sources (og:image / JSON-LD image) at parse time. The
+    # user-facing /search and /details paths do no other image discovery, so
+    # without this a freshly-added fragrance shows "no image" until the offline
+    # worker enriches it. Best-effort: "" when the page exposes no usable image.
+    image_url: str = ""
     bn_consensus: dict[str, tuple[int, int]] = field(default_factory=dict)
     frag_cards: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     pros_cons: list[str] = field(default_factory=list)
@@ -8317,6 +8323,14 @@ class FragranticaEngine:
                 title_text = soup.title.string or ""
             unified_details.page_title = TextSanitizer.clean(title_text)
 
+        # Harvest the bottle image here while the parsed soup is in scope. The
+        # user-facing /details path otherwise carries no image (the search id
+        # token does not encode one), so a freshly-added fragrance shows "no
+        # image" until the offline worker enriches it. Only set when empty so a
+        # Basenotes-sourced image in the same bundle is not clobbered.
+        if not unified_details.image_url:
+            unified_details.image_url = FragranticaEngine.extract_image_url(soup)
+
         decoded_status = None
         status_payload = FragranticaEngine.extract_encrypted_status_payload(soup)
         diag["has_status_payload"] = bool(status_payload)
@@ -8521,6 +8535,61 @@ class FragranticaEngine:
                     ym = re.search(r"\b((?:17|18|19|20)\d{2})\b", str(val))
                     if ym:
                         return ym.group(1)
+        return ""
+
+    @staticmethod
+    def extract_image_url(soup: BeautifulSoup) -> str:
+        """Best-effort bottle image from the FG detail page's structured sources.
+
+        Precision-first, matching extract_launch_year's source ordering:
+
+          1. ``<meta property="og:image">`` (the canonical share image FG sets to
+             the bottle packshot), and
+          2. JSON-LD ``image`` (string, list, or ImageObject ``url``).
+
+        Returns an absolute http(s) URL, or "" when nothing usable is found. Only
+        durable structured sources are read — never fragile inline markup — so the
+        value stays stable across FG layout reshapes.
+        """
+        if soup is None:
+            return ""
+
+        def _clean_url(value: Any) -> str:
+            if not isinstance(value, str):
+                return ""
+            candidate = value.strip()
+            return candidate if candidate.lower().startswith(("http://", "https://")) else ""
+
+        og_image = soup.select_one('meta[property="og:image"], meta[name="og:image"]')
+        if og_image:
+            cleaned = _clean_url(og_image.get("content"))
+            if cleaned:
+                return cleaned
+
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text() or ""
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw.strip())
+            except Exception:
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                image = node.get("image")
+                candidates: list[Any] = []
+                if isinstance(image, list):
+                    candidates.extend(image)
+                else:
+                    candidates.append(image)
+                for entry in candidates:
+                    if isinstance(entry, dict):
+                        entry = entry.get("url")
+                    cleaned = _clean_url(entry)
+                    if cleaned:
+                        return cleaned
         return ""
 
     @staticmethod
