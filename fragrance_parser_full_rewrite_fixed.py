@@ -3774,6 +3774,13 @@ class DecodoScraperClient:
     _brand_perfume_cache: dict[str, list[str]] = {}
     _parfumo_cache: dict[str, list[str]] = {}
     _image_cache: dict[str, list[dict]] = {}
+    # Monotonic stamp per image-cache key, used only to expire NEGATIVE (empty)
+    # results. A genuinely image-less query used to be cached forever, so a
+    # fragrance that gained an image upstream stayed permanently "no image" for
+    # the process lifetime. Positive results are still cached for the whole run;
+    # empties are re-queried once this short TTL lapses.
+    _image_cache_at: dict[str, float] = {}
+    _IMAGE_EMPTY_TTL = 600.0
     _cache_lock = threading.Lock()
 
     @staticmethod
@@ -4307,8 +4314,15 @@ class DecodoScraperClient:
         cache_key = f"{cls._cache_key(query)}|{max_results}"
         with cls._cache_lock:
             cached = cls._image_cache.get(cache_key)
-        if cached is not None:
-            return [dict(item) for item in cached]
+            # A non-empty (positive) hit is served for the whole run. An empty
+            # (negative) hit is honored only until _IMAGE_EMPTY_TTL lapses, then
+            # falls through to re-query so a since-published image can surface.
+            if cached:
+                return [dict(item) for item in cached]
+            if cached is not None:
+                stamp = cls._image_cache_at.get(cache_key, 0.0)
+                if (time.monotonic() - stamp) < cls._IMAGE_EMPTY_TTL:
+                    return []
         try:
             payload = cls._post_google(query, timeout, image_search=True)
             candidates = cls.image_candidates_from_payload(payload, max_results=max_results)
@@ -4317,6 +4331,7 @@ class DecodoScraperClient:
             return []
         with cls._cache_lock:
             cls._image_cache[cache_key] = [dict(item) for item in candidates]
+            cls._image_cache_at[cache_key] = time.monotonic()
         return candidates
 
     @classmethod
