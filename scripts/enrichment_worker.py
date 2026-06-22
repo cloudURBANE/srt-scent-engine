@@ -1208,16 +1208,41 @@ def _print_engine_lines(captured_text: str) -> None:
 def _accept_candidate(candidate: engine.UnifiedFragrance | None, job: dict[str, Any]) -> bool:
     if not candidate:
         return False
-    if candidate.resolver_source == "designer_catalog_brand_query":
-        job_name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
-        job_house = _canonical_house(str(job.get("house") or ""))
-        probe = engine.UnifiedFragrance(name=job_name, brand=job_house, year="")
-        catalog_item = engine.CatalogItem(name=candidate.name, brand=candidate.brand, year="", url=candidate.frag_url)
-        score = engine.Orchestrator.identity_score(probe, catalog_item)
-        if score < engine.Orchestrator.CATALOG_ACCEPT:
-            print(f"  [resolve] rejected weak catalog match {candidate.frag_url} score={score:.2f}")
-            return False
-    return True
+    # Identity gate for EVERY resolver source. Previously only the
+    # designer-catalog tier was gated; the primary /search path accepted the
+    # first Fragrantica-linked hit UNCONDITIONALLY. With concentration stripped
+    # from the search query (_strip_concentration_terms), that let a flanker /
+    # concentration sibling — "Sauvage Elixir" for a "Sauvage" job, or vice
+    # versa — be enriched and then written back onto the requested fragrance's
+    # record, so the app surfaced "almost a different version" of the pick.
+    if _candidate_matches_job(candidate, job):
+        return True
+    # Year-confirmed subset acceptance, mirroring the designer-catalog tier
+    # (_designer_catalog_candidate): a legitimate name shorthand ("Lys" vs
+    # "The Lys", a dropped marketing line confirmed by an exact year) is
+    # identity-preserving even below CATALOG_ACCEPT. A sibling carrying an EXTRA
+    # non-stopword token on the candidate side (the flanker shape) is rejected by
+    # _subset_identity_match, so distinct versions never collapse.
+    job_name = _canonical_name(str(job.get("house") or ""), str(job.get("name") or ""))
+    job_house = _canonical_house(str(job.get("house") or ""))
+    probe = engine.UnifiedFragrance(
+        name=job_name or candidate.name,
+        brand=job_house or candidate.brand,
+        year=_coerce_year(job.get("year")),
+    )
+    catalog_item = engine.CatalogItem(
+        name=candidate.name,
+        brand=candidate.brand,
+        year=candidate.year,
+        url=candidate.frag_url,
+    )
+    if _subset_identity_match(probe, catalog_item):
+        return True
+    print(
+        f"  [resolve] rejected non-matching search hit {candidate.frag_url} "
+        f"(identity mismatch for {job_house} {job_name!r})"
+    )
+    return False
 
 
 def resolve_candidate(

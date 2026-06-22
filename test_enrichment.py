@@ -3008,6 +3008,66 @@ def test_worker_resolver_hardening() -> None:
     )
 
 
+def test_worker_identity_gate_rejects_version_swap() -> None:
+    """A re-resolved sibling must not be accepted for a different job identity.
+
+    Guards the "Beam recommends X, the enrichment tool returns / writes back an
+    almost-different version of X" regression: the primary /search resolver path
+    used to accept the first Fragrantica-linked hit unconditionally, so a flanker
+    (Sauvage -> Sauvage Elixir) could be enriched onto the requested record. Pure:
+    no network, no DB."""
+    print("\nWorker identity gate (version-swap guard):")
+    w = enrichment_worker
+    engine = w.engine
+
+    def cand(name: str, brand: str, url: str, year: str = "") -> Any:
+        return engine.UnifiedFragrance(
+            name=name,
+            brand=brand,
+            year=year,
+            bn_url="",
+            frag_url=url,
+            resolver_source="api_search",
+            resolver_score=0.95,
+        )
+
+    sauvage = "https://www.fragrantica.com/perfume/Dior/Sauvage-31861.html"
+    elixir = "https://www.fragrantica.com/perfume/Dior/Sauvage-Elixir-62151.html"
+
+    check(
+        "exact identity is accepted",
+        w._accept_candidate(cand("Sauvage", "Dior", sauvage), {"house": "Dior", "name": "Sauvage"}),
+    )
+    check(
+        "flanker sibling rejected for the base job (Sauvage !-> Sauvage Elixir)",
+        not w._accept_candidate(
+            cand("Sauvage Elixir", "Dior", elixir), {"house": "Dior", "name": "Sauvage"}
+        ),
+    )
+    check(
+        "base rejected for a flanker job (Sauvage Elixir !-> Sauvage)",
+        not w._accept_candidate(
+            cand("Sauvage", "Dior", sauvage), {"house": "Dior", "name": "Sauvage Elixir"}
+        ),
+    )
+    check(
+        "year-confirmed subset shorthand is still accepted",
+        w._accept_candidate(
+            cand(
+                "1872 Vetiver",
+                "Clive Christian",
+                "https://www.fragrantica.com/perfume/Clive-Christian/1872-Vetiver-1.html",
+                year="2016",
+            ),
+            {"house": "Clive Christian", "name": "1872 Twist Vetiver", "year": "2016"},
+        ),
+    )
+    check(
+        "None candidate is rejected",
+        not w._accept_candidate(None, {"house": "Dior", "name": "Sauvage"}),
+    )
+
+
 def test_detail_fetch_saturation_returns_retryable_503() -> None:
     print("Detail fetch saturation checks (no DATABASE_URL required):")
     old_gate = api._DETAIL_FETCH_SEMAPHORE
@@ -3814,6 +3874,7 @@ def main() -> int:
     test_worker_query_normalization_and_retry_grace()
     test_worker_url_gating_catalog_tier_and_retirement()
     test_worker_resolver_hardening()
+    test_worker_identity_gate_rejects_version_swap()
     test_detail_fetch_saturation_returns_retryable_503()
     if db.ENABLED:
         test_db_lifecycle()
