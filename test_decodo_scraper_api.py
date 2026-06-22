@@ -275,6 +275,57 @@ def test_decodo_scraper_image_payload_and_mapping() -> None:
     check("Decodo candidates carry source provider", first["source_provider"] == "decodo", str(first))
 
 
+def test_decodo_image_negative_cache_expires_but_positive_sticks() -> None:
+    print("Decodo image negative-cache TTL checks:")
+    saved = _save_env()
+    old_post = engine.requests.post
+    old_ttl = engine.DecodoScraperClient._IMAGE_EMPTY_TTL
+    calls = {"n": 0}
+    empty_payload = {"results": [{"content": {"results": []}}]}
+    try:
+        _clear_decodo_env()
+        engine.DecodoScraperClient._image_cache_at.clear()
+        os.environ["SERP_API_PROVIDER"] = "decodo"
+        os.environ["DECODO_API_BASIC_TOKEN"] = "encoded-test-token"
+
+        # Phase 1: an empty image result is a SHORT-LIVED negative cache entry; a
+        # repeat call inside the TTL must not re-hit the network.
+        engine.DecodoScraperClient._IMAGE_EMPTY_TTL = 600.0
+
+        def empty_post(url, json=None, headers=None, timeout=None, **kwargs):
+            calls["n"] += 1
+            return _FakeDecodoResponse(empty_payload)
+
+        engine.requests.post = empty_post
+        first = engine.DecodoScraperClient.search_image_candidates("aurora missing bottle", max_results=8)
+        second = engine.DecodoScraperClient.search_image_candidates("aurora missing bottle", max_results=8)
+        check("Empty image result returns no candidates", first == [] and second == [], str((first, second)))
+        check("Empty image result is not re-queried within TTL", calls["n"] == 1, f"calls={calls['n']}")
+
+        # Phase 2: once the negative TTL lapses, the SAME query is re-queried so a
+        # since-published image can finally surface (fixes permanent "no image").
+        engine.DecodoScraperClient._IMAGE_EMPTY_TTL = 0.0
+        calls["n"] = 0
+
+        def image_post(url, json=None, headers=None, timeout=None, **kwargs):
+            calls["n"] += 1
+            return _FakeDecodoResponse(_DECODO_IMAGE_PAYLOAD)
+
+        engine.requests.post = image_post
+        recovered = engine.DecodoScraperClient.search_image_candidates("aurora missing bottle", max_results=8)
+        check("Expired negative image cache is re-queried", calls["n"] == 1, f"calls={calls['n']}")
+        check("Recovered image candidates are returned", len(recovered) == 2, str(recovered))
+
+        # Phase 3: a positive result is served for the whole run regardless of TTL.
+        repeat = engine.DecodoScraperClient.search_image_candidates("aurora missing bottle", max_results=8)
+        check("Positive image result stays cached without re-query", calls["n"] == 1, f"calls={calls['n']}")
+        check("Cached positive returns same candidates", len(repeat) == 2, str(repeat))
+    finally:
+        engine.requests.post = old_post
+        engine.DecodoScraperClient._IMAGE_EMPTY_TTL = old_ttl
+        _restore_env(saved)
+
+
 def test_decodo_username_password_auth_fallback() -> None:
     print("Decodo username/password auth checks:")
     saved = _save_env()
