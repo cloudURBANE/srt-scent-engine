@@ -515,7 +515,21 @@ def _search_identity_is_safe_to_store(
 
 
 def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]:
-    """Recover name/house from canonical source URLs when fields are weak."""
+    """Recover name/house from canonical source URLs when fields are weak.
+
+    Memoized per-item: identity is a pure function of ``name``/``brand``/
+    ``frag_url``/``bn_url``, so the result is cached on the item and reused
+    while those fields are unchanged. This removes the redundant recovery that
+    previously ran twice per search result (once in the display-identity filter
+    and again during serialization), plus any other repeat calls on the same
+    object. The cache key includes every input field, so a healed/mutated item
+    transparently recomputes.
+    """
+    cache_key = (item.name, item.brand, item.frag_url, item.bn_url)
+    cached = getattr(item, "_identity_recovery_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
     name = (item.name or "").strip()
     house = (item.brand or "").strip()
 
@@ -561,7 +575,13 @@ def _recover_candidate_identity(item: engine.UnifiedFragrance) -> dict[str, str]
     if name and house:
         name = engine.IdentityTools.strip_house_from_name(name, house)
 
-    return {"name": name, "house": house}
+    result = {"name": name, "house": house}
+    try:
+        item._identity_recovery_cache = (cache_key, result)
+    except Exception:
+        # Best-effort cache only; correctness never depends on it.
+        pass
+    return result
 
 
 def _candidate_has_display_identity(item: engine.UnifiedFragrance) -> bool:
