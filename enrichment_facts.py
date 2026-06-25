@@ -61,6 +61,12 @@ ACCORD_FAMILY_MAP = {
     "rum": "Gourmand",
     "smoky": "Woody",
     "soft spicy": "Spicy",
+    # Parfumo reports compound accords ("warm-spicy", "soft-spicy", "fresh-spicy")
+    # that expand_raw_accords splits on the hyphen into ["warm","spicy"], etc.
+    # The multi-word "warm spicy"/"soft spicy"/"fresh spicy" keys never match the
+    # split tokens, so the bare "spicy" token (shared by all three) must map on
+    # its own or the family is lost for every Parfumo-sourced *-spicy fragrance.
+    "spicy": "Spicy",
     "sweet": "Gourmand",
     "tobacco": "Amber",
     "tuberose": "Floral",
