@@ -1664,7 +1664,16 @@ def _source_coverage(
         "fragrantica_linked": fg_linked,
         "parfinity_linked": parfinity_linked,
         "derived_metrics": derived,
-        "complete": bn_has_data and (fg_has_data or pf_has_data),
+        # "complete" must mean fully complete, not merely "both source families
+        # linked". A Fragrantica-linked detail whose 4 status-metric groups have
+        # NOT all arrived (fg_complete is False) is still partial: the worker
+        # reopens it as pending and the SPA must keep refreshing it. Gating on
+        # fg_complete (not the looser fg_has_data) keeps this field consistent
+        # with derived_metrics=="full" and with fragrantica_metrics_complete, so
+        # the SPA's completeness predicate no longer short-circuits the
+        # self-heal loop on a tile the engine itself considers incomplete.
+        # Parfinity is catalog-backed and counts as complete on its own.
+        "complete": bn_has_data and (fg_complete or pf_has_data),
     }
 
 
