@@ -142,19 +142,27 @@ _SEASON_TIME_LABELS = {
     "spring", "summer", "fall", "autumn", "winter", "day", "night",
 }
 # Shopping/ad copy that the scraper occasionally swept up ("Many Items For Sale
-# On ..."). No accord ever contains these phrases.
-_AD_TEXT_MARKERS = ("for sale", "items for sale", "in stock", "shop ", " ad")
-_AD_TEXT_LABELS = {"sponsored"}
+# On ...", "Online shops offers"). The "Online shops offers" heading bleeds in
+# from Fragrantica's online-retailer widget directly beneath the accords card and,
+# because it has no bar, lands with a full/dominant percentage that sorts it to the
+# TOP of the card (the "F by Ferragamo Black shows ONLINE SHOPS OFFERS as a Dominant
+# accord" bug). No accord ever contains these phrases.
+_AD_TEXT_MARKERS = (
+    "for sale", "items for sale", "in stock", "shop ", " ad",
+    "online shop", "shops offers", "shop offers",
+)
+_AD_TEXT_LABELS = {"sponsored", "offers"}
 
 
 def is_junk_accord_label(label: Any) -> bool:
     """True when an 'accord' label is actually scraped noise rather than a scent.
 
-    Catches the three leaks that the Fragrantica "Main accords" card picks up when
+    Catches the leaks that the Fragrantica "Main accords" card picks up when
     its container over-captures adjacent widgets: vote-count tokens (14.9K), the
     love/hate rating buckets (Hate, Like), the "When to wear" season/time buckets
-    (Summer, Night), and stray shopping copy. A real accord is always an
-    alphabetic scent label, so all of these are unambiguously junk.
+    (Summer, Night), and stray shopping copy including the "Online shops offers"
+    retailer-widget heading. A real accord is always an alphabetic scent label, so
+    all of these are unambiguously junk.
     """
     s = str(label or "").strip()
     if not s:
