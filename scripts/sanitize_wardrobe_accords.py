@@ -21,8 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, ROOT)
 
-import psycopg2
-from psycopg2.extras import Json
+import psycopg
+from psycopg.types.json import Json
 
 from heal_offline import _sanitize_wardrobe_blob
 
@@ -69,7 +69,7 @@ def main() -> int:
     ap.add_argument("--commit", action="store_true", help="persist changes (default: dry-run)")
     args = ap.parse_args()
 
-    conn = psycopg2.connect(_resolve_dsn())
+    conn = psycopg.connect(_resolve_dsn())
     try:
         with conn.cursor() as cur:
             total = 0

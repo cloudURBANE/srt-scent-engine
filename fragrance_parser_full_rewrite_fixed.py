@@ -6161,7 +6161,14 @@ def _clean_note_display(text: str) -> str:
 # compound note names ("Pink & Black Pepper", "Saffron & Leather Accord",
 # "Turkish Rose Essence and Absolute") — splitting those would manufacture
 # garbage fragments. Limiting to " or " and "/" keeps this regression-free.
-_NOTE_DISJUNCTION_RE = re.compile(r"\s+or\s+|\s*/\s*", re.IGNORECASE)
+#
+# The slash branch requires whitespace on BOTH sides ("Benzoin / Tolu Balsam"),
+# the disjunction form actually seen in the caches. A bare slash with no spaces
+# is almost always a parenthetical provenance ("Vetiver (Bourbon/Java)",
+# "Labdanum (Cistus/Rockrose)"); splitting it mid-parenthesis would emit garbage
+# fragments with unbalanced parentheses ("Vetiver (Bourbon", "Java)"), so it is
+# left intact for _collapse_synonym_paren / clarifying-parenthetical handling.
+_NOTE_DISJUNCTION_RE = re.compile(r"\s+or\s+|\s+/\s+", re.IGNORECASE)
 
 
 def _split_note_disjunction(note: str) -> list[str]:
