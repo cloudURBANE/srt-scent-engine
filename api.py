@@ -1664,7 +1664,13 @@ def _source_coverage(
         "fragrantica_linked": fg_linked,
         "parfinity_linked": parfinity_linked,
         "derived_metrics": derived,
-        "complete": bn_has_data and (fg_has_data or pf_has_data),
+        # Aligns with the documented contract: a detail is only "complete" when
+        # both sources contributed AND Fragrantica's 4 status-metric groups all
+        # arrived (fg_complete) -- i.e. it agrees with derived_metrics == "full".
+        # Previously this was `bn_has_data and (fg_has_data or pf_has_data)`,
+        # which flipped true as soon as FG returned ANY frag_card, marking
+        # genuinely-partial details "complete" and halting the SPA self-heal loop.
+        "complete": derived == "full",
     }
 
 
