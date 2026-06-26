@@ -1622,6 +1622,7 @@ def test_junk_accord_filtering() -> None:
         "Hate", "Like", "OK",
         "Summer", "Winter", "Spring", "Fall", "Day", "Night",
         "Many Items For Sale On", "Sponsored",
+        "Online shops offers", "Online shops offers:", "Offers",
     ]:
         check(f"is_junk_accord_label flags {junk!r}", enrichment_facts.is_junk_accord_label(junk), junk)
     for real in ["Amber", "Citrus", "Fresh Spicy", "Warm Spicy", "Woody", "Aquatic", "Musky", "Green", "Fresh"]:
