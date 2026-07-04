@@ -242,10 +242,15 @@ def init_db() -> None:
     from psycopg_pool import ConnectionPool
 
     max_size = _env_int("DB_POOL_MAX_SIZE", DEFAULT_DB_POOL_MAX_SIZE)
+    # Bound the connection-acquire wait: the anyio threadpool admits more
+    # concurrent sync routes (40) than the pool has connections, so under a
+    # burst the overflow request must fail fast (api.py maps PoolTimeout to a
+    # retryable 503) instead of holding a thread for psycopg's 30s default.
     _pool = ConnectionPool(
         DATABASE_URL,
         min_size=1,
         max_size=max_size,
+        timeout=float(_env_int("DB_POOL_ACQUIRE_TIMEOUT", 5)),
         kwargs={"autocommit": True},
     )
     with _pool.connection() as conn:
@@ -668,6 +673,19 @@ def requeue_or_enqueue_job(
         ctx.__exit__(None, None, None)
 
 
+# A job row is "still live" when a worker can still legitimately deliver it:
+# pending, or processing under an unexpired claim lease. A NULL or expired
+# lease on a processing row means the worker died mid-job -- such orphans must
+# reopen (mirroring the lease-stealing rule in claim_job), or a crashed claim
+# would report "processing" forever and never re-queue.
+_JOB_STILL_LIVE_SQL = (
+    "(enrichment_jobs.status = 'pending'"
+    " OR (enrichment_jobs.status = 'processing'"
+    " AND enrichment_jobs.claim_expires_at IS NOT NULL"
+    " AND enrichment_jobs.claim_expires_at > now()))"
+)
+
+
 def recover_or_enqueue_job(
     *,
     job_key: str,
@@ -682,15 +700,16 @@ def recover_or_enqueue_job(
     """Idempotently make an incomplete detail job available to the worker.
 
     Background recovery must not reset active worker leases or inflate retry
-    counts. Pending/processing rows are returned as-is; deliberately ignored
-    rows stay retired; other terminal rows reopen.
+    counts. Pending rows and processing rows with a live claim lease are
+    returned as-is; deliberately ignored rows stay retired; terminal rows and
+    orphaned processing rows (expired/NULL lease) reopen to pending.
     """
     if not ENABLED:
         return None
     ctx, conn = _conn()
     try:
         row = conn.execute(
-            """
+            f"""
             INSERT INTO enrichment_jobs
                 (id, job_key, query, name, house, year, bn_url, fg_url,
                  status, priority, requested_count, created_at, last_requested_at)
@@ -699,18 +718,18 @@ def recover_or_enqueue_job(
                  'pending', %s, 1, now(), now())
             ON CONFLICT (job_key) DO UPDATE SET
                 status            = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.status
                     ELSE 'pending'
                 END,
                 priority          = GREATEST(enrichment_jobs.priority, EXCLUDED.priority),
                 requested_count   = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.requested_count
                     ELSE enrichment_jobs.requested_count + 1
                 END,
                 last_requested_at = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.last_requested_at
                     ELSE now()
                 END,
@@ -721,32 +740,32 @@ def recover_or_enqueue_job(
                 bn_url            = COALESCE(EXCLUDED.bn_url, enrichment_jobs.bn_url),
                 fg_url            = COALESCE(EXCLUDED.fg_url, enrichment_jobs.fg_url),
                 claimed_at        = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.claimed_at
                     ELSE NULL
                 END,
                 claim_expires_at  = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.claim_expires_at
                     ELSE NULL
                 END,
                 completed_at      = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.completed_at
                     ELSE NULL
                 END,
                 failed_at         = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.failed_at
                     ELSE NULL
                 END,
                 ignored_at        = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.ignored_at
                     ELSE NULL
                 END,
                 last_error        = CASE
-                    WHEN enrichment_jobs.status IN ('pending', 'processing')
+                    WHEN {_JOB_STILL_LIVE_SQL}
                     THEN enrichment_jobs.last_error
                     ELSE NULL
                 END

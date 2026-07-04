@@ -4033,8 +4033,12 @@ class DecodoScraperClient:
             raise RuntimeError("Decodo daily request cap reached")
         deadline = time.monotonic() + max(float(timeout), 0.0)
         attempt = 0
+        # First attempt gets the exact granted budget; re-deriving it from the
+        # monotonic clock here shaved the microseconds elapsed since `deadline`
+        # was set off every first read timeout. Retries recompute the true
+        # remainder after their backoff sleep below.
+        budget = max(float(timeout), 0.0)
         while True:
-            budget = deadline - time.monotonic()
             res = requests.post(
                 cls.ENDPOINT,
                 json=payload,
@@ -4058,6 +4062,7 @@ class DecodoScraperClient:
                 res.raise_for_status()
                 return res.json() or {}
             time.sleep(wait)
+            budget = deadline - time.monotonic()
 
     @classmethod
     def _post_google(cls, query: str, timeout: float, *, image_search: bool = False) -> dict:
