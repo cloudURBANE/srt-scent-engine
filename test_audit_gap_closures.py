@@ -12,9 +12,13 @@ Covers, fully offline (no DB, no network):
     503 (Retry-After), mirroring the scrape gates, instead of a 30s-hang 500;
   * B4 -- derived-metrics locks are striped to a fixed cardinality (no
     per-record monotonic growth) and stable per record;
-  * B6 -- diagnostics mint attempts reuse one module-level single-worker
-    executor per site, so a timed-out mint cannot strand a fresh thread+executor
-    per call.
+  * B6 -- diagnostics mint attempts are gated to one in-flight mint per site
+    on a daemon thread: overlap gets an immediate honest "busy" result instead
+    of stranding a fresh thread per call or silently queueing behind a stuck
+    mint;
+  * B1 sweep -- list_jobs(status="pending") flips expired/NULL-lease
+    `processing` orphans back to pending first, so plain --process-pending
+    drains can see them.
 
 pytest-style (no __main__ guard): run via `python -m pytest`.
 """
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -80,6 +85,9 @@ class _RecordingCursor:
     def fetchone(self):
         return None
 
+    def fetchall(self):
+        return []
+
 
 class _RecordingConn:
     def __init__(self, log: list) -> None:
@@ -126,6 +134,36 @@ def test_recover_sql_reopens_expired_lease_processing() -> None:
     # Ignored rows stay retired.
     assert "status <> 'ignored'" in sql, sql
     assert "fg:test" in params, params
+
+
+def _list_jobs_sql(status: str) -> list:
+    executed: list = []
+    saved_enabled = db.ENABLED
+    saved_conn = db._conn
+    try:
+        db.ENABLED = True
+        db._conn = lambda: (_NullCtx(), _RecordingConn(executed))
+        db.list_jobs(status=status)
+    finally:
+        db.ENABLED = saved_enabled
+        db._conn = saved_conn
+    return executed
+
+
+def test_pending_list_reopens_expired_lease_orphans_first() -> None:
+    executed = _list_jobs_sql("pending")
+    # Orphan flip runs before the SELECT, and only for the pending listing.
+    assert len(executed) == 2, [sql for sql, _ in executed]
+    flip_sql = executed[0][0]
+    assert "SET status = 'pending'" in flip_sql, flip_sql
+    assert "status = 'processing'" in flip_sql, flip_sql
+    assert "claim_expires_at IS NULL OR claim_expires_at <= now()" in flip_sql, flip_sql
+    assert "SELECT" in executed[1][0], executed[1][0]
+
+    # Non-pending listings (mobile dashboard tabs) never mutate.
+    executed = _list_jobs_sql("processing")
+    assert len(executed) == 1, [sql for sql, _ in executed]
+    assert "UPDATE" not in executed[0][0], executed[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -234,20 +272,19 @@ def test_derived_metrics_locks_are_striped_and_bounded() -> None:
 
 
 # ---------------------------------------------------------------------------
-# B6 -- diagnostics mint attempts reuse module-level single-worker executors
+# B6 -- diagnostics mint attempts are gated, daemon-threaded, and honest
 # ---------------------------------------------------------------------------
 
 
-def test_mint_diagnostics_reuse_module_executor() -> None:
-    assert api._BN_MINT_DIAG_EXECUTOR._max_workers == 1
-    assert api._FG_MINT_DIAG_EXECUTOR._max_workers == 1
-    assert api._BN_MINT_DIAG_EXECUTOR is not api._FG_MINT_DIAG_EXECUTOR
+def test_mint_diagnostics_gated_daemon_and_reusable() -> None:
+    assert api._BN_MINT_DIAG_GATE is not api._FG_MINT_DIAG_GATE
 
-    thread_names: list[str] = []
+    seen: list[tuple[str, bool]] = []
     saved_mint = engine._mint_basenotes_clearance
 
     def _fake_mint():
-        thread_names.append(threading.current_thread().name)
+        t = threading.current_thread()
+        seen.append((t.name, t.daemon))
         return None
 
     try:
@@ -257,8 +294,30 @@ def test_mint_diagnostics_reuse_module_executor() -> None:
     finally:
         engine._mint_basenotes_clearance = saved_mint
 
+    # Gate released after each completed mint -> both attempts actually ran,
+    # on named daemon threads (a stuck mint must not block interpreter exit).
     assert first["success"] is False and second["success"] is False
-    assert len(thread_names) == 2
-    # Both attempts ran on the same named single worker -- no per-call executor.
-    assert thread_names[0] == thread_names[1], thread_names
-    assert thread_names[0].startswith("bn-mint-diag"), thread_names
+    assert first["error"] is None and second["error"] is None, (first, second)
+    assert len(seen) == 2, seen
+    assert all(name.startswith("bn-mint-diag") for name, _ in seen), seen
+    assert all(daemon for _, daemon in seen), seen
+
+
+def test_mint_diagnostics_overlap_reports_busy_immediately() -> None:
+    saved_mint = engine._mint_basenotes_clearance
+    engine._mint_basenotes_clearance = lambda: None
+    # Simulate an in-flight mint by holding the gate ourselves.
+    assert api._BN_MINT_DIAG_GATE.acquire(blocking=False)
+    try:
+        started = time.monotonic()
+        result = api._bn_diag_mint_attempt(True)
+        elapsed = time.monotonic() - started
+    finally:
+        api._BN_MINT_DIAG_GATE.release()
+        engine._mint_basenotes_clearance = saved_mint
+
+    # Overlap is rejected immediately with an honest error -- it must not
+    # queue behind the running mint and burn the 90s budget.
+    assert result["success"] is False
+    assert result["error"] is not None and result["error"].startswith("busy"), result
+    assert elapsed < 5.0, elapsed

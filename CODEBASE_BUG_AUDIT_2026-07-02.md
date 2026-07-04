@@ -159,8 +159,10 @@ makes the candidate safe. Tests referenced are the in-repo `*.test.ts` / `test_*
 > reclaim — PR #69); the remaining open portion was `recover_or_enqueue_job`
 > preserving `processing` unconditionally. It now preserves a processing row
 > only under a live (non-NULL, unexpired) `claim_expires_at` lease, so an
-> orphan reopens to `pending` on the next `/details` view or heal sweep.
-> Guarded by `test_audit_gap_closures.py`.
+> orphan reopens to `pending` on the next `/details` view or heal sweep, and
+> `list_jobs(status="pending")` flips expired-lease orphans back to pending
+> before listing — so even a plain `--process-pending` drain (no dashboard,
+> no `/details` view) reclaims them. Guarded by `test_audit_gap_closures.py`.
 
 - **Where:** `db.py:863-919` (`claim_job` reclaims by id only), `db.py:820-846` /
   `api.py:6023-6035` (`list_jobs` defaults to `status="pending"`), `db.py:671-770`
@@ -249,10 +251,12 @@ makes the candidate safe. Tests referenced are the in-repo `*.test.ts` / `test_*
 
 ### B6. Diagnostics mint executor can leave a thread running past timeout — **Confirmed · Low**
 
-> **Status: FIXED** (2026-07-04). Both mint-diagnostic sites now reuse a
-> module-level single-worker executor (one per site) and cancel a queued
-> mint on timeout, capping stranded threads at one per site instead of one
-> per timed-out call. Guarded by `test_audit_gap_closures.py`.
+> **Status: FIXED** (2026-07-04). Both mint-diagnostic sites now run the mint
+> on a gated daemon thread (`_run_mint_bounded`): at most one in-flight mint
+> per site, overlapping calls get an immediate honest "busy" instead of
+> queueing behind a stuck mint, and a mint outliving the 90s budget can no
+> longer strand a thread per call nor block interpreter shutdown. Guarded by
+> `test_audit_gap_closures.py`.
 
 - **Where:** `api.py:3559-3581` (sibling at `:3918`).
 - **Symptom:** on `future.result(timeout=90)` TimeoutError,

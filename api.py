@@ -34,7 +34,6 @@ will fall back to it if `id` is absent.
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import hmac
 import json
 import logging
@@ -52,6 +51,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import db
@@ -358,17 +358,17 @@ app = FastAPI(title="Fragrance Engine API", version="1.0.0", lifespan=_lifespan)
 # pool has connections, so a burst of cheap DB endpoints can exhaust the pool.
 # db.py bounds the acquire wait (DB_POOL_ACQUIRE_TIMEOUT); map that saturation
 # to the same retryable 503 the scrape gates already use instead of a 500.
+# ImportError only: psycopg-pool is a hard runtime dep, and a broader guard
+# would silently drop this handler on a broken install.
 try:
     from psycopg_pool import PoolTimeout as _PoolTimeout
-except Exception:  # pragma: no cover - psycopg_pool absent in DB-less dev
+except ImportError:  # pragma: no cover - psycopg_pool absent in DB-less dev
     _PoolTimeout = None
 
 if _PoolTimeout is not None:
 
     @app.exception_handler(_PoolTimeout)
     def _db_pool_saturated(request, exc):
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=503,
             content={"detail": "Database capacity is saturated; retry shortly."},
@@ -3604,16 +3604,50 @@ def _bn_diag_search_probe(query: str) -> dict[str, Any]:
     return result
 
 
-# Module-level single-worker executors for the diagnostics mint attempts. A
-# per-call executor cannot cancel an already-running mint on timeout, so each
-# timed-out call stranded a thread (and its executor) until the mint finished;
-# reusing one worker per site caps runaway mints at a single thread apiece.
-_BN_MINT_DIAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="bn-mint-diag"
-)
-_FG_MINT_DIAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="fg-mint-diag"
-)
+# Bounded diagnostics mint attempts. A per-call executor cannot cancel an
+# already-running mint on timeout, so each timed-out call stranded a thread
+# until the mint finished (a mint can run for minutes: headful mode waits for
+# a human to solve the challenge). A shared single-worker executor would cap
+# the threads but silently queue new attempts behind a stuck mint, burning
+# each caller's full timeout to report a misleading TimeoutError. Instead: a
+# non-blocking gate per site caps in-flight mints at one and rejects overlap
+# immediately with an honest "busy"; the mint runs on a daemon thread so a
+# stuck mint never blocks interpreter shutdown.
+_BN_MINT_DIAG_GATE = threading.BoundedSemaphore(1)
+_FG_MINT_DIAG_GATE = threading.BoundedSemaphore(1)
+_MINT_DIAG_TIMEOUT = 90.0
+
+
+def _run_mint_bounded(
+    gate: threading.BoundedSemaphore, mint_fn, thread_name: str
+) -> tuple[str, Any]:
+    """Run one clearance mint on a gated daemon thread.
+
+    Returns ("busy", None) when a previous mint on this site still holds the
+    gate; ("timeout", None) when this mint exceeded the budget (the daemon
+    thread keeps running and releases the gate itself when the mint ends);
+    ("error", exc) when the mint raised; ("ok", session) on completion.
+    """
+    if not gate.acquire(blocking=False):
+        return "busy", None
+    outcome: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            outcome["session"] = mint_fn()
+        except Exception as exc:
+            outcome["exc"] = exc
+        finally:
+            done.set()
+            gate.release()
+
+    threading.Thread(target=_run, name=thread_name, daemon=True).start()
+    if not done.wait(_MINT_DIAG_TIMEOUT):
+        return "timeout", None
+    if "exc" in outcome:
+        return "error", outcome["exc"]
+    return "ok", outcome.get("session")
 
 
 def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
@@ -3630,10 +3664,21 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         return result
 
     started = _time.monotonic()
-    future = _BN_MINT_DIAG_EXECUTOR.submit(engine._mint_basenotes_clearance)
-    try:
-        session = future.result(timeout=90)
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+    status, payload = _run_mint_bounded(
+        _BN_MINT_DIAG_GATE, engine._mint_basenotes_clearance, "bn-mint-diag"
+    )
+    result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+    if status == "busy":
+        result["success"] = False
+        result["error"] = "busy: a previous mint attempt is still running; retry later"
+    elif status == "timeout":
+        result["success"] = False
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
+    elif status == "error":
+        result["success"] = False
+        result["error"] = _bn_diag_error(payload)
+    else:
+        session = payload
         result["success"] = session is not None
         if session is not None:
             try:
@@ -3642,17 +3687,6 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
                 )
             except Exception:
                 result["session_validated_after_mint"] = False
-    except concurrent.futures.TimeoutError:
-        # Drop a not-yet-started mint from the queue; a running one cannot be
-        # cancelled and simply keeps the single worker busy until it finishes.
-        future.cancel()
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
-        result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
-    except Exception as exc:
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
-        result["success"] = False
-        result["error"] = _bn_diag_error(exc)
     return result
 
 
@@ -3988,10 +4022,21 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         return result
 
     started = _time.monotonic()
-    future = _FG_MINT_DIAG_EXECUTOR.submit(engine._mint_fragrantica_clearance)
-    try:
-        session = future.result(timeout=90)
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+    status, payload = _run_mint_bounded(
+        _FG_MINT_DIAG_GATE, engine._mint_fragrantica_clearance, "fg-mint-diag"
+    )
+    result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
+    if status == "busy":
+        result["success"] = False
+        result["error"] = "busy: a previous mint attempt is still running; retry later"
+    elif status == "timeout":
+        result["success"] = False
+        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
+    elif status == "error":
+        result["success"] = False
+        result["error"] = _bn_diag_error(payload)
+    else:
+        session = payload
         result["success"] = session is not None
         if session is not None:
             with engine._FRAGRANTICA_SESSION_LOCK:
@@ -4008,17 +4053,6 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
                 )
             except Exception:
                 result["session_validated_after_mint"] = False
-    except concurrent.futures.TimeoutError:
-        # Drop a not-yet-started mint from the queue; a running one cannot be
-        # cancelled and simply keeps the single worker busy until it finishes.
-        future.cancel()
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
-        result["success"] = False
-        result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
-    except Exception as exc:
-        result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
-        result["success"] = False
-        result["error"] = _bn_diag_error(exc)
     return result
 
 
@@ -4984,6 +5018,11 @@ def _enqueue_enrichment_job(
 def _enrichment_status_from_job_state(
     job: dict[str, Any] | None,
 ) -> tuple[str, int | None]:
+    # Contract: any unrecognized status normalizes to "unavailable".
+    # _recover_incomplete_enrichment_job's raised-error sentinel
+    # ({"status": "error"}) depends on this so the details handler can tell a
+    # raised recovery apart from "no row" (None) -- do not pass unknown
+    # statuses through.
     if not job:
         return "unavailable", None
     status = str(job.get("status") or "").strip().lower()

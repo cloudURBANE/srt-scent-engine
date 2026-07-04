@@ -74,6 +74,14 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
 # ---------------------------------------------------------------------------
 # Connection / schema bootstrap
 # ---------------------------------------------------------------------------
@@ -246,11 +254,13 @@ def init_db() -> None:
     # concurrent sync routes (40) than the pool has connections, so under a
     # burst the overflow request must fail fast (api.py maps PoolTimeout to a
     # retryable 503) instead of holding a thread for psycopg's 30s default.
+    # The bound is uniform -- bulk sweeps and the worker /complete share it --
+    # so raise it via env on a deploy where write bursts outrank fast reads.
     _pool = ConnectionPool(
         DATABASE_URL,
         min_size=1,
         max_size=max_size,
-        timeout=float(_env_int("DB_POOL_ACQUIRE_TIMEOUT", 5)),
+        timeout=_env_float("DB_POOL_ACQUIRE_TIMEOUT", 5.0),
         kwargs={"autocommit": True},
     )
     with _pool.connection() as conn:
@@ -851,6 +861,22 @@ def list_jobs(
     offset = max(0, int(offset or 0))
     ctx, conn = _conn()
     try:
+        if status == "pending":
+            # Piggybacked orphan sweep (audit B1): a worker that died mid-job
+            # leaves its row 'processing' under an expired/NULL lease --
+            # invisible to every pending-only consumer, so a plain
+            # --process-pending drain could never pick it up. Flip such
+            # orphans back to pending right before listing; idempotent, and
+            # rows under a live lease are untouched (same rule as
+            # _JOB_STILL_LIVE_SQL / claim_job's lease-stealing).
+            conn.execute(
+                """
+                UPDATE enrichment_jobs
+                SET status = 'pending', claimed_at = NULL, claim_expires_at = NULL
+                WHERE status = 'processing'
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= now())
+                """
+            )
         rows = conn.execute(
             f"""
             SELECT {_ENRICHMENT_JOB_COLUMNS} FROM enrichment_jobs
