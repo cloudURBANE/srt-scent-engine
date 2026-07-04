@@ -13,3 +13,7 @@
 # version so a fresh clone reproduces the same result.
 -r requirements.txt
 pytest==9.0.3
+# fastapi.testclient (used by test_enrichment.py, test_parfinity.py, and the
+# other TestClient-driven files) requires httpx, which the runtime image does
+# not need -- without this pin a fresh dev clone fails 4 of the suite's files.
+httpx==0.28.1

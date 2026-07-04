@@ -34,6 +34,7 @@ will fall back to it if `id` is absent.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hmac
 import json
 import logging
@@ -41,6 +42,7 @@ import os
 import re
 import threading
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -236,8 +238,14 @@ _BRAND_ONLY_MAX_RESULTS = max(1, min(_env_int("API_BRAND_ONLY_MAX_RESULTS", 50),
 # keep it focused; the background brand-sweep still warms the full set into cache,
 # and a deliberate brand browse can widen this via API_SEARCH_RESULT_MAX.
 _SEARCH_RESULT_MAX = max(1, _env_int("API_SEARCH_RESULT_MAX", 24))
-_DERIVED_METRICS_LOCK_GUARD = threading.Lock()
-_DERIVED_METRICS_LOCKS: dict[str, threading.Lock] = {}
+# Derived-metrics fill locks, striped to a fixed cardinality. A per-record
+# dict here grew monotonically (one permanent Lock per fragrance ever viewed
+# -- a slow leak on a long-lived process); a collision between two records on
+# one stripe merely serializes their fills, which is harmless.
+_DERIVED_METRICS_LOCK_STRIPES = 256
+_DERIVED_METRICS_LOCKS: tuple[threading.Lock, ...] = tuple(
+    threading.Lock() for _ in range(_DERIVED_METRICS_LOCK_STRIPES)
+)
 
 # Enrichment worker auth. The protected /api/enrichment/jobs/* endpoints require
 # `Authorization: Bearer <ENRICHMENT_WORKER_TOKEN>`. This token is for the
@@ -345,6 +353,27 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0", lifespan=_lifespan)
+
+# The anyio threadpool admits more concurrent sync routes (40) than the DB
+# pool has connections, so a burst of cheap DB endpoints can exhaust the pool.
+# db.py bounds the acquire wait (DB_POOL_ACQUIRE_TIMEOUT); map that saturation
+# to the same retryable 503 the scrape gates already use instead of a 500.
+try:
+    from psycopg_pool import PoolTimeout as _PoolTimeout
+except Exception:  # pragma: no cover - psycopg_pool absent in DB-less dev
+    _PoolTimeout = None
+
+if _PoolTimeout is not None:
+
+    @app.exception_handler(_PoolTimeout)
+    def _db_pool_saturated(request, exc):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Database capacity is saturated; retry shortly."},
+            headers={"Retry-After": "2"},
+        )
 
 # ---------------------------------------------------------------------------
 # CORS -- restricted to the frontend origin(s).
@@ -3575,8 +3604,19 @@ def _bn_diag_search_probe(query: str) -> dict[str, Any]:
     return result
 
 
+# Module-level single-worker executors for the diagnostics mint attempts. A
+# per-call executor cannot cancel an already-running mint on timeout, so each
+# timed-out call stranded a thread (and its executor) until the mint finished;
+# reusing one worker per site caps runaway mints at a single thread apiece.
+_BN_MINT_DIAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="bn-mint-diag"
+)
+_FG_MINT_DIAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="fg-mint-diag"
+)
+
+
 def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
-    import concurrent.futures
     import time as _time
 
     result: dict[str, Any] = {
@@ -3590,8 +3630,7 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         return result
 
     started = _time.monotonic()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(engine._mint_basenotes_clearance)
+    future = _BN_MINT_DIAG_EXECUTOR.submit(engine._mint_basenotes_clearance)
     try:
         session = future.result(timeout=90)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
@@ -3604,6 +3643,9 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
             except Exception:
                 result["session_validated_after_mint"] = False
     except concurrent.futures.TimeoutError:
+        # Drop a not-yet-started mint from the queue; a running one cannot be
+        # cancelled and simply keeps the single worker busy until it finishes.
+        future.cancel()
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
         result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
@@ -3611,8 +3653,6 @@ def _bn_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
         result["error"] = _bn_diag_error(exc)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
     return result
 
 
@@ -3935,7 +3975,6 @@ def _fg_diag_search_probe(query: str) -> dict[str, Any]:
 
 
 def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
-    import concurrent.futures
     import time as _time
 
     result: dict[str, Any] = {
@@ -3949,8 +3988,7 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         return result
 
     started = _time.monotonic()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(engine._mint_fragrantica_clearance)
+    future = _FG_MINT_DIAG_EXECUTOR.submit(engine._mint_fragrantica_clearance)
     try:
         session = future.result(timeout=90)
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
@@ -3971,6 +4009,9 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
             except Exception:
                 result["session_validated_after_mint"] = False
     except concurrent.futures.TimeoutError:
+        # Drop a not-yet-started mint from the queue; a running one cannot be
+        # cancelled and simply keeps the single worker busy until it finishes.
+        future.cancel()
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
         result["error"] = "TimeoutError: mint attempt exceeded 90 seconds"
@@ -3978,8 +4019,6 @@ def _fg_diag_mint_attempt(mint: bool) -> dict[str, Any]:
         result["elapsed_ms"] = _bn_diag_elapsed_ms(started)
         result["success"] = False
         result["error"] = _bn_diag_error(exc)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
     return result
 
 
@@ -4568,12 +4607,11 @@ def _derived_metrics_lock_for(record: dict[str, Any]) -> threading.Lock:
         or str(record.get("bn_url") or "").strip()
         or f"{record.get('house') or ''}|{record.get('name') or ''}|{record.get('year') or ''}"
     )
-    with _DERIVED_METRICS_LOCK_GUARD:
-        lock = _DERIVED_METRICS_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _DERIVED_METRICS_LOCKS[key] = lock
-        return lock
+    # crc32 (not hash()) so a record maps to the same stripe across restarts
+    # and PYTHONHASHSEED values.
+    return _DERIVED_METRICS_LOCKS[
+        zlib.crc32(key.encode("utf-8")) % _DERIVED_METRICS_LOCK_STRIPES
+    ]
 
 
 def _fill_missing_derived_metrics_once(
@@ -5018,7 +5056,11 @@ def _recover_incomplete_enrichment_job(
             selected.name,
             selected.brand,
         )
-        return None
+        # A raised DB error must stay distinguishable from "no row to recover"
+        # (None): the details handler only degrades unavailable -> completed
+        # when no job state exists at all. "error" is not a recognized job
+        # status, so _enrichment_status_from_job_state maps it to unavailable.
+        return {"status": "error"}
 
 
 def _fetch_parfinity_detail_bundle(
@@ -5113,7 +5155,12 @@ def details(req: DetailRequest) -> dict[str, Any]:
                 recovery_status,
                 recovery_requested_count,
             ) = _enrichment_status_from_job_state(job_state)
-            if recovery_status == "unavailable":
+            if recovery_status == "unavailable" and job_state is None:
+                # No durable row exists for this identity (DB disabled,
+                # parfinity, or a deliberately ignored row) -- serve the stored
+                # payload as final. A raised recovery error returns a non-None
+                # error state instead, which keeps "unavailable" so the SPA
+                # retries rather than treating a partial tile as complete.
                 enrichment_status = "completed"
             else:
                 enrichment_status = recovery_status
