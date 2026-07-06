@@ -4,6 +4,30 @@ Date: 2026-07-06. Companion to `sCAST/docs/AWS_MIGRATION_PLAN.md` (the web app's
 Vercel-removal plan). The web app can move first — the two migrations are independent
 as long as env vars are re-pointed at cutover.
 
+## Implementation status (2026-07-06)
+
+Repo-side work is DONE on this branch; what remains is AWS account work (§5 steps 2-7).
+
+- **`Dockerfile` + `.dockerignore` landed** (§3). Two deliberate additions over the
+  §3 draft: `DRISSION_FORCE_ORIGIN=1` (the DevTools-websocket Origin patch in
+  `fragrance_parser_full_rewrite_fixed.py:58-75` otherwise only activates on
+  `RAILWAY_*` env vars, so off Railway every clearance mint would fail with the
+  DevTools 404 again) and `ARG GIT_COMMIT` → `SOURCE_VERSION`/`GIT_COMMIT` so
+  `/api/diagnostics/runtime` keeps reporting the build after `RAILWAY_GIT_COMMIT_SHA`
+  disappears. `railway.toml` pins `builder = "nixpacks"`, so the Dockerfile is inert
+  on Railway during the parallel run.
+- **`.github/workflows/deploy.yml` landed** (§5 step 8): `run_tests.py` gate on every
+  push/PR; the ECR-push + `apprunner start-deployment` job only activates once the
+  repo variable `AWS_DEPLOY_ENABLED=true` is set (plus `AWS_REGION`,
+  `AWS_DEPLOY_ROLE_ARN`, `ECR_REPOSITORY`, optional `APPRUNNER_SERVICE_ARN`).
+- **Verified in a container build of this image**: `/health` returns `{"ok":true}`
+  without `DATABASE_URL`; Debian's real Chromium and `xvfb-run` resolve on PATH;
+  the Origin patch reports active with no `RAILWAY_*` vars; full test suite 21/21.
+- **Not verifiable from the dev sandbox**: an actual Chromium page render (the
+  sandbox kernel lacks `clone3`, which Debian's Chromium 150 requires — standard
+  AWS kernels have it). This makes §5 step 1's clearance-mint diagnostics test
+  (`POST /api/diagnostics/basenotes/clearance`) **mandatory** before cutover.
+
 ---
 
 ## 1. Current state (audited)

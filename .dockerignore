@@ -1,0 +1,13 @@
+# Keep the image close to what nixpacks shipped: full repo INCLUDING fg_cache/
+# (see docs/AWS_MIGRATION_PLAN.md §2). Only strip VCS, caches, and local tooling.
+.git
+.githooks
+.claude
+.dockerignore
+Dockerfile
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv

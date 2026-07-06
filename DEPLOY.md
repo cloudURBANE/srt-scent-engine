@@ -1,5 +1,11 @@
 # Deploying to Railway
 
+> **AWS migration in progress:** the AWS (App Runner) deployment path lives in
+> `docs/AWS_MIGRATION_PLAN.md` — a `Dockerfile` and a gated GitHub Actions
+> pipeline (`.github/workflows/deploy.yml`, activated by the repo variable
+> `AWS_DEPLOY_ENABLED=true`) are already in the repo. Railway (below) remains
+> the production path until that cutover completes.
+
 ## Files added (engine untouched)
 
 | file                 | purpose                                            |
