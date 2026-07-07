@@ -1,0 +1,49 @@
+# Continuous integration for the Python fragrance engine.
+#
+# The engine stays deployed on Railway's own git integration — this workflow is
+# CI only (no deploy job). It validates that the code compiles and that the
+# repo's OFFLINE test suite passes on every push to main and every pull request.
+#
+# Non-flaky by design: the suite is driven through `run_tests.py`, which is the
+# repo's documented "full offline suite (no DATABASE_URL)" entrypoint. Those
+# tests use monkeypatching and fixed URL/token fixtures — they do NOT hit live
+# scraping targets (Basenotes / Fragrantica / Decodo), so CI never depends on
+# third-party sites or secrets and stays deterministic.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Compile floor: guarantees every module in the repo parses and imports
+      # cleanly, so the job is always meaningful even if the suite is narrowed.
+      - name: Compile all modules
+        run: python -m compileall -q .
+
+      # Offline test suite. run_tests.py auto-discovers every test_*.py and runs
+      # each the way it expects (script-style directly, pytest-style via pytest),
+      # so nothing silently no-ops. It is the repo's offline entrypoint and needs
+      # no DATABASE_URL and no network access.
+      - name: Run offline test suite
+        run: python run_tests.py
