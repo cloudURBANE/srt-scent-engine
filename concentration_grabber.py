@@ -140,7 +140,12 @@ class SemanticScentEngine:
         ("EDT (Eau de Toilette)",       r"eau[- ]de[- ]toilette|\bedt\b"),
         ("EDC (Cologne)",               r"eau[- ]de[- ]cologne"),
         ("Eau Fraiche",                 r"eau[- ]fra[iî]che"),
-        ("Parfum (Profumo)",            r"(?<!eau[- ]de[- ])parfum|profumo"),
+        # Word-bounded like the TAXONOMY twin above: unbounded "parfum" also
+        # matches the generic French "parfums"/"parfumerie" (= perfumes/
+        # perfumery) inside common house/retailer names (e.g. "Parfums de
+        # Marly", "Initio Parfums Prives", "Parfumerie Generale",
+        # "parfumdreams.de"), none of which state a concentration.
+        ("Parfum (Profumo)",            r"(?<!eau[- ]de[- ])\bparfum\b|\bprofumo\b"),
     ]
 
     SIBLING_FALLBACK = {

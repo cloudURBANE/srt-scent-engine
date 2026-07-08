@@ -449,3 +449,37 @@ def test_concentration_meta_marks_ambiguous_helper():
     assert not concentration_meta_marks_ambiguous({"source": "semantic_engine_v6"})
     assert not concentration_meta_marks_ambiguous(None)
     assert not concentration_meta_marks_ambiguous("nope")
+
+
+# --- URL-slug "Parfum (Profumo)" marker must not fire on the generic French
+#     "parfum(s)" (= perfume) inside a brand/retailer name. The TAXONOMY (title)
+#     pattern already word-bounds this (`\bparfum\b`); the URL_SLUG_MARKERS twin
+#     is the literal, highest-priority signal _classify_result checks -- a false
+#     hit here feeds primary_has_literal_support, the ground-truth gate that lets
+#     resolve_concentration_online write straight into the production engine
+#     cache, so an unbounded match silently corrupts ground truth.
+from concentration_grabber import SemanticScentEngine as _SSE  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "slug",
+    [
+        # "Parfums de Marly" / "Initio Parfums Prives": plural house-name noise,
+        # no concentration stated anywhere in the slug.
+        "initio parfums prives oud for happiness",
+        "parfums de marly layton",
+        # "Parfumerie Generale": a house name, not a stated concentration.
+        "parfumerie generale cadjmere",
+        # A retailer domain token, not a product statement.
+        "parfumdreams de sauvage",
+    ],
+)
+def test_url_slug_parfum_marker_ignores_generic_perfume_word(slug):
+    assert _SSE._detect_url_concentration(slug) is None
+
+
+def test_url_slug_parfum_marker_still_detects_real_trailing_parfum():
+    # No-regression: a bare, word-bounded "parfum" token is still a real signal.
+    assert _SSE._detect_url_concentration("chanel no 5 parfum") == "Parfum (Profumo)"
+    assert _SSE._detect_url_concentration("chanel no 5 eau de parfum") == "EDP (Eau de Parfum)"
+    assert _SSE._detect_url_concentration("xerjoff naxos profumo") == "Parfum (Profumo)"
