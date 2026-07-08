@@ -154,21 +154,27 @@ process via `DrissionPage.ChromiumPage`. The default Nixpacks Python image does
 **not** ship a Chromium binary, so on Railway clearance silently fails and the
 search engine falls back to zero Basenotes rows.
 
-`search_engine/nixpacks.toml` installs the OS packages and sets the env vars the
-engine looks for:
+`nixpacks.toml` installs Chromium via **Nix** (not apt) and sets the env vars the
+engine looks for. Ubuntu's apt `chromium`/`chromium-browser` packages are
+snap-transition shims that can't run in Railway's container, so we pin a real
+Nix-managed binary on `PATH`:
 
 ```toml
 [phases.setup]
-aptPkgs = ["chromium", "chromium-driver"]
+nixpkgsArchive = "336eda0d07dc5e2be1f923990ad9fdb6bc8e28e3"
+nixPkgs = ["python311", "gcc", "chromium", "xvfb-run"]
 
 [variables]
 BASENOTES_CHROMIUM_HEADLESS = "1"
-BASENOTES_CHROMIUM_PATH = "/bin/chromium-browser"
+# The web service should NOT spawn Chromium while serving traffic (failed mints
+# leak helper processes and pressure memory). Offline workers/local runs opt back
+# in by overriding this.
+DISABLE_CHROMIUM_MINT = "1"
 ```
 
-`_mint_basenotes_clearance()` reads `BASENOTES_CHROMIUM_PATH` and, when set,
-passes it to `ChromiumOptions.set_browser_path()` so DrissionPage does not have
-to auto-discover the binary.
+`BASENOTES_CHROMIUM_PATH` is intentionally left unset — the mint helpers fall
+back to `shutil.which("chromium")`, which resolves to the Nix binary. Set it
+explicitly only if you need to point at a non-default Chromium.
 
 ### Post-deploy validation
 
@@ -203,3 +209,33 @@ pip install -r requirements.txt
 uvicorn api:app --reload --port 8000
 # http://localhost:8000/health
 ```
+
+## Public launch checklist
+
+Steps to make the engine public-ready alongside the web app. The web app's
+operator checklist lives in the sCAST repo (`docs/USER_LAUNCH_SETUP.md`).
+
+### Required env (API service)
+
+| Variable | Value / notes |
+| --- | --- |
+| `FRONTEND_ORIGINS` | The **production SPA origin** (comma-separated), e.g. `https://app.example.com`. Without it CORS only allows `http://localhost:5173`. |
+| Decodo credentials | The SERP/Decodo proxy creds the engine scrapes through. **Verify them live** after deploy — a stale/expired cred degrades cold search to Basenotes-only / empty results with no hard error. |
+| `DATABASE_URL` | Postgres for the enrichment queue + durable detail cache. |
+| `ENRICHMENT_WORKER_TOKEN` | Long random secret authorizing the offline worker against `/api/enrichment/jobs/*`. **Never** put it on the frontend service. |
+| `DB_POOL_MAX_SIZE` | Pin to **10–15**. Bounds connections against the shared/managed Postgres so a burst can't exhaust its limit. |
+
+### No rate limiting by design
+
+The public search/detail endpoints stay **keyless** so browser calls work for
+logged-out visitors; request quota is enforced in the web layer, not here. Do
+not add engine-side rate limiting.
+
+### Pending ops (run after deploy)
+
+- **E-1** — run the wardrobe-completeness heal sweep.
+- **E-5** — bring up the local/offline enrichment worker.
+- **E-8** — live-validate the search-budget fix on a **cold** (never-cached)
+  search. Cached tests don't count — use the `engine-live-verify` skill (the
+  cold-Decodo-discovery canary) and confirm a populated `results` array with a
+  real family, not an Express-fallback catalog row.
