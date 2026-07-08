@@ -54,26 +54,42 @@ def _exact_name_in(text: str, name: str) -> bool:
     return bool(needle) and f" {needle} " in haystack
 
 
-def _name_is_release_subject(sentence: str, name: str) -> bool:
-    """Require the exact name to lead directly into the release predicate.
+_RELEASE_SUBJECT_TAIL_RE = (
+    r"\s+(?:(?:was|is)\s+)?(?:first\s+)?"
+    r"(?:released|launched|introduced|debuted|created)\s+"
+    r"(?:in|on|during)\s+(?:17|18|19|20)\d{2}\b"
+)
+
+
+def _name_is_release_subject(sentence: str, name: str, brand: str = "") -> bool:
+    """Require the exact name to lead directly into the release predicate,
+    with nothing but the brand (or nothing at all) ahead of it.
 
     A loose token check would bind ``Sauvage`` to ``Sauvage Elixir was released
     in 2021``. Requiring the predicate immediately after the requested name is
     what makes suffix flankers non-matches.
+
+    The mirror-image mistake is a *prefix* flanker: ``Amouage Reflection Gold
+    was released in 2007`` would otherwise satisfy a plain word-boundary check
+    for ``Gold``, misattributing a distinct line extension's launch year to the
+    base fragrance. Guard against that by requiring whatever word (if any)
+    immediately precedes the matched name to be one of the brand's own words —
+    not an unrelated modifier like "Reflection" or "Black".
     """
     normalized = _normal(sentence)
     needle = _normal(name)
     if not normalized or not needle:
         return False
-    return bool(
-        re.search(
-            rf"(?:^|\s){re.escape(needle)}\s+"
-            r"(?:(?:was|is)\s+)?(?:first\s+)?"
-            r"(?:released|launched|introduced|debuted|created)\s+"
-            r"(?:in|on|during)\s+(?:17|18|19|20)\d{2}\b",
-            normalized,
-        )
-    )
+    brand_tokens = _tokens(brand)
+    pattern = re.compile(rf"(?:^|\s){re.escape(needle)}{_RELEASE_SUBJECT_TAIL_RE}")
+    for match in pattern.finditer(normalized):
+        prefix = normalized[: match.start()].rstrip()
+        if not prefix:
+            return True
+        prev_token = prefix.rsplit(" ", 1)[-1]
+        if prev_token in brand_tokens:
+            return True
+    return False
 
 
 def _domain(url: str, fallback: str = "") -> str:
@@ -107,7 +123,7 @@ def extract_year_evidence(
             # The product name must be in the claim itself. Merely appearing in
             # the result title is insufficient because snippets often discuss a
             # sibling or comparison fragrance.
-            if not _exact_name_in(sentence, name) or not _name_is_release_subject(sentence, name):
+            if not _exact_name_in(sentence, name) or not _name_is_release_subject(sentence, name, brand):
                 continue
             # When the brand is stated in the claim, it must be the requested
             # brand. Brand omission is allowed (the exact product name remains).

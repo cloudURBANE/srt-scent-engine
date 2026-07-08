@@ -132,6 +132,40 @@ def test_rejects_bare_years_wrong_products_and_conflicts():
     assert sauvage == []
 
 
+def test_rejects_prefix_flanker_release_statement():
+    """A distinct line extension that PRECEDES the requested name (e.g. 'Black
+    Oud' or 'Reflection Gold') must not donate its launch year to the base
+    fragrance. The existing suffix-flanker guard (Sauvage vs Sauvage Elixir)
+    has no mirror-image guard for a modifier word placed in front of the name,
+    so 'Amouage Reflection Gold was released in 2007' was previously accepted
+    as evidence for plain 'Gold'."""
+    rows = [{
+        "title": "Amouage Reflection Gold",
+        "snippet": "Amouage Reflection Gold was released in 2007 for men.",
+        "url_raw": "https://example.test/reflection-gold",
+    }]
+    evidence = extract_year_evidence(rows, "Amouage", "Gold", now_year=2026)
+    assert evidence == []
+
+    oud_rows = [{
+        "title": "Lattafa Black Oud",
+        "snippet": "Lattafa Black Oud was released in 2018 and quickly became a bestseller.",
+        "url_raw": "https://example.test/black-oud",
+    }]
+    oud_evidence = extract_year_evidence(oud_rows, "Lattafa", "Oud", now_year=2026)
+    assert oud_evidence == []
+
+    # The genuine, non-flanker statement (brand directly precedes name) must
+    # keep working.
+    genuine_rows = [{
+        "title": "Amouage Gold",
+        "snippet": "Amouage Gold was released in 1983 for women.",
+        "url_raw": "https://example.test/gold",
+    }]
+    genuine_evidence = extract_year_evidence(genuine_rows, "Amouage", "Gold", now_year=2026)
+    assert [(item.year, item.domain) for item in genuine_evidence] == [(1983, "example.test")]
+
+
 def test_decodo_uses_bing_to_corroborate_and_stops_on_google_consensus():
     class Client:
         calls = []
