@@ -237,6 +237,42 @@ CREATE TABLE IF NOT EXISTS brand_sweeps (
 """
 
 
+def _tls_hardened_conninfo(url: str) -> str:
+    """Apply verified DB TLS when a CA is provided (readiness gap E3).
+
+    psycopg's default `sslmode=require` encrypts but does NOT verify the server
+    certificate — the exact MITM gap the sCAST web app closed with its
+    DATABASE_SSL_CA support; this mirrors it. `DATABASE_SSL_CA` accepts either
+    a file path or inline PEM content (Railway variables can't hold files).
+    When set, `sslmode=verify-full sslrootcert=<ca>` is appended, which takes
+    precedence over any earlier sslmode in the URL (last occurrence wins in
+    libpq conninfo resolution). When unset, the URL passes through untouched
+    and a boot warning records that the connection is unverified.
+    """
+    ca = os.environ.get("DATABASE_SSL_CA", "").strip()
+    if not ca:
+        logger.warning(
+            "DATABASE_SSL_CA is not set: the engine DB connection is encrypted "
+            "but the server certificate is NOT verified (sslmode<verify-full). "
+            "Provide the CA cert to close the MITM gap."
+        )
+        return url
+    if "-----BEGIN" in ca:
+        import tempfile
+
+        ca_path = os.path.join(tempfile.gettempdir(), "engine_database_ssl_ca.pem")
+        with open(ca_path, "w", encoding="utf-8") as fh:
+            fh.write(ca)
+    else:
+        ca_path = ca
+    if "://" in url:
+        from urllib.parse import quote
+
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}sslmode=verify-full&sslrootcert={quote(ca_path)}"
+    return f"{url} sslmode=verify-full sslrootcert={ca_path}"
+
+
 def init_db() -> None:
     """Create the connection pool and bootstrap the schema. No-op when disabled.
 
@@ -257,7 +293,7 @@ def init_db() -> None:
     # The bound is uniform -- bulk sweeps and the worker /complete share it --
     # so raise it via env on a deploy where write bursts outrank fast reads.
     _pool = ConnectionPool(
-        DATABASE_URL,
+        _tls_hardened_conninfo(DATABASE_URL),
         min_size=1,
         max_size=max_size,
         timeout=_env_float("DB_POOL_ACQUIRE_TIMEOUT", 5.0),
@@ -265,6 +301,29 @@ def init_db() -> None:
     )
     with _pool.connection() as conn:
         conn.execute(_SCHEMA)
+
+
+def ping(timeout: float = 2.0) -> None:
+    """Cheap readiness check (readiness gap E4): acquire + SELECT 1, bounded.
+
+    Raises when the pool is saturated or the database is unreachable — the
+    /readyz endpoint maps that to 503 so a deploy whose DB cannot connect never
+    passes the platform healthcheck and takes traffic.
+    """
+    if _pool is None:
+        raise RuntimeError("db.init_db() has not been called or DATABASE_URL is unset")
+    with _pool.connection(timeout=timeout) as conn:
+        conn.execute("SELECT 1")
+
+
+def close_pool() -> None:
+    """Release pooled connections on shutdown (lifespan teardown, gap E9)."""
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close()
+        finally:
+            _pool = None
 
 
 def _conn():

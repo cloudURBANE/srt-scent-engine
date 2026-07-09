@@ -3,6 +3,9 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "uvicorn api:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
+# /readyz pings the DB pool (readiness gap E4) so a deploy that cannot reach
+# Postgres never passes healthcheck and takes traffic; /health stays the
+# unconditional liveness probe for the frontend.
+healthcheckPath = "/readyz"
 healthcheckTimeout = 100
 restartPolicyType = "on_failure"
