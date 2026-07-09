@@ -41,3 +41,12 @@ audit_runs/
 baseline_*.csv
 baseline_*.xlsx
 baseline_*.audit.json
+
+# Run outputs (readiness gap E8): diagnostic/smoke artifacts that scripts emit
+# into the repo root. Committed once by accident, they rot fast, bloat clones,
+# and risk one day carrying a credential. The tracked fg_cache/*.json bundled
+# caches stay COMMITTED on purpose — they are a live Fragrantica data source on
+# Railway, where live FG fetches are Cloudflare-403'd and cannot regenerate it.
+_diag_*.txt
+decodo_scraper_*.json
+production_verification_results*.json

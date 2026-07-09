@@ -47,3 +47,11 @@ jobs:
       # no DATABASE_URL and no network access.
       - name: Run offline test suite
         run: python run_tests.py
+
+      # Report-only for now (readiness gap E6): surfaces known-vulnerable pinned
+      # deps without blocking merges. Flip to blocking (drop `|| true`) once the
+      # initial findings are triaged, mirroring the sCAST repo's audit gate.
+      - name: Dependency audit (non-blocking)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --skip-editable || true

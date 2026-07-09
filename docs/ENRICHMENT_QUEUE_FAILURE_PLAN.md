@@ -19,8 +19,8 @@ blocked, or ignored because no Fragrantica/usable fallback page exists.
 Read-only commands run from this workspace:
 
 ```powershell
-.\.venv\Scripts\python.exe _inspect_failed_jobs.py
-.\.venv\Scripts\python.exe _inspect_failed_jobs2.py
+.\.venv\Scripts\python.exe scripts/_inspect_failed_jobs.py
+.\.venv\Scripts\python.exe scripts/_inspect_failed_jobs2.py
 .\.venv\Scripts\python.exe test_enrichment.py
 .\.venv\Scripts\python.exe scripts\test_identity_fix.py
 ```

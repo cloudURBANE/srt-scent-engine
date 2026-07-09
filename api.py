@@ -55,6 +55,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import db
+import rate_limit
 from enrichment_facts import (
     FACT_FIELDS,
     actionable_missing_facts,
@@ -349,7 +350,34 @@ async def _lifespan(_app: FastAPI):
     """Bootstrap durable storage. Inert when DATABASE_URL is unset (local dev)."""
     db.init_db()
     _start_basenotes_warmup()
-    yield
+    try:
+        yield
+    finally:
+        # Release pooled DB connections on shutdown (readiness gap E9). Mostly
+        # cosmetic on SIGTERM, but keeps restarts clean of orphaned backends.
+        db.close_pool()
+
+
+# ---------------------------------------------------------------------------
+# Error tracking (readiness gap E1). DSN-gated exactly like the sCAST web app:
+# with SENTRY_DSN unset (local dev, offline CI) this whole block is inert and
+# sentry-sdk need not even be importable. Telemetry must never break boot.
+# ---------------------------------------------------------------------------
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=os.environ.get("RAILWAY_ENVIRONMENT_NAME", "production"),
+            # Errors are the point; tracing stays off unless explicitly enabled.
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0") or 0),
+            # The FastAPI/Starlette integrations auto-enable when present.
+        )
+        logging.getLogger(__name__).info("Sentry error tracking enabled")
+    except Exception:  # pragma: no cover - never let telemetry break boot
+        logging.getLogger(__name__).exception("Sentry init failed; continuing without it")
 
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0", lifespan=_lifespan)
@@ -396,6 +424,26 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Per-IP rate limits on the cost-bearing public endpoints (readiness gap E2).
+# CORS above only constrains browsers; this bounds ANY anonymous caller's
+# Decodo-billed searches and requeue-driven worker burn. Fail-open by design —
+# see rate_limit.py for the rule table and RATE_LIMIT_*_PER_MIN env knobs.
+# ---------------------------------------------------------------------------
+_RATE_RULES = rate_limit.build_rules()
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request, call_next):
+    rejection = rate_limit.check(_RATE_RULES, request)
+    if rejection is not None:
+        return JSONResponse(
+            status_code=rejection["status_code"],
+            content=rejection["content"],
+            headers=rejection["headers"],
+        )
+    return await call_next(request)
 
 # Mobile router: /m/* HTML, /api/m/* JSON (cookie-authed), plus the
 # /api/enrichment/commands/* channel the desktop worker polls.
@@ -2009,6 +2057,26 @@ class RequeueDetailRequest(DetailRequest):
 def health() -> dict[str, bool]:
     """Liveness probe for Railway and the frontend."""
     return {"ok": True}
+
+
+@app.get("/readyz")
+def readyz() -> JSONResponse:
+    """Readiness probe (readiness gap E4): can this instance actually serve?
+
+    /health above answers unconditionally, so a deploy whose DB pool cannot
+    connect still passed the platform healthcheck and took traffic. This probe
+    pings the pool when durable storage is configured — railway.toml's
+    healthcheckPath points here. Deliberately lenient when DATABASE_URL is
+    unset: the JSON-cache-only mode is a supported deployment, not a failure.
+    """
+    if not db.ENABLED:
+        return JSONResponse({"ok": True, "db": "disabled"})
+    try:
+        db.ping()
+    except Exception:
+        logging.getLogger(__name__).exception("readiness probe: DB ping failed")
+        return JSONResponse(status_code=503, content={"ok": False, "db": "unreachable"})
+    return JSONResponse({"ok": True, "db": "ok"})
 
 
 def _read_proc_cmdline(pid: int) -> str:
