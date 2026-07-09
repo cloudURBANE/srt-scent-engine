@@ -7,6 +7,7 @@ derive app-facing taxonomy/context from the engine's existing derived metrics.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 UNKNOWN_TEXT = {"", "unknown", "n/a", "none", "null"}
@@ -152,17 +153,67 @@ _AD_TEXT_MARKERS = (
     "online shop", "shops offers", "shop offers",
 )
 _AD_TEXT_LABELS = {"sponsored", "offers"}
+# Meta/structural page labels that describe the perfume's *anatomy* rather than
+# name a scent. Fragrantica's "Main accords" card sits between the fragrance
+# title/"Fragrance composition" heading and the note pyramid, so when the card
+# container over-captures upward it swallows the composition heading and (rarely)
+# the concentration/notes headings. These land with no bar and thus a full/
+# dominant percentage, sorting them to the TOP of the card (the "FRAGRANCE
+# COMPOSITION shown as a Dominant accord" bug). None of these is ever a real
+# Fragrantica accord, so they are dropped by exact normalized-label match.
+_META_STRUCTURAL_LABELS = frozenset({
+    "fragrance composition", "composition",
+    "fragrance", "fragrances", "perfume", "perfumes", "cologne",
+    "note", "notes", "fragrance notes",
+    "top notes", "middle notes", "heart notes", "base notes",
+    "accord", "accords", "main accord", "main accords",
+    "eau de parfum", "eau de toilette", "eau de cologne",
+    "parfum", "extrait", "extrait de parfum",
+})
 
 
-def is_junk_accord_label(label: Any) -> bool:
+def _normalize_accord_identity(text: Any) -> str:
+    """Casefold, strip accents/diacritics, and collapse punctuation/whitespace.
+
+    Turns "BAL À VERSAILLES" and "Bal a Versailles" both into "bal a versailles"
+    so the fragrance's own name matches its accord-card leak regardless of the
+    accented spelling the source page used, and "Fragrance Composition" into
+    "fragrance composition" for the meta-label set lookup.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(text or ""))
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", stripped.casefold()).strip()
+
+
+# Real accord vocabulary (normalized) used ONLY to guard the self-name rule:
+# a fragrance legitimately named after a real accord word (e.g. a scent called
+# "Amber") must keep that accord, so the self-name filter never drops a label
+# that is itself a known accord.
+_REAL_ACCORD_LABELS = frozenset(
+    _normalize_accord_identity(k) for k in ACCORD_FAMILY_MAP
+)
+
+
+def is_junk_accord_label(
+    label: Any, *, fragrance_name: Any = None, brand: Any = None
+) -> bool:
     """True when an 'accord' label is actually scraped noise rather than a scent.
 
     Catches the leaks that the Fragrantica "Main accords" card picks up when
     its container over-captures adjacent widgets: vote-count tokens (14.9K), the
     love/hate rating buckets (Hate, Like), the "When to wear" season/time buckets
-    (Summer, Night), and stray shopping copy including the "Online shops offers"
-    retailer-widget heading. A real accord is always an alphabetic scent label, so
-    all of these are unambiguously junk.
+    (Summer, Night), stray shopping copy including the "Online shops offers"
+    retailer-widget heading, meta/structural page headings (Fragrance Composition,
+    Eau de Parfum, Notes), and -- when the fragrance's identity is supplied -- the
+    fragrance's OWN name or brand leaking in as an accord (the "BAL À VERSAILLES
+    shown as a Dominant accord" bug). A real accord is always an alphabetic scent
+    label, so all of these are unambiguously junk.
+
+    ``fragrance_name`` / ``brand`` are optional keyword-only identity hints. When
+    omitted the label-only behavior is 100% preserved, so the read/projection
+    backstops that only see a label keep working unchanged; extraction- and
+    compute-time call sites that know the perfume identity pass it through to also
+    catch the self-name leak.
     """
     s = str(label or "").strip()
     if not s:
@@ -174,6 +225,15 @@ def is_junk_accord_label(label: Any) -> bool:
         return True
     if any(marker in low for marker in _AD_TEXT_MARKERS):
         return True
+    norm = _normalize_accord_identity(s)
+    if norm in _META_STRUCTURAL_LABELS:
+        return True
+    # Self-name leak: the perfume's own name/brand is not a scent accord. Guarded
+    # so a fragrance genuinely named after a real accord word keeps that accord.
+    if norm and norm not in _REAL_ACCORD_LABELS:
+        for identity in (fragrance_name, brand):
+            if identity and _normalize_accord_identity(identity) == norm:
+                return True
     return False
 
 

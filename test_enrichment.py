@@ -1628,6 +1628,85 @@ def test_junk_accord_filtering() -> None:
     for real in ["Amber", "Citrus", "Fresh Spicy", "Warm Spicy", "Woody", "Aquatic", "Musky", "Green", "Fresh"]:
         check(f"is_junk_accord_label keeps {real!r}", not enrichment_facts.is_junk_accord_label(real), real)
 
+    # Meta/structural headings that leak from the "Fragrance composition"/notes
+    # region above the accords card (the "FRAGRANCE COMPOSITION as a Dominant
+    # accord" bug). None is ever a real accord.
+    for meta in [
+        "Fragrance Composition", "fragrance composition", "Composition",
+        "Fragrance", "Perfume", "Cologne", "Notes", "Note", "Fragrance Notes",
+        "Top Notes", "Middle Notes", "Base Notes", "Heart Notes",
+        "Main Accords", "Accords", "Accord",
+        "Eau de Parfum", "Eau de Toilette", "Eau de Cologne", "Parfum", "Extrait",
+    ]:
+        check(f"is_junk_accord_label flags meta {meta!r}", enrichment_facts.is_junk_accord_label(meta), meta)
+
+    # Self-name leak: the fragrance's own name/brand is not an accord. Identity is
+    # supplied keyword-only; accent-folding must match "BAL À VERSAILLES" against
+    # the stored "Bal a Versailles".
+    check(
+        "is_junk_accord_label flags the fragrance's own name (exact)",
+        enrichment_facts.is_junk_accord_label("Bal a Versailles", fragrance_name="Bal a Versailles"),
+        "self-name exact",
+    )
+    check(
+        "is_junk_accord_label flags the own name across accent spelling",
+        enrichment_facts.is_junk_accord_label("BAL À VERSAILLES", fragrance_name="Bal a Versailles"),
+        "self-name accent-folded",
+    )
+    check(
+        "is_junk_accord_label flags the brand leaking as an accord",
+        enrichment_facts.is_junk_accord_label("Jean Desprez", brand="Jean Desprez"),
+        "brand self-name",
+    )
+    # Backward compatibility: without identity, a name-shaped label is NOT junk
+    # (label-only backstops must keep working exactly as before).
+    check(
+        "single-arg call does not treat a name-shaped label as junk",
+        not enrichment_facts.is_junk_accord_label("Bal a Versailles"),
+        "no identity supplied",
+    )
+    # Edge case: a fragrance legitimately named after a real accord word keeps
+    # that accord even when identity IS the name -- the self-name rule is guarded
+    # by the real-accord vocabulary so "Amber" (the scent) survives.
+    check(
+        "self-name rule never drops a label that is itself a real accord",
+        not enrichment_facts.is_junk_accord_label("Amber", fragrance_name="Amber", brand="Prada"),
+        "real-accord-named fragrance",
+    )
+    # Real accords for Bal à Versailles must all survive the identity-aware filter.
+    for real in ["Amber", "Powdery", "Woody", "Animalic", "Musky", "Balsamic", "Warm Spicy", "White Floral"]:
+        check(
+            f"identity-aware filter keeps real accord {real!r} for Bal a Versailles",
+            not enrichment_facts.is_junk_accord_label(real, fragrance_name="Bal a Versailles", brand="Jean Desprez"),
+            real,
+        )
+
+    # End-to-end at compute time: a Bal à Versailles card polluted with its own
+    # name + "Fragrance Composition" (both carrying dominant %) must rebuild clean,
+    # with the real accords retained and correctly ordered.
+    bal_card = [
+        {"label": "Bal à Versailles", "pct": 100.0},
+        {"label": "Fragrance Composition", "pct": 99.0},
+        {"label": "Amber", "pct": 90.0}, {"label": "Powdery", "pct": 82.0},
+        {"label": "Woody", "pct": 71.0}, {"label": "Animalic", "pct": 63.0},
+        {"label": "Musky", "pct": 55.0}, {"label": "Balsamic", "pct": 48.0},
+        {"label": "Warm Spicy", "pct": 40.0}, {"label": "White Floral", "pct": 33.0},
+    ]
+    bal = UnifiedDetails(notes=NotesList(), name="Bal à Versailles", brand="Jean Desprez")
+    bal.frag_cards = {"Main accords": bal_card}
+    bal_dm = build_derived_metrics(bal)
+    bal_top = (bal_dm.get("main_accords") or {}).get("top_accords") or []
+    check(
+        "compute-time drops the self-name and meta headings from Bal a Versailles",
+        "Bal à Versailles" not in bal_top and "Fragrance Composition" not in bal_top,
+        str(bal_top),
+    )
+    check(
+        "compute-time keeps and leads with the real Bal a Versailles accords",
+        bal_top[:3] == ["Amber", "Powdery", "Woody"],
+        str(bal_top),
+    )
+
     # This is exactly Dylan Blue's polluted "Main accords" card: 10 real accords
     # followed by 11 leaked rating/vote-count bars carrying high percentages.
     polluted_card = [
