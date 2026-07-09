@@ -64,6 +64,22 @@ return `503`. The existing bundled JSON detail cache keeps working unchanged.
   saturated uncached requests return `503` with `Retry-After: 2` instead of
   piling up resolver threads. For heavy traffic, scale via Railway replicas or
   add `--workers N` to the start command.
+- **Capacity ceiling (readiness gap E9):** the deploy is ONE uvicorn worker —
+  a single GIL-bound process with anyio's ~40-thread pool for sync routes. Fine
+  at MVP traffic. **Scale-out trigger:** sustained CPU-bound search latency
+  (p95 climbing while the 503 saturation guards are NOT firing). **Plan:**
+  prefer `--workers N` on one service first (shared filesystem caches stay
+  coherent); Railway replicas only after re-examining the in-process state —
+  per-IP rate-limit windows (rate_limit.py), the live-work semaphores, and the
+  clearance-session reuse are all per-process and would multiply per replica.
+- Per-IP rate limits protect the cost-bearing endpoints (search / image-search
+  / details / requeue) with `RATE_LIMIT_*_PER_MIN` env knobs — see
+  rate_limit.py. `0` disables a rule. Fail-open by design.
+- Error tracking: set `SENTRY_DSN` on the Railway service to enable Sentry
+  (inert when unset). `SENTRY_TRACES_SAMPLE_RATE` optionally enables tracing.
+- Verified DB TLS: set `DATABASE_SSL_CA` (PEM content or file path) to upgrade
+  the Postgres connection to `sslmode=verify-full`; unset logs a boot warning
+  and connects unverified (encrypted, but MITM-able).
 
 ## Search provider env
 
