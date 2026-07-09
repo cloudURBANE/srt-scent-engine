@@ -1,0 +1,24 @@
+# Dependency scanning (readiness gap E6). Requirements are pinned — good for
+# reproducibility, but nothing ever bumped or audited them before this.
+# cloudscraper / curl_cffi / DrissionPage are exactly the kind of fast-moving
+# scraping deps that accumulate CVEs. Weekly PRs; CI (compileall + full offline
+# suite) is the merge gate. NOTE: Chromium/nixpacks pinning (nixpacks.toml) is
+# deliberately NOT touched by automation — the mint stack is version-sensitive
+# (DrissionPage x Chromium compat), refresh it manually per DEPLOY.md.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
