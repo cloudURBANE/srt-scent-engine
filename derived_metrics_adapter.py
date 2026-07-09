@@ -430,14 +430,21 @@ def _main_accords(details: Any) -> dict[str, Any] | None:
     if not metrics:
         return None
 
+    # Identity hints so the junk filter also drops the fragrance's own name/brand
+    # if it leaked into the accord card (the "BAL À VERSAILLES as a Dominant
+    # accord" bug). Absent identity, the label-only filter still applies.
+    frag_name = getattr(details, "name", None)
+    frag_brand = getattr(details, "brand", None)
+
     vector: list[dict[str, Any]] = []
     for m in metrics:
         label = str(m.get("label", "")).strip()
         if not label:
             continue
-        # Drop scraped vote-count / rating-word leakage (14.9K, Hate, ...) so the
-        # junk never enters the stored blob nor sorts above the real accords.
-        if is_junk_accord_label(label):
+        # Drop scraped vote-count / rating-word leakage (14.9K, Hate, ...), meta
+        # headings (Fragrance Composition), and self-name leaks so the junk never
+        # enters the stored blob nor sorts above the real accords.
+        if is_junk_accord_label(label, fragrance_name=frag_name, brand=frag_brand):
             continue
         try:
             score = float(m.get("pct") or 0.0)

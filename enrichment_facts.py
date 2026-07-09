@@ -7,6 +7,7 @@ derive app-facing taxonomy/context from the engine's existing derived metrics.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 UNKNOWN_TEXT = {"", "unknown", "n/a", "none", "null"}
@@ -152,17 +153,97 @@ _AD_TEXT_MARKERS = (
     "online shop", "shops offers", "shop offers",
 )
 _AD_TEXT_LABELS = {"sponsored", "offers"}
+# Meta/structural page labels that describe the perfume's *anatomy* rather than
+# name a scent. Fragrantica's "Main accords" card sits between the fragrance
+# title/"Fragrance composition" heading and the note pyramid, so when the card
+# container over-captures upward it swallows the composition heading and (rarely)
+# the concentration/notes headings. These land with no bar and thus a full/
+# dominant percentage, sorting them to the TOP of the card (the "FRAGRANCE
+# COMPOSITION shown as a Dominant accord" bug). None of these is ever a real
+# Fragrantica accord, so they are dropped by exact normalized-label match.
+#
+# This frozenset is the SINGLE authority for structural page-heading labels that
+# must never be treated as accords. It intentionally absorbs the structural
+# strings that used to live only in the review-block reject regex in
+# fragrance_parser_full_rewrite_fixed.py (extract_reviews: "perfume rating",
+# "main accords", "similar perfumes", "add your review", ...) so there is one
+# place to reason about "is this string a Fragrantica page heading?" -- do not
+# start a competing list elsewhere; extend this one.
+#
+# Every entry below is either an observed leak or an unambiguous non-accord:
+#   * The first block is the composition/notes/concentration anatomy region that
+#     sits directly above the accords card (the "FRAGRANCE COMPOSITION" bug).
+#   * The second block is the sibling Fragrantica stat cards that sit directly
+#     BELOW/around the accords card -- their titles and dominant bucket labels
+#     were seen verbatim as frag_cards keys ("Community Interest",
+#     "Fragrantica Rating", "Rating Distribution", "Price Value", "When to wear",
+#     "Longevity", "Sillage", "Projection", "Gender") in the cached corpus. Any
+#     of these can bleed in with a full/dominant % when the card container
+#     over-captures a neighbouring widget. None is a real accord (verified: no
+#     entry collides with ACCORD_FAMILY_MAP), so blocking them is loss-free.
+_META_STRUCTURAL_LABELS = frozenset({
+    # -- composition / notes / concentration anatomy (above the accords card) --
+    "fragrance composition", "composition",
+    "fragrance", "fragrances", "perfume", "perfumes", "cologne",
+    "note", "notes", "fragrance notes",
+    "top notes", "middle notes", "heart notes", "base notes",
+    "accord", "accords", "main accord", "main accords",
+    "eau de parfum", "eau de toilette", "eau de cologne",
+    "parfum", "extrait", "extrait de parfum",
+    # -- sibling stat-card titles / headings (around the accords card) --
+    "rating", "ratings", "perfume rating", "fragrantica rating",
+    "rating distribution", "community interest", "price value",
+    "when to wear", "longevity", "sillage", "projection", "gender",
+    "pros and cons", "pros", "cons", "review", "reviews",
+    "similar perfumes", "add your review", "read more",
+    # Community-interest ownership buckets ("Have"/"Had"/"Want") that bleed from
+    # the adjacent Community Interest widget (seen as dominant rows in the cache).
+    "have", "had", "want",
+})
 
 
-def is_junk_accord_label(label: Any) -> bool:
+def _normalize_accord_identity(text: Any) -> str:
+    """Casefold, strip accents/diacritics, and collapse punctuation/whitespace.
+
+    Turns "BAL À VERSAILLES" and "Bal a Versailles" both into "bal a versailles"
+    so the fragrance's own name matches its accord-card leak regardless of the
+    accented spelling the source page used, and "Fragrance Composition" into
+    "fragrance composition" for the meta-label set lookup.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(text or ""))
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", stripped.casefold()).strip()
+
+
+# Real accord vocabulary (normalized) used ONLY to guard the self-name rule:
+# a fragrance legitimately named after a real accord word (e.g. a scent called
+# "Amber") must keep that accord, so the self-name filter never drops a label
+# that is itself a known accord.
+_REAL_ACCORD_LABELS = frozenset(
+    _normalize_accord_identity(k) for k in ACCORD_FAMILY_MAP
+)
+
+
+def is_junk_accord_label(
+    label: Any, *, fragrance_name: Any = None, brand: Any = None
+) -> bool:
     """True when an 'accord' label is actually scraped noise rather than a scent.
 
     Catches the leaks that the Fragrantica "Main accords" card picks up when
     its container over-captures adjacent widgets: vote-count tokens (14.9K), the
     love/hate rating buckets (Hate, Like), the "When to wear" season/time buckets
-    (Summer, Night), and stray shopping copy including the "Online shops offers"
-    retailer-widget heading. A real accord is always an alphabetic scent label, so
-    all of these are unambiguously junk.
+    (Summer, Night), stray shopping copy including the "Online shops offers"
+    retailer-widget heading, meta/structural page headings (Fragrance Composition,
+    Eau de Parfum, Notes), and -- when the fragrance's identity is supplied -- the
+    fragrance's OWN name or brand leaking in as an accord (the "BAL À VERSAILLES
+    shown as a Dominant accord" bug). A real accord is always an alphabetic scent
+    label, so all of these are unambiguously junk.
+
+    ``fragrance_name`` / ``brand`` are optional keyword-only identity hints. When
+    omitted the label-only behavior is 100% preserved, so the read/projection
+    backstops that only see a label keep working unchanged; extraction- and
+    compute-time call sites that know the perfume identity pass it through to also
+    catch the self-name leak.
     """
     s = str(label or "").strip()
     if not s:
@@ -174,6 +255,15 @@ def is_junk_accord_label(label: Any) -> bool:
         return True
     if any(marker in low for marker in _AD_TEXT_MARKERS):
         return True
+    norm = _normalize_accord_identity(s)
+    if norm in _META_STRUCTURAL_LABELS:
+        return True
+    # Self-name leak: the perfume's own name/brand is not a scent accord. Guarded
+    # so a fragrance genuinely named after a real accord word keeps that accord.
+    if norm and norm not in _REAL_ACCORD_LABELS:
+        for identity in (fragrance_name, brand):
+            if identity and _normalize_accord_identity(identity) == norm:
+                return True
     return False
 
 
@@ -190,7 +280,9 @@ def _accord_summary_from_top(top: list[str]) -> str:
     return f"A {top[0].lower()} fragrance with {tail} facets."
 
 
-def sanitize_derived_metrics(derived_metrics: Any) -> bool:
+def sanitize_derived_metrics(
+    derived_metrics: Any, *, fragrance_name: Any = None, brand: Any = None
+) -> bool:
     """Strip scraped-junk accord labels from a stored derived_metrics blob, in place.
 
     ``build_derived_metrics`` drops junk (vote counts like 14.9K, the Hate/Like
@@ -207,19 +299,30 @@ def sanitize_derived_metrics(derived_metrics: Any) -> bool:
     the clean accord set without a network recompute. It mutates ``main_accords``
     in place (the blob is always a freshly deserialized copy at the call sites)
     and returns ``True`` when it removed at least one junk entry.
+
+    ``fragrance_name`` / ``brand`` are optional keyword-only identity hints. When
+    omitted (the default at every read/projection backstop) the label-only
+    behavior is 100% preserved, so the vote-count/meta classes still self-heal on
+    read. The self-name class canonically CANNOT self-heal without identity -- so
+    the one-shot backfill (scripts/backfill_selfname_accords.py) passes the row's
+    house+name here to converge already-stored self-name pollution too.
     """
     if not isinstance(derived_metrics, dict):
         return False
     main = derived_metrics.get("main_accords")
     if not isinstance(main, dict):
         return False
+
+    def _junk(label: Any) -> bool:
+        return is_junk_accord_label(label, fragrance_name=fragrance_name, brand=brand)
+
     changed = False
     vector = main.get("scent_vector")
     if isinstance(vector, list):
         cleaned = [
             item
             for item in vector
-            if isinstance(item, dict) and not is_junk_accord_label(item.get("accord"))
+            if isinstance(item, dict) and not _junk(item.get("accord"))
         ]
         if len(cleaned) != len(vector):
             # Re-sort so the highest-scoring real accord leads the card now that
@@ -232,18 +335,24 @@ def sanitize_derived_metrics(derived_metrics: Any) -> bool:
         cleaned_top = [
             s
             for item in top
-            if (s := str(item).strip()) and not is_junk_accord_label(s)
+            if (s := str(item).strip()) and not _junk(s)
         ]
         if cleaned_top != [str(item).strip() for item in top]:
             main["top_accords"] = cleaned_top
             changed = True
     summary = main.get("accord_summary")
     if isinstance(summary, str) and any(
-        is_junk_accord_label(part)
+        _junk(part)
         for part in re.split(r"[^A-Za-z]+", summary)
         if part.strip()
     ):
-        clean_top = top_accords_from({"derived_metrics": {"main_accords": main}})
+        # Rebuild from the now-clean top_accords list (identity already applied
+        # above), so a self-name/meta word in the prose summary is dropped too.
+        clean_top = [
+            s
+            for item in (main.get("top_accords") or [])
+            if (s := str(item).strip()) and not _junk(s)
+        ]
         rebuilt = _accord_summary_from_top(clean_top)
         if rebuilt != summary:
             main["accord_summary"] = rebuilt
@@ -251,8 +360,15 @@ def sanitize_derived_metrics(derived_metrics: Any) -> bool:
     return changed
 
 
-def sanitize_frag_cards(frag_cards: Any) -> bool:
-    """Strip junk rows from raw Fragrantica Main accords frag_cards in place."""
+def sanitize_frag_cards(
+    frag_cards: Any, *, fragrance_name: Any = None, brand: Any = None
+) -> bool:
+    """Strip junk rows from raw Fragrantica Main accords frag_cards in place.
+
+    Identity hints are optional and keyword-only; omitting them preserves the
+    label-only behavior. The backfill passes the row's house+name so a self-name
+    row leaked into the raw card is dropped from the stored ``frag_cards`` too.
+    """
     if not isinstance(frag_cards, dict):
         return False
     changed = False
@@ -267,7 +383,7 @@ def sanitize_frag_cards(frag_cards: Any) -> bool:
                 cleaned.append(row)
                 continue
             label = row.get("label") or row.get("accord") or row.get("name") or row.get("display")
-            if is_junk_accord_label(label):
+            if is_junk_accord_label(label, fragrance_name=fragrance_name, brand=brand):
                 continue
             cleaned.append(row)
         if len(cleaned) != len(rows):

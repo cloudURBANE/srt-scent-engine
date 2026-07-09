@@ -1628,6 +1628,85 @@ def test_junk_accord_filtering() -> None:
     for real in ["Amber", "Citrus", "Fresh Spicy", "Warm Spicy", "Woody", "Aquatic", "Musky", "Green", "Fresh"]:
         check(f"is_junk_accord_label keeps {real!r}", not enrichment_facts.is_junk_accord_label(real), real)
 
+    # Meta/structural headings that leak from the "Fragrance composition"/notes
+    # region above the accords card (the "FRAGRANCE COMPOSITION as a Dominant
+    # accord" bug). None is ever a real accord.
+    for meta in [
+        "Fragrance Composition", "fragrance composition", "Composition",
+        "Fragrance", "Perfume", "Cologne", "Notes", "Note", "Fragrance Notes",
+        "Top Notes", "Middle Notes", "Base Notes", "Heart Notes",
+        "Main Accords", "Accords", "Accord",
+        "Eau de Parfum", "Eau de Toilette", "Eau de Cologne", "Parfum", "Extrait",
+    ]:
+        check(f"is_junk_accord_label flags meta {meta!r}", enrichment_facts.is_junk_accord_label(meta), meta)
+
+    # Self-name leak: the fragrance's own name/brand is not an accord. Identity is
+    # supplied keyword-only; accent-folding must match "BAL À VERSAILLES" against
+    # the stored "Bal a Versailles".
+    check(
+        "is_junk_accord_label flags the fragrance's own name (exact)",
+        enrichment_facts.is_junk_accord_label("Bal a Versailles", fragrance_name="Bal a Versailles"),
+        "self-name exact",
+    )
+    check(
+        "is_junk_accord_label flags the own name across accent spelling",
+        enrichment_facts.is_junk_accord_label("BAL À VERSAILLES", fragrance_name="Bal a Versailles"),
+        "self-name accent-folded",
+    )
+    check(
+        "is_junk_accord_label flags the brand leaking as an accord",
+        enrichment_facts.is_junk_accord_label("Jean Desprez", brand="Jean Desprez"),
+        "brand self-name",
+    )
+    # Backward compatibility: without identity, a name-shaped label is NOT junk
+    # (label-only backstops must keep working exactly as before).
+    check(
+        "single-arg call does not treat a name-shaped label as junk",
+        not enrichment_facts.is_junk_accord_label("Bal a Versailles"),
+        "no identity supplied",
+    )
+    # Edge case: a fragrance legitimately named after a real accord word keeps
+    # that accord even when identity IS the name -- the self-name rule is guarded
+    # by the real-accord vocabulary so "Amber" (the scent) survives.
+    check(
+        "self-name rule never drops a label that is itself a real accord",
+        not enrichment_facts.is_junk_accord_label("Amber", fragrance_name="Amber", brand="Prada"),
+        "real-accord-named fragrance",
+    )
+    # Real accords for Bal à Versailles must all survive the identity-aware filter.
+    for real in ["Amber", "Powdery", "Woody", "Animalic", "Musky", "Balsamic", "Warm Spicy", "White Floral"]:
+        check(
+            f"identity-aware filter keeps real accord {real!r} for Bal a Versailles",
+            not enrichment_facts.is_junk_accord_label(real, fragrance_name="Bal a Versailles", brand="Jean Desprez"),
+            real,
+        )
+
+    # End-to-end at compute time: a Bal à Versailles card polluted with its own
+    # name + "Fragrance Composition" (both carrying dominant %) must rebuild clean,
+    # with the real accords retained and correctly ordered.
+    bal_card = [
+        {"label": "Bal à Versailles", "pct": 100.0},
+        {"label": "Fragrance Composition", "pct": 99.0},
+        {"label": "Amber", "pct": 90.0}, {"label": "Powdery", "pct": 82.0},
+        {"label": "Woody", "pct": 71.0}, {"label": "Animalic", "pct": 63.0},
+        {"label": "Musky", "pct": 55.0}, {"label": "Balsamic", "pct": 48.0},
+        {"label": "Warm Spicy", "pct": 40.0}, {"label": "White Floral", "pct": 33.0},
+    ]
+    bal = UnifiedDetails(notes=NotesList(), name="Bal à Versailles", brand="Jean Desprez")
+    bal.frag_cards = {"Main accords": bal_card}
+    bal_dm = build_derived_metrics(bal)
+    bal_top = (bal_dm.get("main_accords") or {}).get("top_accords") or []
+    check(
+        "compute-time drops the self-name and meta headings from Bal a Versailles",
+        "Bal à Versailles" not in bal_top and "Fragrance Composition" not in bal_top,
+        str(bal_top),
+    )
+    check(
+        "compute-time keeps and leads with the real Bal a Versailles accords",
+        bal_top[:3] == ["Amber", "Powdery", "Woody"],
+        str(bal_top),
+    )
+
     # This is exactly Dylan Blue's polluted "Main accords" card: 10 real accords
     # followed by 11 leaked rating/vote-count bars carrying high percentages.
     polluted_card = [
@@ -1714,6 +1793,167 @@ def test_junk_accord_filtering() -> None:
         "sanitize_derived_metrics is a no-op when there is no main_accords group",
         enrichment_facts.sanitize_derived_metrics({"performance_score": {"score_raw": 5}}) is False,
         "missing main_accords",
+    )
+
+
+def test_accord_leak_hardening() -> None:
+    """Corpus-wide leak sweep + gap 2/3/4 hardening guards (no DATABASE_URL required)."""
+    print("Accord-leak hardening (broad corpus sweep + backfill; no DATABASE_URL required):")
+    import json
+    import os
+
+    import enrichment_facts as ef
+
+    # -- Gap 2: the sibling Fragrantica stat-card headings that used to leak as
+    #    Dominant accords are now caught by the single meta authority, and NONE
+    #    collides with a real accord (loss-free). --
+    for heading in [
+        "Perfume Rating", "Fragrantica Rating", "Rating", "Rating Distribution",
+        "Community Interest", "Price Value", "When To Wear", "Longevity",
+        "Sillage", "Projection", "Gender", "Pros And Cons", "Reviews",
+        "Similar Perfumes", "Add Your Review", "Have", "Had", "Want",
+    ]:
+        check(f"meta authority now catches sibling-card heading {heading!r}",
+              ef.is_junk_accord_label(heading), heading)
+    check(
+        "no meta-structural label collides with a real accord",
+        not (ef._META_STRUCTURAL_LABELS & ef._REAL_ACCORD_LABELS),
+        str(ef._META_STRUCTURAL_LABELS & ef._REAL_ACCORD_LABELS),
+    )
+    for real in ef.ACCORD_FAMILY_MAP:
+        check(f"real accord {real!r} survives the expanded meta set",
+              not ef.is_junk_accord_label(real), real)
+
+    # -- Broad data sweep: every real fragrance data point the repo ships with.
+    #    All labels must classify as real accords under the hardened predicate
+    #    (with each row's own identity). This is the regression guard that the
+    #    shipped corpus stays leak-free. --
+    cache_path = os.path.join(os.path.dirname(__file__), "fg_cache", "fg_detail_cache_v1.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            entries = (json.load(f) or {}).get("entries") or {}
+        scanned = with_cards = labels = leaks = idents = self_caught = 0
+        for v in entries.values():
+            if not isinstance(v, dict):
+                continue
+            scanned += 1
+            name = v.get("name") or ""
+            house = v.get("house") or ""
+            if name:
+                idents += 1
+                # Injection stress: the row's OWN name, if it leaked, must be
+                # dropped once identity is supplied (guarantees new fragrances too).
+                if ef.is_junk_accord_label(name, fragrance_name=name, brand=house):
+                    self_caught += 1
+            fc = v.get("frag_cards") or {}
+            has = False
+            for cn, rows in (fc.items() if isinstance(fc, dict) else []):
+                if "main accord" not in str(cn).lower() or not isinstance(rows, list):
+                    continue
+                for r in rows:
+                    lbl = (r.get("label") or r.get("display") or r.get("accord")) if isinstance(r, dict) else r
+                    if not lbl:
+                        continue
+                    has = True
+                    labels += 1
+                    # Identity-aware: a real accord must NEVER be dropped, and no
+                    # junk may survive.
+                    if ef.is_junk_accord_label(lbl, fragrance_name=name, brand=house):
+                        leaks += 1
+                        print(f"    LEAK {house} / {name}: {lbl!r}")
+            if has:
+                with_cards += 1
+        print(f"    corpus: scanned={scanned} with_accord_cards={with_cards} labels={labels}")
+        check(
+            "broad corpus sweep finds ZERO accord leaks under the hardened predicate",
+            leaks == 0, f"{leaks} leaks across {labels} labels",
+        )
+        check(
+            "every real identity's own name is caught once identity is supplied",
+            idents > 0 and self_caught == idents, f"{self_caught}/{idents}",
+        )
+
+    # -- Gap 4a: the meta class self-heals on READ (label-only) -- a legacy blob
+    #    with a meta heading in BOTH scent_vector and top_accords reads clean with
+    #    no identity, so projection never copies it forward. --
+    legacy_meta = {
+        "main_accords": {
+            "scent_vector": [
+                {"accord": "Fragrance Composition", "score": 100.0},
+                {"accord": "Amber", "score": 90.0},
+                {"accord": "Woody", "score": 70.0},
+            ],
+            "top_accords": ["Fragrance Composition", "Amber", "Woody"],
+        }
+    }
+    healed = ef.sanitize_derived_metrics(legacy_meta)
+    check(
+        "meta leak self-heals on read WITHOUT identity (scent_vector + list)",
+        healed is True
+        and [v["accord"] for v in legacy_meta["main_accords"]["scent_vector"]] == ["Amber", "Woody"]
+        and legacy_meta["main_accords"]["top_accords"] == ["Amber", "Woody"],
+        str(legacy_meta["main_accords"]),
+    )
+
+    # -- Gap 4b: the SELF-NAME class canonically CANNOT self-heal label-only, but
+    #    DOES converge once the row identity is threaded through (what the backfill
+    #    script does). This proves both the gap and its remedy. --
+    def _fresh_selfname_blob():
+        return {
+            "main_accords": {
+                "scent_vector": [
+                    {"accord": "Bal a Versailles", "score": 100.0},
+                    {"accord": "Amber", "score": 90.0},
+                    {"accord": "Powdery", "score": 80.0},
+                ],
+                "top_accords": ["Bal a Versailles", "Amber", "Powdery"],
+                "accord_summary": "A bal a versailles fragrance with amber and powdery facets.",
+            }
+        }
+
+    label_only = _fresh_selfname_blob()
+    check(
+        "self-name does NOT self-heal label-only (why the backfill is needed)",
+        ef.sanitize_derived_metrics(label_only) is False,
+        str(label_only["main_accords"]["top_accords"]),
+    )
+    with_identity = _fresh_selfname_blob()
+    fixed = ef.sanitize_derived_metrics(
+        with_identity, fragrance_name="Bal a Versailles", brand="Jean Desprez"
+    )
+    top = with_identity["main_accords"]["top_accords"]
+    check(
+        "identity-aware sanitize converges stored self-name pollution",
+        fixed is True and top == ["Amber", "Powdery"]
+        and [v["accord"] for v in with_identity["main_accords"]["scent_vector"]] == ["Amber", "Powdery"],
+        str(with_identity["main_accords"]),
+    )
+    check(
+        "identity-aware sanitize rebuilds the prose summary without the self-name",
+        "bal a versailles" not in with_identity["main_accords"]["accord_summary"].lower(),
+        with_identity["main_accords"]["accord_summary"],
+    )
+    check(
+        "identity-aware sanitize is idempotent (second pass no-ops)",
+        ef.sanitize_derived_metrics(
+            with_identity, fragrance_name="Bal a Versailles", brand="Jean Desprez"
+        ) is False,
+        "second pass should not report a change",
+    )
+
+    # -- Gap 3: exact-match self-name stays conservative on purpose. A naive
+    #    substring/token rule would drop real accords that are a token of the
+    #    name (e.g. "Tobacco" of "Tobacco Vanille"); the guarded exact rule keeps
+    #    them. Prove the real accord survives even though it IS a name token. --
+    check(
+        "token-of-name real accord 'Tobacco' survives for 'Tobacco Vanille'",
+        not ef.is_junk_accord_label("Tobacco", fragrance_name="Tobacco Vanille", brand="Tom Ford"),
+        "conservative exact-match self-name rule",
+    )
+    check(
+        "token-of-name real accord 'Tuberose' survives for a Tuberose fragrance",
+        not ef.is_junk_accord_label("Tuberose", fragrance_name="Gianni Versace Couture Tuberose", brand="Versace"),
+        "conservative exact-match self-name rule",
     )
 
 
@@ -3867,6 +4107,7 @@ def main() -> int:
     test_completeness_self_heal_sweep()
     test_recompute_derived_metrics_sweep()
     test_junk_accord_filtering()
+    test_accord_leak_hardening()
     test_vote_count_parse_is_crash_proof()
     test_parfumo_partial_self_heal_alignment()
     test_actionable_missing_contract()

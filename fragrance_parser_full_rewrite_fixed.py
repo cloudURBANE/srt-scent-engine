@@ -162,6 +162,13 @@ def notes_layers_populated(notes: NotesList) -> bool:
 @dataclass
 class UnifiedDetails:
     notes: NotesList
+    # Resolved identity of the fragrance this detail belongs to. Populated from
+    # the selected UnifiedFragrance so the accord junk filter can drop the
+    # fragrance's OWN name/brand if it leaks into the "Main accords" card (the
+    # "BAL À VERSAILLES shown as a Dominant accord" bug). Default "" keeps every
+    # existing keyword construction and the label-only filter path unchanged.
+    name: str = ""
+    brand: str = ""
     gender: str = "Unisex / Unspecified"
     description: str = ""
     # Launch year mined from durable structured page sources (the description
@@ -8557,7 +8564,11 @@ class FragranticaEngine:
             unified_details.frag_cards.setdefault("Fragrantica Rating", []).append(rating)
 
         # Surgical Main Accords extraction
-        accords = FragranticaEngine.extract_main_accords(soup)
+        accords = FragranticaEngine.extract_main_accords(
+            soup,
+            fragrance_name=getattr(unified_details, "name", "") or "",
+            brand=getattr(unified_details, "brand", "") or "",
+        )
         if accords:
             unified_details.frag_cards.setdefault("Main accords", []).extend(accords)
 
@@ -8755,8 +8766,16 @@ class FragranticaEngine:
         return ""
 
     @staticmethod
-    def extract_main_accords(soup: BeautifulSoup) -> list[dict[str, Any]]:
-        """Surgical extraction dedicated to Main Accords, actively bypassing hidden screen reader strings."""
+    def extract_main_accords(
+        soup: BeautifulSoup, *, fragrance_name: str = "", brand: str = ""
+    ) -> list[dict[str, Any]]:
+        """Surgical extraction dedicated to Main Accords, actively bypassing hidden screen reader strings.
+
+        ``fragrance_name`` / ``brand`` are optional identity hints forwarded to
+        :func:`is_junk_accord_label` so the fragrance's own name/brand (e.g. "Bal
+        à Versailles") is dropped if the card container over-captures it as an
+        accord. Omitting them preserves the label-only filtering behavior.
+        """
         from enrichment_facts import is_junk_accord_label
         header = soup.find(lambda tag: getattr(tag, "name", None) in {"h2", "h3", "h4", "div", "span", "b", "p"} and "main accords" in tag.get_text(" ", strip=True).lower())
         if not header:
@@ -8803,10 +8822,11 @@ class FragranticaEngine:
                 for t in texts:
                     if re.match(r"^[\d.,%()]+$", t):
                         continue
-                    # Drop vote-count ("14.9K") / love-hate rating ("Hate") bars
-                    # that bleed in from the adjacent Rating Distribution widget
-                    # when the card container over-captures -- those aren't accords.
-                    if is_junk_accord_label(t):
+                    # Drop vote-count ("14.9K") / love-hate rating ("Hate") bars,
+                    # meta headings ("Fragrance Composition"), and self-name leaks
+                    # ("Bal à Versailles") that bleed in when the card container
+                    # over-captures -- none of those are accords.
+                    if is_junk_accord_label(t, fragrance_name=fragrance_name, brand=brand):
                         continue
                     # Hard-skip tiny connector words that slip past the phrase blocks
                     if t.lower() in {"or", "and", "at", "on", "in", "by", "for", "buy"}:
@@ -11636,6 +11656,10 @@ def search_once(scraper, query: str, args, timing: dict[str, Any] | None = None)
 
 def fetch_selected_details(scraper, selected: UnifiedFragrance, detail_timeout: float) -> UnifiedDetails:
     details = UnifiedDetails(notes=NotesList())
+    # Carry the resolved identity onto the detail so downstream accord extraction
+    # and metric computation can reject the fragrance's own name/brand as an accord.
+    details.name = getattr(selected, "name", "") or ""
+    details.brand = getattr(selected, "brand", "") or ""
     deadline = Deadline(detail_timeout)
     # Fragrantica first — required source and canonical note identity. Parallel
     # BN+FG detail fetch used to race and merge duplicate pyramids (e.g. BN
