@@ -9,7 +9,7 @@ treats the two databases as separate systems; so does DR.
 
 | Data | Table(s) | Loss impact |
 | --- | --- | --- |
-| Enrichment job queue | `worker_jobs` (+ status/lease columns) | Low–medium: pending jobs are re-enqueued by the SPA self-heal loop over time |
+| Enrichment job queue | `enrichment_jobs` (+ status/lease columns) | Low–medium: pending jobs are re-enqueued by the SPA self-heal loop over time |
 | Durable FG detail cache | `fg_detail_cache` | Medium: rebuilding needs live FG access, which Railway cannot do (Cloudflare 403); until re-warmed, coverage falls back to the bundled `fg_cache/*.json` |
 | Mobile accounts + magic links | `mobile_*`, `magic_links` | High for the (small) mobile-account population: bcrypt hashes are not recoverable |
 | Enrichment metrics/state | misc. state tables | Low: observability, re-derivable |
@@ -44,16 +44,45 @@ on boot (`CREATE TABLE IF NOT EXISTS`), so a restore only has to bring data.
 4. Only after 1–3 verify, repoint the production service's `DATABASE_URL` (or
    restore in place via Railway's backup restore).
 
-## Drill (not yet performed)
+## Drill
 
-- [ ] One timed end-to-end restore into a scratch DB. Record: dump size,
+- [x] One timed end-to-end restore into a scratch DB. Record: dump size,
       restore wall-clock (→ **RTO**), dump timestamp vs. incident time
       (→ **RPO**), and the exact commands used.
-- [ ] Write the measured RPO/RTO here. Until this box is checked, the numbers
-      are unknown and this runbook is aspiration, not capability.
+- [x] Write the measured RPO/RTO here.
 
-**RPO:** TBD (target: ≤24h via daily platform backup)
-**RTO:** TBD (target: ≤1h)
+### 2026-07-10 drill result
+
+- Source: a live, CA-verified `pg_dump --format=custom --no-owner` of the
+  production Railway Postgres service.
+- Target: temporary Railway environment `dr-drill-20260710-1145`, containing
+  only a scratch Postgres service. The environment was deleted after the
+  verification passed.
+- Dump size: **6,315,337 bytes** (about 6.0 MiB).
+- Measured dump + clean restore: **19.4 seconds**.
+- Verification: all **9** public tables matched the source by name; every table
+  matched by row count (**5,061 rows** total); a local engine pointed at the
+  restored DB returned `/readyz` HTTP 200 with `{"ok":true,"db":"ok"}`.
+- Operator wall-clock: about **8 minutes** from scratch provisioning through
+  verification and teardown, including tooling setup.
+- Issue found and corrected: this runbook named the queue table `worker_jobs`;
+  the code and both source/restored databases use `enrichment_jobs`.
+
+Commands used (credentials supplied from Railway variables and never printed):
+
+```bash
+pg_dump "$PRODUCTION_URL?sslmode=verify-ca&sslrootcert=$RAILWAY_CA" \
+  --format=custom --no-owner --file engine.dump
+pg_restore --clean --if-exists --no-owner \
+  --dbname "$SCRATCH_URL?sslmode=require" engine.dump
+```
+
+**Measured RPO:** effectively zero for this on-demand dump (snapshot taken at
+drill start). The standing RPO remains **≤24h only after a daily platform backup
+schedule is verified**.
+
+**Measured RTO:** **19.4s** for dump + restore; about **8 minutes** end-to-end
+including scratch provisioning and verification (target: ≤1h).
 **Owner:** repo owner (single-operator project)
 
 ## Related
