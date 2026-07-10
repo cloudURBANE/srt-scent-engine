@@ -238,25 +238,39 @@ CREATE TABLE IF NOT EXISTS brand_sweeps (
 
 
 def _tls_hardened_conninfo(url: str) -> str:
-    """Apply verified DB TLS when a CA is provided (readiness gap E3).
+    """Apply CA-verified DB TLS when a CA is provided (readiness gap E3).
 
     psycopg's default `sslmode=require` encrypts but does NOT verify the server
     certificate — the exact MITM gap the sCAST web app closed with its
     DATABASE_SSL_CA support; this mirrors it. `DATABASE_SSL_CA` accepts either
     a file path or inline PEM content (Railway variables can't hold files).
-    When set, `sslmode=verify-full sslrootcert=<ca>` is appended, which takes
+    By default, `sslmode=verify-full sslrootcert=<ca>` is appended, which takes
     precedence over any earlier sslmode in the URL (last occurrence wins in
-    libpq conninfo resolution). When unset, the URL passes through untouched
+    libpq conninfo resolution). Providers whose certificates cannot match the
+    connection hostname may explicitly set `DATABASE_SSL_MODE=verify-ca`;
+    certificate-chain verification remains mandatory, but hostname verification
+    is then unavailable. When the CA is unset, the URL passes through unchanged
     and a boot warning records that the connection is unverified.
     """
     ca = os.environ.get("DATABASE_SSL_CA", "").strip()
     if not ca:
         logger.warning(
             "DATABASE_SSL_CA is not set: the engine DB connection is encrypted "
-            "but the server certificate is NOT verified (sslmode<verify-full). "
+            "but the server certificate is NOT verified (sslmode<verify-ca). "
             "Provide the CA cert to close the MITM gap."
         )
         return url
+    ssl_mode = os.environ.get("DATABASE_SSL_MODE", "verify-full").strip().lower()
+    if ssl_mode not in {"verify-full", "verify-ca"}:
+        raise ValueError(
+            "DATABASE_SSL_MODE must be 'verify-full' or 'verify-ca' when "
+            "DATABASE_SSL_CA is configured"
+        )
+    if ssl_mode == "verify-ca":
+        logger.warning(
+            "DATABASE_SSL_MODE=verify-ca: the engine verifies the database CA "
+            "but cannot verify the connection hostname"
+        )
     if "-----BEGIN" in ca:
         import tempfile
 
@@ -269,8 +283,8 @@ def _tls_hardened_conninfo(url: str) -> str:
         from urllib.parse import quote
 
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}sslmode=verify-full&sslrootcert={quote(ca_path)}"
-    return f"{url} sslmode=verify-full sslrootcert={ca_path}"
+        return f"{url}{sep}sslmode={ssl_mode}&sslrootcert={quote(ca_path)}"
+    return f"{url} sslmode={ssl_mode} sslrootcert={ca_path}"
 
 
 def init_db() -> None:

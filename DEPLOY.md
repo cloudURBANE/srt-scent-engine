@@ -79,7 +79,12 @@ return `503`. The existing bundled JSON detail cache keeps working unchanged.
   (inert when unset). `SENTRY_TRACES_SAMPLE_RATE` optionally enables tracing.
 - Verified DB TLS: set `DATABASE_SSL_CA` (PEM content or file path) to upgrade
   the Postgres connection to `sslmode=verify-full`; unset logs a boot warning
-  and connects unverified (encrypted, but MITM-able).
+  and connects unverified (encrypted, but MITM-able). Railway's official
+  `postgres-ssl` image issues its server certificate only for `localhost`, so a
+  service connecting through Railway's proxy must also set
+  `DATABASE_SSL_MODE=verify-ca`. That still verifies the private CA chain but,
+  necessarily, cannot verify the proxy hostname. Keep the default
+  `verify-full` for providers whose certificate matches the connection host.
 
 ## Search provider env
 
