@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guards for readiness gap E3: DATABASE_SSL_CA -> sslmode=verify-full.
+"""Guards for readiness gap E3: DATABASE_SSL_CA -> CA-verified TLS.
 
 Fully offline; pytest-style, run via ``python -m pytest``.
 """
@@ -30,6 +30,27 @@ def test_ca_file_path_appends_verify_full(monkeypatch, tmp_path):
     assert "sslmode=verify-full" in out
     assert "sslrootcert=" in out
     assert out.startswith(_URL + "?"), "params must extend the URL, not replace it"
+
+
+def test_verify_ca_mode_is_explicitly_supported(monkeypatch, tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
+    monkeypatch.setenv("DATABASE_SSL_CA", str(ca))
+    monkeypatch.setenv("DATABASE_SSL_MODE", "verify-ca")
+    out = db._tls_hardened_conninfo(_URL)
+    assert "sslmode=verify-ca" in out
+    assert "sslrootcert=" in out
+
+
+def test_invalid_ssl_mode_fails_closed(monkeypatch, tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
+    monkeypatch.setenv("DATABASE_SSL_CA", str(ca))
+    monkeypatch.setenv("DATABASE_SSL_MODE", "require")
+    import pytest
+
+    with pytest.raises(ValueError, match="DATABASE_SSL_MODE"):
+        db._tls_hardened_conninfo(_URL)
 
 
 def test_inline_pem_is_materialized_to_a_file(monkeypatch):
