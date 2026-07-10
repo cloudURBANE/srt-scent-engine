@@ -55,6 +55,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import db
+from sentry_config import configure_sentry
 import rate_limit
 from enrichment_facts import (
     FACT_FIELDS,
@@ -327,7 +328,8 @@ def _warm_basenotes_clearance() -> None:
             deadline=engine.Deadline(_ARGS.initial_timeout),
         )
         logger.info("Basenotes startup warmup completed with %d rows", len(rows))
-    except Exception:
+    except Exception as exc:
+        _SENTRY.capture_background_exception(exc, "basenotes-startup-warmup")
         logger.warning("Basenotes startup warmup failed", exc_info=True)
 
 
@@ -359,25 +361,11 @@ async def _lifespan(_app: FastAPI):
 
 
 # ---------------------------------------------------------------------------
-# Error tracking (readiness gap E1). DSN-gated exactly like the sCAST web app:
-# with SENTRY_DSN unset (local dev, offline CI) this whole block is inert and
-# sentry-sdk need not even be importable. Telemetry must never break boot.
+# Error tracking (readiness gap E1). Initialization happens before FastAPI app
+# construction so the auto-enabled FastAPI/Starlette integrations cover startup
+# and uncaught request exceptions. The reporter is inert without SENTRY_DSN.
 # ---------------------------------------------------------------------------
-_SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
-if _SENTRY_DSN:
-    try:
-        import sentry_sdk
-
-        sentry_sdk.init(
-            dsn=_SENTRY_DSN,
-            environment=os.environ.get("RAILWAY_ENVIRONMENT_NAME", "production"),
-            # Errors are the point; tracing stays off unless explicitly enabled.
-            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0") or 0),
-            # The FastAPI/Starlette integrations auto-enable when present.
-        )
-        logging.getLogger(__name__).info("Sentry error tracking enabled")
-    except Exception:  # pragma: no cover - never let telemetry break boot
-        logging.getLogger(__name__).exception("Sentry init failed; continuing without it")
+_SENTRY = configure_sentry()
 
 
 app = FastAPI(title="Fragrance Engine API", version="1.0.0", lifespan=_lifespan)
@@ -1517,7 +1505,8 @@ def _spawn_warm_refresh(query: str) -> bool:
             ]
             if results:
                 _persist_search_results(query, results)
-        except Exception:
+        except Exception as exc:
+            _SENTRY.capture_background_exception(exc, "warm-cache-refresh")
             logger.warning(
                 "warm-cache background refresh failed q=%r", query, exc_info=True
             )
@@ -1641,7 +1630,8 @@ def _maybe_spawn_brand_sweep(
                 "brand-sweep complete brand_key=%s discovered=%d enqueued=%d",
                 brand_key, len(discovered), found,
             )
-        except Exception:
+        except Exception as exc:
+            _SENTRY.capture_background_exception(exc, "brand-sweep")
             logger.warning(
                 "brand-sweep failed brand_key=%s", brand_key, exc_info=True
             )
