@@ -55,6 +55,30 @@ executes — code landing ≠ data healed). Then pick up the **still-open** item
 
 ## 2. Master index — what is left
 
+> **Status reconciliation — 2026-07-12 (verified against the current tree).**
+>
+> - **E-2 ❌ / E-4 ✅** — already marked below; unchanged.
+> - **E-3 ✅ closed as moot** — `_persist_detail_record` (api.py) persists
+>   `derived_metrics` on the detail write, and stored-payload incompleteness now
+>   self-heals via the auto-requeue path (`test_auto_requeue_incomplete.py`) plus
+>   the offline recompute sweep. No eager-compute change needed.
+> - **E-6 ✅ code half closed** — pool default 15, bounded acquisition
+>   (`DB_POOL_ACQUIRE_TIMEOUT`, 5s) and `PoolTimeout` → retryable 503 landed with
+>   the audit B3 closure (`test_audit_gap_closures.py`). The Railway
+>   `DB_POOL_MAX_SIZE` env value itself remains an ops check.
+> - **E-9 ✅ done** — the hard-coded `THOMBRONY` alias is retired from
+>   `fragrance_parser_full_rewrite_fixed.py`; the string survives only in a
+>   comment describing the general collapsed-alias fix.
+> - **E-1 / E-5 (OPERATE)** — the code and runbooks are shipped; whether the prod
+>   backlog is drained is live-DB state. Check `GET /api/enrichment/completeness`
+>   (see `ENRICHMENT_RUNBOOK.md` and the `wardrobe-completeness-heal` skill)
+>   before re-running anything.
+> - **E-7 / E-8 (VERIFY)** — remain post-deploy/ops checks (Railway env +
+>   `engine-live-verify`); not verifiable from a sandbox.
+> - **E-10** — long-term infra track, unchanged.
+>
+> Do not re-open the ✅ items; the table below is historical context.
+
 | ID | Title | Type | Priority | Network? | Primary file(s) |
 |---|---|---|---|---|---|
 | E-1 | Run the heal/recompute against prod to drain the 89-job / Unknown-family backlog | OPERATE | High | yes | `scripts/heal_offline.py`, `GET /api/enrichment/completeness` |
