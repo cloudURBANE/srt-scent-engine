@@ -6,6 +6,7 @@ Fully offline; pytest-style, run via ``python -m pytest``.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -74,3 +75,40 @@ def test_existing_query_params_use_ampersand(monkeypatch, tmp_path):
     url = _URL + "?application_name=engine"
     out = db._tls_hardened_conninfo(url)
     assert out.startswith(url + "&sslmode=verify-full")
+
+
+def test_pool_checks_connections_before_checkout(monkeypatch):
+    """A server-closed idle socket must be replaced before reaching a caller."""
+    import psycopg_pool
+
+    created = {}
+    check_sentinel = object()
+
+    class FakeConnection:
+        def execute(self, _query):
+            return None
+
+    class FakePool:
+        check_connection = check_sentinel
+
+        def __init__(self, conninfo, **kwargs):
+            created["conninfo"] = conninfo
+            created["kwargs"] = kwargs
+
+        @contextmanager
+        def connection(self):
+            yield FakeConnection()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(psycopg_pool, "ConnectionPool", FakePool)
+    monkeypatch.setattr(db, "DATABASE_URL", _URL)
+    monkeypatch.setattr(db, "ENABLED", True)
+    monkeypatch.setattr(db, "_pool", None)
+    monkeypatch.delenv("DATABASE_SSL_CA", raising=False)
+
+    db.init_db()
+
+    assert created["conninfo"] == _URL
+    assert created["kwargs"]["check"] is check_sentinel

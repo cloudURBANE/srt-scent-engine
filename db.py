@@ -312,6 +312,11 @@ def init_db() -> None:
         max_size=max_size,
         timeout=_env_float("DB_POOL_ACQUIRE_TIMEOUT", 5.0),
         kwargs={"autocommit": True},
+        # Managed Postgres can close an idle SSL socket without the client
+        # process noticing.  Validate connections at checkout so the pool
+        # discards and replaces a stale socket before a request (including
+        # /readyz) receives it.
+        check=ConnectionPool.check_connection,
     )
     with _pool.connection() as conn:
         conn.execute(_SCHEMA)
