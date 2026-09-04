@@ -612,49 +612,74 @@ _FACT_QUERY_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("gender", ("gender", "marketed gender", "target gender")),
 )
 
+_FACT_ALIASES: list[tuple[str, str]] = sorted(
+    [
+        (field, alias)
+        for field, names in _FACT_QUERY_ALIASES
+        for alias in names
+    ],
+    key=lambda item: len(item[1]),
+    reverse=True,
+)
+_FACT_ALIAS_PATTERN: str = "|".join(re.escape(alias) for _, alias in _FACT_ALIASES)
+_FACT_FIELD_BY_ALIAS: dict[str, str] = {alias.casefold(): field for field, alias in _FACT_ALIASES}
+
+_FACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"^(?:what(?:'s| is)?|whats|tell me|show me|find|grab|get|give me)?\s*"
+        rf"(?:the\s+)?(?P<alias>{_FACT_ALIAS_PATTERN})\s+(?:for|of|on|in)\s+(?P<target>.+)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?:what(?:'s| is)?|whats)\s+(?:the\s+)?(?P<alias>{_FACT_ALIAS_PATTERN})\s+"
+        rf"(?:for|of|on|in)?\s*(?P<target>.+)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?P<target>.+?)\s+(?P<alias>{_FACT_ALIAS_PATTERN})$",
+        re.IGNORECASE,
+    ),
+)
+_QUESTION_LIKE_RE = re.compile(
+    r"^(?:what|whats|what's|tell|show|find|grab|get|give)\b", re.IGNORECASE
+)
+_YEAR_DISQUALIFIER_RE = re.compile(
+    r"^(?:release\s+|launch\s+)?year\s+(?:of|for|in)\b", re.IGNORECASE
+)
+_WHITESPACE_RE = re.compile(r"\s+")
+_TARGET_PREFIX_RE = re.compile(r"^(?:is|are|the|a|an)\s+", re.IGNORECASE)
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_query(value: str | None) -> str:
+    """Strip NUL bytes and control characters, returning stripped query."""
+    if not value:
+        return ""
+    return _CONTROL_CHAR_RE.sub("", value).strip()
+
 
 def _parse_fact_query(query: str) -> dict[str, str] | None:
     """Extract fact intent from natural questions without broad fuzzy guessing."""
     raw = (query or "").strip()
     if not raw:
         return None
-    text = re.sub(r"\s+", " ", raw).strip(" ?!.")
+    text = _WHITESPACE_RE.sub(" ", raw).strip(" ?!.")
     if not text:
         return None
 
-    aliases: list[tuple[str, str]] = []
-    for field, names in _FACT_QUERY_ALIASES:
-        aliases.extend((field, alias) for alias in names)
-    aliases.sort(key=lambda item: len(item[1]), reverse=True)
-    alias_pattern = "|".join(re.escape(alias) for _, alias in aliases)
-    field_by_alias = {alias.casefold(): field for field, alias in aliases}
-
-    patterns = (
-        rf"^(?:what(?:'s| is)?|whats|tell me|show me|find|grab|get|give me)?\s*"
-        rf"(?:the\s+)?(?P<alias>{alias_pattern})\s+(?:for|of|on|in)\s+(?P<target>.+)$",
-        rf"^(?:what(?:'s| is)?|whats)\s+(?:the\s+)?(?P<alias>{alias_pattern})\s+"
-        rf"(?:for|of|on|in)?\s*(?P<target>.+)$",
-        rf"^(?P<target>.+?)\s+(?P<alias>{alias_pattern})$",
-    )
-    for pattern in patterns:
-        match = re.match(pattern, text, flags=re.IGNORECASE)
+    for pattern in _FACT_PATTERNS:
+        match = pattern.match(text)
         if not match:
             continue
         alias = match.group("alias").casefold()
-        target = re.sub(r"\s+", " ", match.group("target")).strip(" ?!.")
-        target = re.sub(r"^(?:is|are|the|a|an)\s+", "", target, flags=re.IGNORECASE).strip()
+        target = _WHITESPACE_RE.sub(" ", match.group("target")).strip(" ?!.")
+        target = _TARGET_PREFIX_RE.sub("", target).strip()
         if not target:
             continue
         # A bare "year" query should not hijack titles like "Year of the Dragon".
-        question_like = bool(
-            re.match(r"^(?:what|whats|what's|tell|show|find|grab|get|give)\b", text, re.IGNORECASE)
-        )
-        field = field_by_alias[alias]
-        if field == "year" and not question_like and re.match(
-            r"^(?:release\s+|launch\s+)?year\s+(?:of|for|in)\b",
-            text,
-            re.IGNORECASE,
-        ):
+        question_like = bool(_QUESTION_LIKE_RE.match(text))
+        field = _FACT_FIELD_BY_ALIAS[alias]
+        if field == "year" and not question_like and _YEAR_DISQUALIFIER_RE.match(text):
             continue
         if engine.QueryRepair._identity(target) == engine.QueryRepair._identity(raw):
             continue
@@ -917,9 +942,14 @@ def _fragrance_record_search(
 ) -> list[engine.UnifiedFragrance]:
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
-    for record in db.search_fragrance_records(
-        query, limit=limit * 2, house_forms=_brand_alias_forms(query)
-    ):
+    try:
+        records = db.search_fragrance_records(
+            query, limit=limit * 2, house_forms=_brand_alias_forms(query)
+        )
+    except Exception:
+        logger.exception("search_fragrance_records failed for query %r", query)
+        return []
+    for record in records:
         if _fragrance_record_is_stale(record):
             continue
         item = _candidate_from_fragrance_record(record)
@@ -1162,7 +1192,12 @@ def _db_detail_cache_search(
     """Search candidates from the durable Postgres fg_detail_cache."""
     candidates: list[engine.UnifiedFragrance] = []
     seen: set[str] = set()
-    for entry in db.search_detail_cache(query, limit=limit * 2):
+    try:
+        entries = db.search_detail_cache(query, limit=limit * 2)
+    except Exception:
+        logger.exception("search_detail_cache failed for query %r", query)
+        return []
+    for entry in entries:
         item = _candidate_from_cache_entry(entry, "fg_detail_db_cache")
         if not item:
             continue
@@ -1247,7 +1282,11 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
             )
 
         for search_query in _variant_queries():
-            rows = search_fn(search_query, source_limit * 2, min_score=0.0)
+            try:
+                rows = search_fn(search_query, source_limit * 2, min_score=0.0)
+            except Exception:
+                logger.exception("search_fn %r failed in _source_search for variant %r", getattr(search_fn, "__name__", str(search_fn)), search_query)
+                rows = []
             for item in rows:
                 item.query_score = engine.IdentityTools.relevance_score(query, item)
                 if not variant_candidate_ok(item, search_query):
@@ -1270,21 +1309,38 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
     brand_only = _query_resolves_known_brand(query)
     effective_limit = max(limit, _BRAND_ONLY_MAX_RESULTS) if brand_only else limit
 
-    candidates = _source_search(_fragrance_record_search, effective_limit)
+    candidates: list[engine.UnifiedFragrance] = []
     source: str | None = None
+    try:
+        candidates = _source_search(_fragrance_record_search, effective_limit)
+    except Exception:
+        logger.exception("Cache search fallback aggregate_db failed for query %r", query)
+        candidates = []
 
     if candidates:
         source = "aggregate_db"
     else:
-        candidates = _source_search(_db_detail_cache_search, effective_limit)
+        try:
+            candidates = _source_search(_db_detail_cache_search, effective_limit)
+        except Exception:
+            logger.exception("Cache search fallback db failed for query %r", query)
+            candidates = []
         if candidates:
             source = "db"
     if not candidates:
-        candidates = _source_search(_json_cache_search, effective_limit)
+        try:
+            candidates = _source_search(_json_cache_search, effective_limit)
+        except Exception:
+            logger.exception("Cache search fallback json failed for query %r", query)
+            candidates = []
         if candidates:
             source = "json"
     if not candidates:
-        candidates = _source_search(_identity_cache_search, effective_limit)
+        try:
+            candidates = _source_search(_identity_cache_search, effective_limit)
+        except Exception:
+            logger.exception("Cache search fallback identity failed for query %r", query)
+            candidates = []
         if candidates:
             source = "identity"
 
@@ -1293,7 +1349,12 @@ def _cache_search_fallback(query: str, limit: int) -> tuple[list[engine.UnifiedF
             (item.frag_url or item.bn_url or item.cache_key) for item in candidates
         }
         catalogue_added = False
-        for extra in _source_search(_identity_cache_search, effective_limit):
+        try:
+            extra_candidates = _source_search(_identity_cache_search, effective_limit)
+        except Exception:
+            logger.exception("Cache search fallback brand-only identity extra failed for query %r", query)
+            extra_candidates = []
+        for extra in extra_candidates:
             key = extra.frag_url or extra.bn_url or extra.cache_key
             if key in existing_keys:
                 continue
@@ -1344,9 +1405,14 @@ def _strong_cache_search(
     first_candidates: list[engine.UnifiedFragrance] = []
     first_source: str | None = None
     for source, search_fn in searches:
+        try:
+            raw_candidates = search_fn(query, limit, min_score)
+        except Exception:
+            logger.exception("search_fn %s failed in _strong_cache_search for query %r", source, query)
+            raw_candidates = []
         candidates = [
             item
-            for item in search_fn(query, limit, min_score)
+            for item in raw_candidates
             if _strong_cache_candidate_ok(query, item, min_score)
         ]
         if not candidates:
@@ -2572,10 +2638,10 @@ def _search_diagnostics(results: list[engine.UnifiedFragrance]) -> dict[str, Any
 
 @app.get("/api/fragrances/search")
 def search(
-    q: str = Query(..., min_length=1, description="Fragrance search query"),
+    q: str = Query(..., min_length=1, max_length=200, description="Fragrance search query"),
 ) -> dict[str, Any]:
     """Run the engine's dual-source resolver and return ranked candidates."""
-    query = q.strip()
+    query = _clean_query(q)
     if not query:
         raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
     fact_query = _parse_fact_query(query)
@@ -2587,7 +2653,11 @@ def search(
     # match here is high-confidence enough to skip live search entirely -- this
     # is the fast path that answers common cached queries in tens of ms instead
     # of waiting behind the engine's first-pass timeout budget.
-    strong_results, strong_source = _strong_cache_search(resolver_query, _ARGS.max_results)
+    try:
+        strong_results, strong_source = _strong_cache_search(resolver_query, _ARGS.max_results)
+    except Exception:
+        logger.exception("_strong_cache_search precheck failed for query %r", resolver_query)
+        strong_results, strong_source = [], None
     strong_results = [
         item for item in strong_results if _candidate_has_display_identity(item)
     ]
@@ -2620,9 +2690,13 @@ def search(
     # revalidate live in the background so the next identical query promotes to
     # the strong fast path above. This is the stale-while-revalidate bridge
     # between a tens-of-ms precheck hit and a full multi-second live search.
-    warm_results, warm_source = _strong_cache_search(
-        resolver_query, _ARGS.max_results, min_score=_WARM_CACHE_MIN_SCORE
-    )
+    try:
+        warm_results, warm_source = _strong_cache_search(
+            resolver_query, _ARGS.max_results, min_score=_WARM_CACHE_MIN_SCORE
+        )
+    except Exception:
+        logger.exception("_strong_cache_search warm check failed for query %r", resolver_query)
+        warm_results, warm_source = [], None
     warm_results = [
         item for item in warm_results if _candidate_has_display_identity(item)
     ]
@@ -2680,7 +2754,11 @@ def search(
             _release_gate(_LIVE_SEARCH_SEMAPHORE)
 
     if not results:
-        results, fallback_source = _cache_search_fallback(resolver_query, _ARGS.max_results)
+        try:
+            results, fallback_source = _cache_search_fallback(resolver_query, _ARGS.max_results)
+        except Exception:
+            logger.exception("_cache_search_fallback failed for query %r", resolver_query)
+            results, fallback_source = [], None
         if live_search_saturated and not results:
             raise HTTPException(
                 status_code=503,
@@ -2742,7 +2820,7 @@ def search(
 
 @app.get("/api/fragrances/image-search")
 def image_search(
-    q: str = Query(..., min_length=1, description="Bottle-image search query"),
+    q: str = Query(..., min_length=1, max_length=200, description="Bottle-image search query"),
     limit: int = Query(12, ge=1, le=20, description="Max image candidates to return"),
 ) -> dict[str, Any]:
     """Decodo-backed bottle-image candidate search.
@@ -2758,7 +2836,7 @@ def image_search(
     route returns an empty candidate list instead of a 5xx and the app's pipeline
     soft-fails to its cache/placeholder path exactly as it does for Serper.
     """
-    query = q.strip()
+    query = _clean_query(q)
     if not query:
         raise HTTPException(status_code=400, detail="Query 'q' must not be empty.")
 
@@ -2844,7 +2922,7 @@ def _engine_candidate_to_diag(item: engine.UnifiedFragrance) -> dict[str, Any]:
     dependencies=[Depends(_require_diagnostics_token)],
 )
 def engine_search_diagnostics(
-    q: str = Query("silver mountain water", min_length=1),
+    q: str = Query("silver mountain water", min_length=1, max_length=200),
 ) -> dict[str, Any]:
     """Run the public /search code path verbatim and dump raw candidates.
 
@@ -2856,7 +2934,7 @@ def engine_search_diagnostics(
     import contextlib
     import io
 
-    query = q.strip()
+    query = _clean_query(q)
 
     # Same scraper construction as the public endpoint.
     scraper = engine.get_scraper()

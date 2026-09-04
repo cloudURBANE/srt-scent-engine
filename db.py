@@ -1210,6 +1210,13 @@ def _merge_fragrance_record_keys(conn: Any, target_key: str, duplicate_key: str)
     )
 
 
+def _escape_sql_like(value: str) -> str:
+    """Escape SQL LIKE / ILIKE wildcards and escape characters (%, _, \\)."""
+    if not value:
+        return ""
+    return value.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+
 def _identity_search_term(query: str) -> tuple[str, str]:
     """Return the SQL match mode and bound term for identity search.
 
@@ -1218,9 +1225,9 @@ def _identity_search_term(query: str) -> tuple[str, str]:
     case-insensitive regex with non-alphanumeric boundaries.
     """
     text = (query or "").strip()
-    if len(text) <= 2 and len(text.split()) == 1:
+    if len(text) <= 2 and len(text.split()) == 1 and text.isalnum():
         return "regex", rf"(^|[^[:alnum:]]){re.escape(text)}([^[:alnum:]]|$)"
-    return "ilike", f"%{text}%"
+    return "ilike", f"%{_escape_sql_like(text)}%"
 
 
 def _fragrance_record_key(row: dict[str, Any]) -> str:
@@ -1495,7 +1502,7 @@ def search_fragrance_records(
     # Brand-alias recall: only meaningful alias forms (>= 3 chars) become house
     # patterns, so a 1-2 char alias fragment cannot broaden the match to noise.
     house_patterns = [
-        f"%{form.strip()}%"
+        f"%{_escape_sql_like(form.strip())}%"
         for form in (house_forms or [])
         if form and len(form.strip()) >= 3
     ]

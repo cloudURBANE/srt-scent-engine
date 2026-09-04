@@ -1084,6 +1084,51 @@ def test_short_db_search_uses_word_boundaries() -> None:
     check("normal DB query still uses ILIKE mode", (long_mode, long_term) == ("ilike", "%Dior%"), str((long_mode, long_term)))
 
 
+def test_search_safety_hardening() -> None:
+    print("Search engine safety hardening checks:")
+    # 1. SQL LIKE escaping
+    escaped = api.db._escape_sql_like(r"Y %_% \ test")
+    check("SQL LIKE escaping handles %, _, \\", escaped == r"Y \%\_\% \\ test", escaped)
+
+    # 2. _identity_search_term alphanumeric gating
+    pct_mode, pct_term = api.db._identity_search_term("%")
+    check("non-alphanumeric short query does not use regex", pct_mode == "ilike", pct_mode)
+    check("escaped wildcard in ILIKE term", pct_term == r"%\%%", pct_term)
+
+    slash_mode, slash_term = api.db._identity_search_term("Sauvage \\")
+    check("trailing backslash escaped", slash_term == r"%Sauvage \\%", slash_term)
+
+    # 3. Control character and NUL stripping
+    cleaned_text = engine.TextSanitizer.clean("Dior\x00 Sauvage\x1f\x7f")
+    check("TextSanitizer.clean strips NUL and control chars", cleaned_text == "Dior Sauvage", cleaned_text)
+
+    cleaned_query = api._clean_query("Creed\x00 Aventus\x07\x1b")
+    check("_clean_query strips NUL and control chars", cleaned_query == "Creed Aventus", cleaned_query)
+
+    # 4. Precompiled _FACT_PATTERNS
+    check("_FACT_PATTERNS is precompiled tuple", isinstance(api._FACT_PATTERNS, tuple) and len(api._FACT_PATTERNS) > 0, str(type(api._FACT_PATTERNS)))
+    fact = api._parse_fact_query("what is the launch year of aventus")
+    check("_parse_fact_query resolves year query", fact is not None and fact["field"] == "year", str(fact))
+
+    # 5. Database error resilience in _strong_cache_search and _cache_search_fallback
+    old_records = api.db.search_fragrance_records
+    old_details = api.db.search_detail_cache
+    try:
+        def raise_db_error(*args, **kwargs):
+            raise RuntimeError("DB connection dropped")
+        api.db.search_fragrance_records = raise_db_error
+        api.db.search_detail_cache = raise_db_error
+
+        strong_res, strong_src = api._strong_cache_search("sauvage", 10)
+        check("_strong_cache_search handles DB exception gracefully", isinstance(strong_res, list), str(strong_res))
+
+        fallback_res, fallback_src = api._cache_search_fallback("sauvage", 10)
+        check("_cache_search_fallback handles DB exception gracefully", isinstance(fallback_res, list), str(fallback_res))
+    finally:
+        api.db.search_fragrance_records = old_records
+        api.db.search_detail_cache = old_details
+
+
 def test_search_serialization_recovers_fragrantica_identity() -> None:
     print("Fragrantica identity recovery checks:")
     row = engine.UnifiedFragrance(
@@ -2472,6 +2517,7 @@ def main() -> int:
     test_multi_token_bare_brand_seeds_catalog_labels()
     test_poisoned_db_records_are_filtered()
     test_short_db_search_uses_word_boundaries()
+    test_search_safety_hardening()
     test_search_serialization_recovers_fragrantica_identity()
     test_search_serialization_recovers_basenotes_identity()
     test_basenotes_slug_splits_on_final_by()

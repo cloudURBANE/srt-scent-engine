@@ -394,6 +394,7 @@ class TextSanitizer:
     # The latter ride along after trademark glyphs in scraped names
     # ("Ambrox\u00AE\uFE0FSuper") and survive \u00AE stripping as an invisible artifact;
     # they only modify a preceding glyph's rendering, so dropping them is safe.
+    CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
     ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\uFEFF\uFE00-\uFE0F]")
     SPACE = re.compile(r"\s+")
     YEAR_RE = re.compile(r"\b(?:17|18|19|20)\d{2}\b")
@@ -452,6 +453,8 @@ class TextSanitizer:
         if text is None:
             return ""
         value = html.unescape(str(text))
+        value = cls.SPACE.sub(" ", value)
+        value = cls.CONTROL_CHARS.sub("", value)
         for pattern, repl in cls.CLEANUP_RULES:
             value = pattern.sub(repl, value)
         value = cls.ZERO_WIDTH.sub("", value)
@@ -3590,7 +3593,8 @@ class SerperClient:
             budget = min(budget, deadline.timeout(budget))
         urls: list[str] = []
         try:
-            query = " ".join(f'"{part}"' for part in (house, name) if part)
+            parts = [part.replace('"', ' ').strip() for part in (house, name)]
+            query = " ".join(f'"{part}"' for part in parts if part)
             payload = cls._post(query, budget, site="parfumo.com/Perfumes")
             seen: set[str] = set()
             for entry in payload.get("organic", []) or []:
@@ -4301,7 +4305,7 @@ class DecodoScraperClient:
         timeout: float = MAX_TIMEOUT,
         max_results: int = 20,
     ) -> list[dict]:
-        query = (query or "").strip()
+        query = (query or "").replace('"', ' ').strip()
         if not query or not cls.enabled():
             return []
         cache_key = f"{cls._cache_key(query)}|{max_results}"
@@ -4326,7 +4330,7 @@ class DecodoScraperClient:
         deadline: Deadline | None = None,
         timeout: float = MAX_TIMEOUT,
     ) -> list[str]:
-        query = (query or "").strip()
+        query = (query or "").replace('"', ' ').strip()
         if not query or not cls.enabled():
             return []
         cache_key = cls._cache_key(query)
@@ -4463,7 +4467,7 @@ class DecodoScraperClient:
         timeout: float = MAX_TIMEOUT,
         max_results: int = 5,
     ) -> list[str]:
-        query = (query or "").strip()
+        query = (query or "").replace('"', ' ').strip()
         if not query or not cls.enabled():
             return []
         cache_key = cls._cache_key(query)
@@ -4555,8 +4559,9 @@ class DecodoScraperClient:
                 if max_results and len(urls) >= max_results:
                     break
         if not urls and not (deadline is not None and deadline.expired()):
+            clean_brand = brand.replace('"', ' ').strip()
             for url in cls._search_fragrantica_urls_for_google_query(
-                f'"{brand}" site:fragrantica.com/perfume',
+                f'"{clean_brand}" site:fragrantica.com/perfume',
                 deadline=deadline,
                 timeout=timeout,
             ):
@@ -4591,7 +4596,7 @@ class DecodoScraperClient:
         cheap Google + Bing organic passes both came back empty for a cold niche
         brand. URLs come from the answer's cited ``source_panel``.
         """
-        query = (query or "").strip()
+        query = (query or "").replace('"', ' ').strip()
         if not query or not cls.ai_overview_enabled():
             return []
         budget = cls._viable_budget(timeout, deadline)
@@ -4652,7 +4657,8 @@ class DecodoScraperClient:
             return []
         urls: list[str] = []
         try:
-            quoted = " ".join(f'"{part}"' for part in (house, name) if part)
+            parts = [part.replace('"', ' ').strip() for part in (house, name)]
+            quoted = " ".join(f'"{part}"' for part in parts if part)
             payload = cls._post_google(f"site:parfumo.com/Perfumes {quoted}".strip(), budget)
             seen: set[str] = set()
             for entry in cls._search_entries(payload):
@@ -7195,8 +7201,8 @@ class SearchSniper:
     @staticmethod
     def resolve(scraper, brand: str, name: str, deadline: Deadline | None = None, trace: ResolverTrace | None = None) -> str:
         """Opt-in last-resort web resolver. Keep disabled by default in first-load UX."""
-        brand = TextSanitizer.clean(brand)
-        name = TextSanitizer.clean(name)
+        brand = TextSanitizer.clean(brand).replace('"', ' ').strip()
+        name = TextSanitizer.clean(name).replace('"', ' ').strip()
         if not brand or not name:
             return ""
         search_term = f'site:fragrantica.com/perfume "{brand}" "{name}"'
